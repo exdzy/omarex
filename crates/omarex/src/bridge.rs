@@ -571,50 +571,40 @@ impl OmarexController {
         self.build_shell_layout_spec_with_cwd(cwd.as_deref(), command, wait_after)
     }
 
-    fn next_terminal_session_label(
+    /// Label for a new terminal session, or `None` to let the Rex server name it.
+    ///
+    /// Like the Rex app, Omarex leaves new sessions unlabeled so the server assigns a friendly
+    /// name (`wandering-river`, `quiet-marsh`, …). Only when Omarex is launched into a specific
+    /// project directory (`prefer_cwd_basename`) is the session named after that folder, if no
+    /// other session on the host already uses the name.
+    fn new_terminal_session_label(
         &self,
         host_id: &str,
         cwd: Option<&str>,
         prefer_cwd_basename: bool,
-    ) -> String {
-        let used: HashSet<String> = self
-            .workspace
-            .host(host_id)
-            .map(|h| {
-                h.sessions
-                    .values()
-                    .map(|s| s.label.to_ascii_lowercase())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if prefer_cwd_basename && let Some(dir) = cwd {
-            let home = std::env::var("HOME").ok();
-            let is_home = home
-                .as_deref()
-                .is_some_and(|h| Path::new(dir) == Path::new(h));
-            if !is_home
-                && let Some(base) = Path::new(dir)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && !is_t3_session(s))
-                && !used.contains(&base.to_ascii_lowercase())
-            {
-                return base.to_owned();
-            }
+    ) -> Option<String> {
+        if !prefer_cwd_basename {
+            return None;
         }
-
-        if !used.contains("terminal") {
-            return "Terminal".to_owned();
+        let dir = cwd?;
+        let home = std::env::var("HOME").ok();
+        if home
+            .as_deref()
+            .is_some_and(|h| Path::new(dir) == Path::new(h))
+        {
+            return None;
         }
-        for n in 2..=999 {
-            let cand = format!("Terminal {n}");
-            if !used.contains(&cand.to_ascii_lowercase()) {
-                return cand;
-            }
-        }
-        "Terminal".to_owned()
+        let base = Path::new(dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !is_t3_session(s))?;
+        let taken = self.workspace.host(host_id).is_some_and(|h| {
+            h.sessions
+                .values()
+                .any(|s| s.label.eq_ignore_ascii_case(base))
+        });
+        (!taken).then(|| base.to_owned())
     }
 
     fn find_preferred_terminal_session(
@@ -666,11 +656,11 @@ impl OmarexController {
         let layout = self.build_shell_layout_spec_with_cwd(cwd.as_deref(), None, false);
 
         if force_new_session {
-            let label = self.next_terminal_session_label(&target_host, cwd.as_deref(), false);
+            let label = self.new_terminal_session_label(&target_host, cwd.as_deref(), false);
             self.send_command(HostCommand::NewSession {
                 host_id: target_host,
                 request: SessionCreateRequest {
-                    label: Some(label),
+                    label,
                     initial_windows: Some(vec![InitialWindowSpec {
                         window_label: None,
                         layout,
@@ -702,7 +692,7 @@ impl OmarexController {
         }
 
         // Otherwise (inside `T3 Code` or no active session), target an existing non-T3 session
-        // on `target_host` if one exists, or create a brand-new `"Terminal"` Rex session!
+        // on `target_host` if one exists, or create a brand-new Rex session (named by the server)!
         if let Some(term_sid) = self.find_preferred_terminal_session(&target_host, None) {
             let sk = SessionKey::new(target_host.clone(), term_sid.clone());
             self.set_session_collapsed(&sk.host_id, &sk.session_id, false);
@@ -717,11 +707,11 @@ impl OmarexController {
                 },
             });
         } else {
-            let label = self.next_terminal_session_label(&target_host, cwd.as_deref(), false);
+            let label = self.new_terminal_session_label(&target_host, cwd.as_deref(), false);
             self.send_command(HostCommand::NewSession {
                 host_id: target_host,
                 request: SessionCreateRequest {
-                    label: Some(label),
+                    label,
                     initial_windows: Some(vec![InitialWindowSpec {
                         window_label: None,
                         layout,
@@ -2021,7 +2011,7 @@ impl OmarexController {
                             self.maybe_hydrate_session_metadata(&sk);
                         } else {
                             let label =
-                                self.next_terminal_session_label(&host_id, Some(&launch_cwd), true);
+                                self.new_terminal_session_label(&host_id, Some(&launch_cwd), true);
                             let layout = self.build_shell_layout_spec_with_cwd(
                                 Some(&launch_cwd),
                                 None,
@@ -2030,7 +2020,7 @@ impl OmarexController {
                             self.send_command(HostCommand::NewSession {
                                 host_id: host_id.clone(),
                                 request: SessionCreateRequest {
-                                    label: Some(label),
+                                    label,
                                     initial_windows: Some(vec![InitialWindowSpec {
                                         window_label: None,
                                         layout,
@@ -2045,13 +2035,13 @@ impl OmarexController {
                         self.activate_session(sk.clone(), &tickets);
                         self.maybe_hydrate_session_metadata(&sk);
                     } else if host_id == LOCAL_HOST_ID && !self.read_only {
-                        // Empty local server: spin up an initial `"Terminal"` shell session.
-                        let label = self.next_terminal_session_label(&host_id, None, false);
+                        // Empty local server: spin up an initial shell session (named by the server).
+                        let label = self.new_terminal_session_label(&host_id, None, false);
                         let layout = self.build_shell_layout_spec(None, false);
                         self.send_command(HostCommand::NewSession {
                             host_id: host_id.clone(),
                             request: SessionCreateRequest {
-                                label: Some(label),
+                                label,
                                 initial_windows: Some(vec![InitialWindowSpec {
                                     window_label: None,
                                     layout,
@@ -8707,7 +8697,8 @@ mod tests {
                 _ => None,
             })
             .expect("expected HostCommand::NewSession creating a real shell session");
-        assert_eq!(new_sess_req.label.as_deref(), Some("Terminal"));
+        // Like the Rex app, new sessions are left unlabeled so the server names them.
+        assert_eq!(new_sess_req.label, None);
         let init_wins = new_sess_req
             .initial_windows
             .as_ref()
@@ -8983,7 +8974,7 @@ mod tests {
                 _ => None,
             })
             .expect("NewSession must target remote host");
-        assert_eq!(mac_new_sess.label.as_deref(), Some("Terminal"));
+        assert_eq!(mac_new_sess.label, None);
         let mac_opts = mac_new_sess.initial_windows.as_ref().unwrap()[0]
             .layout
             .block
