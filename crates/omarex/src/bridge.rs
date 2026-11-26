@@ -5692,10 +5692,7 @@ impl OmarexController {
         let Some(key) = self.focused_block_key() else {
             return;
         };
-        if input.pressed {
-            self.maybe_claim_ownership(&key, OwnershipTrigger::ExplicitInteractOrFit);
-            let _ = self.pane_store.scroll_to_bottom(&key);
-        }
+        let is_bare_modifier = is_modifier_or_lock_key(input.physical_key);
 
         let vt_action = if !input.pressed {
             VtKeyAction::Release
@@ -5719,6 +5716,10 @@ impl OmarexController {
             && !bytes.is_empty()
             && let Ok(data) = String::from_utf8(bytes)
         {
+            if input.pressed && !is_bare_modifier {
+                self.maybe_claim_ownership(&key, OwnershipTrigger::ExplicitInteractOrFit);
+                let _ = self.pane_store.scroll_to_bottom(&key);
+            }
             self.send_command(HostCommand::TerminalWrite {
                 host_id: key.host_id,
                 session_id: key.session_id,
@@ -6750,6 +6751,56 @@ impl OmarexController {
         false
     }
 
+    fn open_thread_link(&mut self, uri: &str, open_external: bool, now: Instant) {
+        let trimmed = uri.trim();
+        let is_internal_t3_thread = trimmed
+            .get(..12)
+            .is_some_and(|p| p.eq_ignore_ascii_case("t3-thread://"));
+        // Keep `t3code://` title links opening T3 Code directly; only try focusing an already
+        // matching Rex tab for internal `t3-thread://` references when not explicitly external.
+        if !open_external && is_internal_t3_thread && self.try_focus_thread_uri(trimmed, now) {
+            return;
+        }
+
+        let targets = resolve_thread_open_targets(trimmed);
+        if let Some(desktop_uri) = targets.desktop_uri.as_deref() {
+            let scheme = desktop_uri
+                .split_once("://")
+                .map(|(s, _)| s)
+                .unwrap_or("t3code");
+            if has_registered_scheme_handler(scheme) {
+                if let Err(err) = open_uri_detached(desktop_uri) {
+                    self.push_toast_at(
+                        ToastSeverity::Warning,
+                        "Open thread link failed",
+                        format!("{desktop_uri} ({err})"),
+                        now,
+                    );
+                }
+                return;
+            }
+        }
+
+        if let Some(web_url) = targets.web_fallback_url.as_deref() {
+            if let Err(err) = open_uri_detached(web_url) {
+                self.push_toast_at(
+                    ToastSeverity::Warning,
+                    "Open thread link failed",
+                    format!("{web_url} ({err})"),
+                    now,
+                );
+            }
+            return;
+        }
+
+        self.push_toast_at(
+            ToastSeverity::Warning,
+            "Open thread link failed",
+            format!("No T3 Code handler found for {trimmed}"),
+            now,
+        );
+    }
+
     fn open_terminal_target(
         &mut self,
         key: &BlockKey,
@@ -6769,16 +6820,7 @@ impl OmarexController {
                 }
             }
             HoveredTerminalTarget::ThreadLink(uri) => {
-                if !self.try_focus_thread_uri(uri, now)
-                    && let Err(err) = open::that_detached(uri)
-                {
-                    self.push_toast_at(
-                        ToastSeverity::Warning,
-                        "Open thread link failed",
-                        format!("{uri} ({err})"),
-                        now,
-                    );
-                }
+                self.open_thread_link(uri, open_external, now);
             }
             HoveredTerminalTarget::LocalFile {
                 resolved_path,
@@ -9170,6 +9212,182 @@ fn bridge_mods_to_vt(m: Modifiers) -> VtModifiers {
         out |= VtModifiers::SUPER;
     }
     out
+}
+
+fn is_modifier_or_lock_key(key: PhysicalKey) -> bool {
+    matches!(
+        key,
+        PhysicalKey::ControlLeft
+            | PhysicalKey::ControlRight
+            | PhysicalKey::ShiftLeft
+            | PhysicalKey::ShiftRight
+            | PhysicalKey::AltLeft
+            | PhysicalKey::AltRight
+            | PhysicalKey::MetaLeft
+            | PhysicalKey::MetaRight
+            | PhysicalKey::CapsLock
+            | PhysicalKey::NumLock
+            | PhysicalKey::ScrollLock
+            | PhysicalKey::Fn
+            | PhysicalKey::FnLock
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadOpenTargets {
+    desktop_uri: Option<String>,
+    web_fallback_url: Option<String>,
+}
+
+/// Encodes a single T3 thread/environment URI path segment (`A-Za-z0-9-_` verbatim, all other
+/// bytes percent-encoded uppercase). Matches T3 Code's `hostedSegment` / `encodeURIComponent`
+/// so literal `%` and `:` inside delegated thread IDs round-trip cleanly through T3 Code's router.
+fn encode_t3_uri_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// Maps internal `t3-thread://v2/<env>/<thread>` links (which OS browsers/XDG do not handle)
+/// into T3 Code Desktop's registered `t3code://threads/<env>/<thread>` deep link plus T3's
+/// hosted web fallback `https://app.t3.codes/threads/<env>/<thread>`.
+fn resolve_thread_open_targets(uri: &str) -> ThreadOpenTargets {
+    let trimmed = uri.trim();
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let (base, query_suffix) = match without_fragment.split_once('?') {
+        Some((b, q)) if !q.is_empty() => (b, format!("?{q}")),
+        Some((b, _)) => (b, String::new()),
+        None => (without_fragment, String::new()),
+    };
+
+    // 1. Internal Markdown thread chip URI: `t3-thread://v2/<env_id>/<thread_id>`
+    if let Some(rest) = base
+        .get(..15)
+        .filter(|p| p.eq_ignore_ascii_case("t3-thread://v2/"))
+        .map(|_| &base[15..])
+    {
+        let clean = rest.trim_end_matches('/');
+        if let Some((env_id, thread_id)) = clean.split_once('/')
+            && !env_id.is_empty()
+            && !thread_id.is_empty()
+            && !thread_id.contains('/')
+        {
+            let enc_env = encode_t3_uri_segment(env_id);
+            let enc_thread = encode_t3_uri_segment(thread_id);
+            return ThreadOpenTargets {
+                desktop_uri: Some(format!(
+                    "t3code://threads/{enc_env}/{enc_thread}{query_suffix}"
+                )),
+                web_fallback_url: Some(format!(
+                    "https://app.t3.codes/threads/{enc_env}/{enc_thread}{query_suffix}"
+                )),
+            };
+        }
+        return ThreadOpenTargets {
+            desktop_uri: None,
+            web_fallback_url: None,
+        };
+    }
+
+    // Legacy `t3-thread://v1/...` or malformed `t3-thread://` links cannot be handled by browsers.
+    if base
+        .get(..12)
+        .is_some_and(|p| p.eq_ignore_ascii_case("t3-thread://"))
+    {
+        return ThreadOpenTargets {
+            desktop_uri: None,
+            web_fallback_url: None,
+        };
+    }
+
+    // 2. Native T3 Code desktop URI (`t3code://...` or `t3code-dev://...`).
+    if let Some((scheme, rest)) = base.split_once("://")
+        && (scheme.eq_ignore_ascii_case("t3code")
+            || scheme
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("t3code-")))
+    {
+        let web_fallback_url = rest
+            .get(..8)
+            .filter(|p| p.eq_ignore_ascii_case("threads/"))
+            .map(|_| rest[8..].trim_end_matches('/'))
+            .and_then(|pair| {
+                let (env_seg, thread_seg) = pair.split_once('/')?;
+                if env_seg.is_empty() || thread_seg.is_empty() || thread_seg.contains('/') {
+                    return None;
+                }
+                Some(format!(
+                    "https://app.t3.codes/threads/{env_seg}/{thread_seg}{query_suffix}"
+                ))
+            });
+        return ThreadOpenTargets {
+            desktop_uri: Some(trimmed.to_owned()),
+            web_fallback_url,
+        };
+    }
+
+    ThreadOpenTargets {
+        desktop_uri: None,
+        web_fallback_url: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn has_registered_scheme_handler(scheme: &str) -> bool {
+    let mime = format!("x-scheme-handler/{scheme}");
+    let Ok(output) = std::process::Command::new("xdg-mime")
+        .args(["query", "default", &mime])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let desktop = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    !desktop.is_empty()
+        && !desktop.contains("chromium")
+        && !desktop.contains("chrome")
+        && !desktop.contains("firefox")
+        && !desktop.contains("brave")
+        && !desktop.contains("vivaldi")
+        && !desktop.contains("epiphany")
+        && !desktop.contains("librewolf")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_registered_scheme_handler(_scheme: &str) -> bool {
+    true
+}
+
+fn open_uri_detached(uri: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::{Command, Stdio};
+        Command::new("xdg-open")
+            .arg(uri)
+            .env_remove("ELECTRON_RUN_AS_NODE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        open::that_detached(uri)
+    }
 }
 
 fn key_input_to_modal_key(input: &KeyInputEvent) -> Option<ModalKey> {
@@ -11760,12 +11978,13 @@ mod tests {
         }
         std::fs::write(&code_file, &file_body).expect("write demo_target.rs");
 
-        ctrl.pane_store
-            .create_local_test_pane(&key, 80, 24)
-            .unwrap();
-        // Enable SGR mouse tracking (`tr3x` enables `?1000h` + `?1006h`) and emit a TUI gutter-wrapped path.
         let prefix = format!("│ {}/\r\n", sub_dir.display());
         let cont = "│ demo_target.rs:12\r\n";
+        let pane_cols = (prefix.chars().count() as u16).saturating_add(16).max(80);
+        ctrl.pane_store
+            .create_local_test_pane(&key, pane_cols, 24)
+            .unwrap();
+        // Enable SGR mouse tracking (`tr3x` enables `?1000h` + `?1006h`) and emit a TUI gutter-wrapped path.
         let osc8 = format!(
             "OSC8 \x1b]8;;file://{}\x1b\\demo_link\x1b]8;;\x1b\\  plain_words\r\n",
             code_file.display()
@@ -12115,5 +12334,186 @@ mod tests {
         if let Some(parent) = ctrl.settings_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn pressing_bare_modifier_keys_does_not_scroll_viewport_to_bottom() {
+        let mut ctrl = make_test_controller();
+        seed_single_pane_workspace(&mut ctrl);
+        let key = BlockKey::new(LOCAL_HOST_ID, "session:t3", "block:1");
+        ctrl.pane_store
+            .create_local_test_pane(&key, 80, 10)
+            .expect("create local pane");
+        // Populate scrollback history well beyond the 10-row viewport.
+        let mut lines = String::new();
+        for i in 1..=80 {
+            lines.push_str(&format!("history line {i:03} https://example.com/{i}\r\n"));
+        }
+        ctrl.pane_store
+            .feed_local_test_bytes(&key, lines.as_bytes())
+            .expect("feed scrollback");
+        ctrl.pane_store
+            .scroll_to_top(&key)
+            .expect("scroll to top of history");
+        let sb_top = ctrl.pane_store.scrollbar(&key).expect("scrollbar metrics");
+        assert_eq!(sb_top.offset, 0, "precondition: scrolled to top");
+        assert!(
+            sb_top.total > sb_top.len,
+            "precondition: scrollback must exceed viewport"
+        );
+        ctrl.drain_pending_commands();
+
+        let now = Instant::now();
+        for (phys, canonical, mods) in [
+            (
+                PhysicalKey::ControlLeft,
+                "control",
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                },
+            ),
+            (
+                PhysicalKey::ControlRight,
+                "control",
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                },
+            ),
+            (
+                PhysicalKey::ShiftLeft,
+                "shift",
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            ),
+            (
+                PhysicalKey::AltLeft,
+                "alt",
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::NONE
+                },
+            ),
+            (
+                PhysicalKey::MetaLeft,
+                "super",
+                Modifiers {
+                    super_key: true,
+                    ..Modifiers::NONE
+                },
+            ),
+            (PhysicalKey::CapsLock, "capslock", Modifiers::NONE),
+        ] {
+            ctrl.handle_key(
+                &KeyInputEvent {
+                    physical_key: phys,
+                    canonical_key: canonical.to_owned(),
+                    text: None,
+                    unshifted_codepoint: 0,
+                    mods,
+                    pressed: true,
+                    repeat: false,
+                    composing: false,
+                },
+                now,
+            );
+            let sb_after = ctrl.pane_store.scrollbar(&key).expect("scrollbar metrics");
+            assert_eq!(
+                sb_after.offset, 0,
+                "pressing bare modifier {phys:?} must NOT jump scrollback to bottom"
+            );
+        }
+
+        // Typing an actual character DOES snap back to the live bottom row and writes to PTY.
+        ctrl.handle_key(
+            &KeyInputEvent {
+                physical_key: PhysicalKey::KeyA,
+                canonical_key: "a".to_owned(),
+                text: Some("a".to_owned()),
+                unshifted_codepoint: 'a' as u32,
+                mods: Modifiers::NONE,
+                pressed: true,
+                repeat: false,
+                composing: false,
+            },
+            now,
+        );
+        let sb_typed = ctrl.pane_store.scrollbar(&key).expect("scrollbar metrics");
+        assert_eq!(
+            sb_typed.offset,
+            sb_typed.total.saturating_sub(sb_typed.len),
+            "typing a real character must still snap scrollback to bottom"
+        );
+        assert!(ctrl.drain_pending_commands().iter().any(|c| matches!(
+            c,
+            HostCommand::TerminalWrite { data, .. } if data == "a"
+        )));
+
+        if let Some(parent) = ctrl.settings_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn resolves_t3_thread_v2_and_t3code_uris_for_desktop_and_web_fallback() {
+        let uuid_link = resolve_thread_open_targets(
+            "t3-thread://v2/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        );
+        assert_eq!(
+            uuid_link.desktop_uri.as_deref(),
+            Some(
+                "t3code://threads/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+        );
+        assert_eq!(
+            uuid_link.web_fallback_url.as_deref(),
+            Some(
+                "https://app.t3.codes/threads/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+        );
+
+        // Delegated task IDs contain colons and literal percent escapes that must round-trip.
+        let delegated = resolve_thread_open_targets(
+            "t3-thread://v2/env-1/thread:delegated-task:command%3Amcp%3Aabc?prompt=hi",
+        );
+        assert_eq!(
+            delegated.desktop_uri.as_deref(),
+            Some(
+                "t3code://threads/env-1/thread%3Adelegated-task%3Acommand%253Amcp%253Aabc?prompt=hi"
+            )
+        );
+        assert_eq!(
+            delegated.web_fallback_url.as_deref(),
+            Some(
+                "https://app.t3.codes/threads/env-1/thread%3Adelegated-task%3Acommand%253Amcp%253Aabc?prompt=hi"
+            )
+        );
+
+        // Direct `t3code://threads/...` links are preserved verbatim and gain a hosted fallback.
+        let direct = resolve_thread_open_targets("t3code://threads/env-1/thread-2");
+        assert_eq!(
+            direct.desktop_uri.as_deref(),
+            Some("t3code://threads/env-1/thread-2")
+        );
+        assert_eq!(
+            direct.web_fallback_url.as_deref(),
+            Some("https://app.t3.codes/threads/env-1/thread-2")
+        );
+
+        // Non-thread `t3code://` links stay desktop-only.
+        let new_link = resolve_thread_open_targets("t3code://new?prompt=test");
+        assert_eq!(
+            new_link.desktop_uri.as_deref(),
+            Some("t3code://new?prompt=test")
+        );
+        assert_eq!(new_link.web_fallback_url, None);
+
+        // Legacy v1 or malformed `t3-thread://` URIs never fall through as raw custom schemes.
+        let legacy = resolve_thread_open_targets("t3-thread://v1/thread-only");
+        assert_eq!(legacy.desktop_uri, None);
+        assert_eq!(legacy.web_fallback_url, None);
     }
 }
