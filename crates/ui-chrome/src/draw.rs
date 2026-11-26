@@ -116,10 +116,11 @@ pub enum ModalKind {
 }
 
 /// Strict keyboard focus owner preventing background `session_view_changed` events from
-/// stealing focus away from active modals, palettes, find bars, or context menus.
+/// stealing focus away from active modals, palettes, find bars, context menus, or the docked viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FocusTarget {
     Terminal(Option<String>),
+    Viewer,
     Modal(ModalKind),
     FindBar,
     SidebarFilter,
@@ -196,6 +197,11 @@ impl FocusGuard {
 
     pub fn focus_context_menu(&mut self) {
         self.current = FocusTarget::ContextMenu;
+    }
+
+    /// Transfers keyboard focus to the docked right-hand Viewer Pane.
+    pub fn focus_viewer(&mut self) {
+        self.current = FocusTarget::Viewer;
     }
 
     /// Restores keyboard focus to the last active terminal block.
@@ -320,6 +326,32 @@ pub enum HitTarget {
     ContextMenuItem {
         index: usize,
     },
+    // Docked right-hand Viewer Pane interactions
+    ViewerDivider,
+    ViewerSurface,
+    ViewerTab {
+        tab_id: u64,
+    },
+    ViewerTabClose {
+        tab_id: u64,
+    },
+    ViewerCopyPath,
+    ViewerOpenExternal,
+    ViewerMaximizeToggle,
+    ViewerClose,
+    ViewerWrapToggle,
+    ViewerRawToggle,
+    ViewerZoomOut,
+    ViewerZoomReset,
+    ViewerZoomIn,
+    ViewerZoomFit,
+    ViewerCanvas,
+    ViewerVideoPlayPause,
+    ViewerVideoSeekBar,
+    ViewerVideoMuteToggle,
+    ViewerVideoLoopToggle,
+    ViewerScrollbarTrack,
+    ViewerScrollbarThumb,
 }
 
 impl HitTarget {
@@ -367,6 +399,22 @@ impl HitTarget {
                 | Self::ToastBody { .. }
                 | Self::ToastDismiss { .. }
                 | Self::ContextMenuItem { .. }
+                | Self::ViewerTab { .. }
+                | Self::ViewerTabClose { .. }
+                | Self::ViewerCopyPath
+                | Self::ViewerOpenExternal
+                | Self::ViewerMaximizeToggle
+                | Self::ViewerClose
+                | Self::ViewerWrapToggle
+                | Self::ViewerRawToggle
+                | Self::ViewerZoomOut
+                | Self::ViewerZoomReset
+                | Self::ViewerZoomIn
+                | Self::ViewerZoomFit
+                | Self::ViewerVideoPlayPause
+                | Self::ViewerVideoSeekBar
+                | Self::ViewerVideoMuteToggle
+                | Self::ViewerVideoLoopToggle
         )
     }
 
@@ -404,6 +452,20 @@ impl HitTarget {
             Self::FindBarClose => Some("Close Find (Esc)"),
             Self::MinimizedCapsuleClose { .. } => Some("Close Floating Pane"),
             Self::ToastDismiss { .. } => Some("Dismiss"),
+            Self::ViewerTabClose { .. } => Some("Close Viewer Tab"),
+            Self::ViewerCopyPath => Some("Copy File Path"),
+            Self::ViewerOpenExternal => Some("Open in External App"),
+            Self::ViewerMaximizeToggle => Some("Maximize / Restore Viewer"),
+            Self::ViewerClose => Some("Close Viewer Pane"),
+            Self::ViewerWrapToggle => Some("Toggle Word Wrap"),
+            Self::ViewerRawToggle => Some("Toggle Raw / Rendered Markdown"),
+            Self::ViewerZoomOut => Some("Zoom Out (-)"),
+            Self::ViewerZoomReset => Some("Actual Size (100%)"),
+            Self::ViewerZoomIn => Some("Zoom In (+)"),
+            Self::ViewerZoomFit => Some("Fit to Viewport"),
+            Self::ViewerVideoPlayPause => Some("Play / Pause (Space)"),
+            Self::ViewerVideoMuteToggle => Some("Mute / Unmute (M)"),
+            Self::ViewerVideoLoopToggle => Some("Toggle Loop (L)"),
             _ => None,
         }
     }
@@ -912,6 +974,53 @@ pub enum UiAction {
     },
     ScrollPaneToFraction {
         block_id: String,
+        fraction: f32,
+    },
+    Viewer(ViewerAction),
+}
+
+/// High-level actions emitted by the docked right-hand Viewer Pane.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewerAction {
+    Focus,
+    BeginDividerDrag,
+    SelectTab {
+        tab_id: u64,
+    },
+    CloseTab {
+        tab_id: u64,
+    },
+    CopyPath {
+        path: String,
+    },
+    OpenExternal {
+        path: String,
+        remote_host: Option<String>,
+    },
+    ToggleMaximize,
+    ClosePane,
+    ToggleWrap,
+    ToggleRawMarkdown,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ZoomFit,
+    BeginPan,
+    ToggleVideoPlayPause {
+        tab_id: u64,
+    },
+    SeekVideo {
+        tab_id: u64,
+        fraction: f32,
+    },
+    ToggleVideoMute {
+        tab_id: u64,
+    },
+    ToggleVideoLoop {
+        tab_id: u64,
+    },
+    ScrollToFraction {
+        tab_id: u64,
         fraction: f32,
     },
 }

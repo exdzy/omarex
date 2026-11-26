@@ -4,6 +4,7 @@ pub mod app;
 pub mod bridge;
 pub mod config;
 pub mod host_manager;
+pub(crate) mod media_viewer;
 pub mod pane_store;
 #[cfg(target_os = "linux")]
 pub mod wayland_dnd;
@@ -84,6 +85,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
     let mut session: Option<String> = None;
     let mut server: Option<String> = None;
     let mut headless_path: Option<PathBuf> = None;
+    let mut headless_viewers: Vec<String> = Vec::new();
     let mut width: u32 = 1440;
     let mut height: u32 = 900;
     let mut scale: f32 = 1.0;
@@ -101,6 +103,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
             server = Some(val.to_owned());
         } else if let Some(val) = arg.strip_prefix("--headless-render=") {
             headless_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--headless-viewer=") {
+            for item in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                headless_viewers.push(item.to_owned());
+            }
         } else if let Some(val) = arg.strip_prefix("--width=") {
             width = val
                 .parse::<u32>()
@@ -145,6 +151,15 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
                         bail!("missing output PNG path for --headless-render");
                     };
                     headless_path = Some(PathBuf::from(val));
+                }
+                "--headless-viewer" => {
+                    i += 1;
+                    let Some(val) = args.get(i) else {
+                        bail!("missing path for --headless-viewer");
+                    };
+                    for item in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        headless_viewers.push(item.to_owned());
+                    }
                 }
                 "--width" => {
                     i += 1;
@@ -243,6 +258,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
                 height,
                 scale_factor: scale,
                 force_light,
+                viewer_paths: headless_viewers,
             },
         })
     } else {
@@ -279,6 +295,7 @@ OPTIONS:
         --wait-after-command, --hold Keep window open after -e command exits
     -e <COMMAND> [ARGS...]          Run command in a clean standalone ephemeral Rex session
         --headless-render <PATH>    Render live session offscreen on Vulkan to PNG path
+        --headless-viewer <PATH>    Open file/image/video in right-hand viewer for headless PNG (repeatable)
         --width <PX>                Headless render width in physical pixels (default: 1440)
         --height <PX>               Headless render height in physical pixels (default: 900)
         --scale <FACTOR>            Headless render HiDPI scale factor (default: 1.0)
@@ -352,6 +369,9 @@ mod tests {
         let act = parse_cli_args(&s(&[
             "--headless-render",
             "/tmp/out.png",
+            "--headless-viewer",
+            "README.md:12",
+            "--headless-viewer=/tmp/a.png,/tmp/b.mp4",
             "--width",
             "1920",
             "--height",
@@ -370,6 +390,10 @@ mod tests {
                 assert!((options.scale_factor - 1.5).abs() < f32::EPSILON);
                 assert!(options.force_light);
                 assert_eq!(options.session_filter.as_deref(), Some("T3 Code"));
+                assert_eq!(
+                    options.viewer_paths,
+                    vec!["README.md:12", "/tmp/a.png", "/tmp/b.mp4"]
+                );
             }
             other => panic!("expected HeadlessRender, got {other:?}"),
         }

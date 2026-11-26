@@ -32,7 +32,7 @@ use vt_engine::{
     TerminalSearch, TerminalTheme, UpdateSnapshot, ViewportMatch, VtError,
 };
 
-use crate::host_manager::{DataStreamEvent, DataStreamEventKind};
+use crate::host_manager::{DataStreamEvent, DataStreamEventKind, LOCAL_HOST_ID};
 use crate::workspace::{BlockKey, WorkspaceState};
 
 /// Default per-tick CPU budget for background `GHOSTSNP` history & image decoding (`<= 2 ms`).
@@ -660,7 +660,7 @@ impl PaneStore {
         match event.kind {
             DataStreamEventKind::Opened { welcome }
             | DataStreamEventKind::ReopenedFreshSnapshot { welcome } => {
-                let cfg = self.terminal_config(Some(welcome.channel_nonce));
+                let cfg = self.terminal_config(&key, Some(welcome.channel_nonce));
                 if let Some(existing) = self.panes.get_mut(&key) {
                     existing.reset_for_fresh_snapshot(cfg)?;
                 } else {
@@ -1436,6 +1436,45 @@ impl PaneStore {
         Ok(vt_engine::logical_line_at(term, col, row)?)
     }
 
+    /// Extracts the unwrapped logical line across both VT soft-wraps and TUI box gutters (`│ `)
+    /// along with exact per-character viewport cell coordinates for hover underline rendering.
+    pub fn logical_line_with_tui_unwrap_at(
+        &self,
+        key: &BlockKey,
+        col: u16,
+        row: u32,
+    ) -> Result<Option<vt_engine::UnwrappedLine>, PaneStoreError> {
+        let term = self.ready_terminal(key)?;
+        Ok(vt_engine::logical_line_with_tui_unwrap_at(term, col, row)?)
+    }
+
+    /// Returns all visible viewport lines stitched across VT soft-wraps and TUI gutters.
+    pub fn viewport_text_lines(&self, key: &BlockKey) -> Result<Vec<String>, PaneStoreError> {
+        let term = self.ready_terminal(key)?;
+        Ok(vt_engine::viewport_text_lines(term)?)
+    }
+
+    /// Returns the topmost Kitty image placement covering viewport cell `(col, row)`, if any.
+    pub fn kitty_placement_at(
+        &self,
+        key: &BlockKey,
+        col: u16,
+        row: u32,
+    ) -> Option<VtKittyPlacement> {
+        let pane = self.panes.get(key)?;
+        vt_engine::kitty_placement_at(&pane.kitty_placements_scratch, col, row)
+    }
+
+    /// Reads decoded RGBA8 pixel data for a Kitty graphics `image_id` from a ready pane.
+    pub fn read_kitty_image(
+        &self,
+        key: &BlockKey,
+        image_id: u32,
+    ) -> Result<Option<vt_engine::KittyImagePixels>, PaneStoreError> {
+        let term = self.ready_terminal(key)?;
+        Ok(vt_engine::read_kitty_image(term, image_id)?)
+    }
+
     /// Returns the OSC 7 working directory reported by the pane's terminal, if any.
     pub fn pwd(&self, key: &BlockKey) -> Option<String> {
         self.panes
@@ -1664,9 +1703,10 @@ impl PaneStore {
         uid
     }
 
-    fn terminal_config(&self, channel_nonce: Option<u64>) -> TerminalConfig {
+    fn terminal_config(&self, key: &BlockKey, channel_nonce: Option<u64>) -> TerminalConfig {
         TerminalConfig {
             compress_history: true,
+            kitty_image_medium_file: key.host_id == LOCAL_HOST_ID,
             initial_scheme: self.active_theme.scheme.unwrap_or(ColorScheme::Dark),
             channel_nonce,
             ..TerminalConfig::default()
@@ -1680,7 +1720,7 @@ impl PaneStore {
     ) -> Result<&mut PaneRuntime, PaneStoreError> {
         if !self.panes.contains_key(key) {
             let uid = self.alloc_pane_uid();
-            let cfg = self.terminal_config(channel_nonce);
+            let cfg = self.terminal_config(key, channel_nonce);
             let pane = PaneRuntime::new(uid, key.clone(), cfg)?;
             self.panes.insert(key.clone(), pane);
         }
@@ -1718,7 +1758,7 @@ impl PaneStore {
         rows: u16,
     ) -> Result<(), PaneStoreError> {
         let uid = self.alloc_pane_uid();
-        let cfg = self.terminal_config(None);
+        let cfg = self.terminal_config(key, None);
         let mut pane = PaneRuntime::new(uid, key.clone(), cfg.clone())?;
         let term = Terminal::new(cols, rows, cfg)?;
         term.resize(cols, rows, 10, 20)?;

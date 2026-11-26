@@ -217,6 +217,12 @@ pub enum ClientCommand {
     BalancePanes,
     EnterCopyMode,
     QuickLook,
+    ViewerOpen {
+        path: String,
+        line: Option<u32>,
+        col: Option<u32>,
+        remote_host: Option<String>,
+    },
     GoToDirectory,
     InsertPath,
     PromptJump {
@@ -377,6 +383,32 @@ pub fn parse_client_command(
         "pane.balance" => ClientCommand::BalancePanes,
         "pane.copy_mode.enter" => ClientCommand::EnterCopyMode,
         "client.quick_look" => ClientCommand::QuickLook,
+        "client.viewer.open" => {
+            let path = get_str("path")
+                .or_else(|| get_str("file"))
+                .or_else(|| get_str("url"))
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    BridgeError::UnknownAction("client.viewer.open missing path".to_owned())
+                })?;
+            let line = args
+                .and_then(|v| v.get("line"))
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n > 0);
+            let col = args
+                .and_then(|v| v.get("col").or_else(|| v.get("column")))
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n > 0);
+            let remote_host = get_str("remote_host").or_else(|| get_str("host"));
+            ClientCommand::ViewerOpen {
+                path,
+                line,
+                col,
+                remote_host,
+            }
+        }
         "pane.go_to_directory" => ClientCommand::GoToDirectory,
         "pane.insert_path" => ClientCommand::InsertPath,
         "client.prompt.next" => ClientCommand::PromptJump { next: true },
@@ -506,4 +538,41 @@ pub fn plan_remote_call(
         args: req.args.unwrap_or_else(|| serde_json::json!({})),
         timeout: CLIENT_CALL_PROXY_TIMEOUT,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_client_viewer_open_command() {
+        let args = serde_json::json!({
+            "path": "/home/user/projects/omarex/README.md",
+            "line": 42,
+            "col": 7,
+            "remote_host": "mac-studio"
+        });
+        let cmd = parse_client_command("client.viewer.open", Some(&args), None, None)
+            .expect("client.viewer.open should parse");
+        assert_eq!(
+            cmd,
+            ClientCommand::ViewerOpen {
+                path: "/home/user/projects/omarex/README.md".to_owned(),
+                line: Some(42),
+                col: Some(7),
+                remote_host: Some("mac-studio".to_owned()),
+            }
+        );
+
+        assert!(
+            parse_client_command(
+                "client.viewer.open",
+                Some(&serde_json::json!({})),
+                None,
+                None
+            )
+            .is_err(),
+            "client.viewer.open without path must error"
+        );
+    }
 }

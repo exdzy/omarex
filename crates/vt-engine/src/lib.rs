@@ -36,10 +36,11 @@ pub use input::{
     should_bypass_mouse_reporting,
 };
 pub use selection::{
-    SearchScroll, SearchStatus, SelectionAutoscroll, SelectionBehavior, SelectionGeometry,
-    SelectionGesture, TerminalSearch, ViewportMatch, clear_selection, hyperlink_at,
-    logical_line_at, select_all, select_line, select_word, selection_text,
-    viewport_row_span_is_blank,
+    CharCellOrigin, RowCellSpan, SearchScroll, SearchStatus, SelectionAutoscroll,
+    SelectionBehavior, SelectionGeometry, SelectionGesture, TerminalSearch, UnwrappedLine,
+    ViewportMatch, clear_selection, hyperlink_at, kitty_placement_at, logical_line_at,
+    logical_line_with_tui_unwrap_at, select_all, select_line, select_word, selection_text,
+    viewport_row_span_is_blank, viewport_text_lines,
 };
 pub use snapshot::{BackgroundStep, SnapshotDecoder, SnapshotFeedStatus};
 
@@ -49,6 +50,11 @@ pub const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_UNKNOWN_MAX_BYTES: usize = 64 * 1024;
 /// Safety timeout for DEC 2026 synchronized output (`RENDER_HOLD`), matching Ghostty/Rex.
 pub const RENDER_HOLD_SAFETY_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE` from `/usr/include/ghostty/vt/terminal.h`.
+const GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE: ffi::GhosttyTerminalOption = 16;
+/// `GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE` from `/usr/include/ghostty/vt/terminal.h`.
+const GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE: ffi::GhosttyTerminalData = 27;
 
 #[derive(Debug, Error)]
 pub enum VtError {
@@ -166,8 +172,9 @@ unsafe extern "C" fn decode_png_cb(
     }
     let result = std::panic::catch_unwind(|| {
         // SAFETY: `data` is valid for `data_len` bytes during this synchronous callback (`sys.h:156`).
-        let png_bytes = unsafe { std::slice::from_raw_parts(data, data_len) };
-        let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png).ok()?;
+        let image_bytes = unsafe { std::slice::from_raw_parts(data, data_len) };
+        // Auto-sniff PNG, JPEG, WebP, GIF, BMP so non-PNG Kitty `f=100` payloads also decode cleanly.
+        let img = image::load_from_memory(image_bytes).ok()?;
         let rgba = img.into_rgba8();
         let (width, height) = rgba.dimensions();
         let raw = rgba.as_raw();
@@ -300,6 +307,11 @@ pub struct TerminalTheme {
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
     pub kitty_image_storage_limit: u64,
+    /// Allow Kitty graphics file-medium (`t=f`) loading from the local filesystem.
+    ///
+    /// Defaults to `false` (safe for remote/untrusted blocks); enable only for trusted local host
+    /// blocks.
+    pub kitty_image_medium_file: bool,
     pub unknown_max_bytes: usize,
     pub compress_history: bool,
     pub scrollback_max_bytes: Option<usize>,
@@ -312,6 +324,7 @@ impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             kitty_image_storage_limit: DEFAULT_KITTY_IMAGE_STORAGE_LIMIT,
+            kitty_image_medium_file: false,
             unknown_max_bytes: DEFAULT_UNKNOWN_MAX_BYTES,
             compress_history: true,
             scrollback_max_bytes: None,
@@ -1176,6 +1189,13 @@ impl Terminal {
                 return Err(VtError::Ffi(rc_kitty));
             }
 
+            let medium_file = config.kitty_image_medium_file;
+            let _ = ffi::ghostty_terminal_set(
+                raw,
+                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
+                (&raw const medium_file).cast(),
+            );
+
             let max_unk = config.unknown_max_bytes;
             let _ = ffi::ghostty_terminal_set(
                 raw,
@@ -1260,6 +1280,45 @@ impl Terminal {
     /// Sets the expected Rex `/api/data` `WELCOME.channel_nonce` for authenticating `rex1;` APCs.
     pub fn set_channel_nonce(&self, nonce: Option<u64>) {
         self.inner.lock().cb_state.channel_nonce = nonce;
+    }
+
+    /// Enables or disables Kitty graphics file-medium (`t=f`) loading for this terminal.
+    ///
+    /// Should only be enabled for trusted local-host blocks; keep disabled (`false`) for remote
+    /// blocks.
+    pub fn set_kitty_image_medium_file(&self, enabled: bool) -> Result<(), VtError> {
+        let guard = self.inner.lock();
+        // SAFETY: `enabled` matches `bool *` for `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE`.
+        let rc = unsafe {
+            ffi::ghostty_terminal_set(
+                guard.raw,
+                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
+                (&raw const enabled).cast(),
+            )
+        };
+        if rc != ffi::GHOSTTY_SUCCESS {
+            return Err(VtError::Ffi(rc));
+        }
+        Ok(())
+    }
+
+    /// Queries whether Kitty graphics file-medium (`t=f`) loading is currently enabled.
+    pub fn kitty_image_medium_file(&self) -> Result<bool, VtError> {
+        let guard = self.inner.lock();
+        let mut enabled = false;
+        // SAFETY: `enabled` matches `bool *` for `GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE`.
+        let rc = unsafe {
+            ffi::ghostty_terminal_get(
+                guard.raw,
+                GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE,
+                (&raw mut enabled).cast(),
+            )
+        };
+        match rc {
+            ffi::GHOSTTY_SUCCESS => Ok(enabled),
+            ffi::GHOSTTY_NO_VALUE => Ok(false),
+            other => Err(VtError::Ffi(other)),
+        }
     }
 
     /// Feeds raw VT output bytes into the terminal emulator.
@@ -3424,6 +3483,198 @@ mod tests {
         assert!(
             saw_non_blank_scrollback,
             "expected viewport_row_span_is_blank to detect non-blank scrollback row"
+        );
+    }
+
+    #[test]
+    fn kitty_graphics_decodes_jpeg_webp_and_supports_local_file_medium_option() {
+        use std::io::Cursor;
+
+        // 1. Verify JPEG payload via Kitty `f=100,t=d` decodes through `decode_png_cb`.
+        let mut img = image::RgbaImage::new(4, 4);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([0xCC, 0x44, 0x22, 0xFF]);
+        }
+        let dyn_img = image::DynamicImage::ImageRgba8(img);
+
+        let mut jpeg_bytes = Vec::new();
+        dyn_img
+            .to_rgb8()
+            .write_to(&mut Cursor::new(&mut jpeg_bytes), image::ImageFormat::Jpeg)
+            .expect("encode test JPEG");
+        let jpeg_b64 = base64_encode(&jpeg_bytes);
+
+        let term = Terminal::new(80, 24, TerminalConfig::default()).unwrap();
+        term.resize(80, 24, 8, 16).unwrap();
+        assert!(
+            !term.kitty_image_medium_file().unwrap(),
+            "file medium must default to false for remote/untrusted safety"
+        );
+
+        let seq_jpg = format!("\x1b_Ga=T,f=100,t=d,i=11,c=2,r=1;{jpeg_b64}\x1b\\");
+        term.write(seq_jpg.as_bytes());
+        let jpg_pixels = read_kitty_image(&term, 11)
+            .expect("read_kitty_image JPEG")
+            .expect("JPEG image 11 should decode cleanly");
+        assert_eq!((jpg_pixels.width, jpg_pixels.height), (4, 4));
+
+        // 2. Verify WebP payload via Kitty `f=100,t=d` decodes through `decode_png_cb`.
+        let mut webp_bytes = Vec::new();
+        dyn_img
+            .write_to(&mut Cursor::new(&mut webp_bytes), image::ImageFormat::WebP)
+            .expect("encode test WebP");
+        let webp_b64 = base64_encode(&webp_bytes);
+        let seq_webp = format!("\x1b_Ga=T,f=100,t=d,i=12,c=2,r=1;{webp_b64}\x1b\\");
+        term.write(seq_webp.as_bytes());
+        let webp_pixels = read_kitty_image(&term, 12)
+            .expect("read_kitty_image WebP")
+            .expect("WebP image 12 should decode cleanly");
+        assert_eq!((webp_pixels.width, webp_pixels.height), (4, 4));
+
+        // 3. Verify `kitty_image_medium_file` option toggles on Terminal & loads local `t=f` file.
+        let mut png_bytes = Vec::new();
+        dyn_img
+            .write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .expect("encode test PNG");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "omarex-vt-kitty-file-medium-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&tmp_path, &png_bytes).expect("write temp png");
+        let path_b64 = base64_encode(tmp_path.to_string_lossy().as_bytes());
+
+        // With `kitty_image_medium_file = false`, `t=f` is ignored.
+        let seq_file_disabled = format!("\x1b_Ga=T,f=100,t=f,i=13,c=2,r=1;{path_b64}\x1b\\");
+        term.write(seq_file_disabled.as_bytes());
+        assert!(
+            read_kitty_image(&term, 13).unwrap().is_none(),
+            "t=f must remain blocked when kitty_image_medium_file is false"
+        );
+
+        // Enable via setter & via TerminalConfig for local blocks.
+        term.set_kitty_image_medium_file(true).unwrap();
+        assert!(term.kitty_image_medium_file().unwrap());
+        let seq_file_enabled = format!("\x1b_Ga=T,f=100,t=f,i=14,c=3,r=2;{path_b64}\x1b\\");
+        term.write(seq_file_enabled.as_bytes());
+        let file_pixels = read_kitty_image(&term, 14)
+            .expect("read_kitty_image t=f")
+            .expect("t=f image 14 should load when kitty_image_medium_file is enabled");
+        assert_eq!((file_pixels.width, file_pixels.height), (4, 4));
+
+        let local_term = Terminal::new(
+            80,
+            24,
+            TerminalConfig {
+                kitty_image_medium_file: true,
+                ..TerminalConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(local_term.kitty_image_medium_file().unwrap());
+
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // 4. Verify `kitty_placement_at` hit-testing against live RenderState placements.
+        let mut rs = RenderState::new().unwrap();
+        let _ = rs.begin_update(&term, Overscan::default()).unwrap();
+        rs.end_update().unwrap();
+        let mut placements = Vec::new();
+        rs.kitty_placements(&mut placements).unwrap();
+        assert!(
+            !placements.is_empty(),
+            "expected Kitty placements from transmitted images"
+        );
+        let first = placements[0];
+        let hit = kitty_placement_at(
+            &placements,
+            first.viewport_col.max(0) as u16,
+            first.viewport_row.max(0) as u32,
+        );
+        assert!(hit.is_some(), "expected kitty_placement_at hit on image");
+        assert!(
+            kitty_placement_at(&placements, 79, 23).is_none(),
+            "expected miss outside image bounds"
+        );
+    }
+
+    #[test]
+    fn logical_line_with_tui_unwrap_stitches_tr3x_gutter_wrapped_paths_and_spans() {
+        // Exact screenshot layout (86 cols): `│ ` fenced `text` and `sh` blocks with wrapped path.
+        let term = Terminal::new(86, 12, TerminalConfig::default()).unwrap();
+        let screen = concat!(
+            "  • Clickable link: omarex_demo_video_v2.mp4\r\n",
+            "  text\r\n",
+            "  │ /home/user/.cache/demo/2026-11-26-sample-session-id001/omarex_demo_vide\r\n",
+            "  │ o_v2.mp4\r\n",
+            "  sh\r\n",
+            "  │ xdg-open /home/user/.cache/demo/2026-11-26-sample-session-id001/omarex_de\r\n",
+            "  │   mo_video_v2.mp4\r\n",
+            "  │ /tmp/a.png\r\n",
+            "  │ /tmp/b.png\r\n",
+        );
+        term.write(screen.as_bytes());
+
+        // Hover row 2 (`│ /home/user/.../omarex_demo_vide`) and row 3 (`│ o_v2.mp4`):
+        let u2 = logical_line_with_tui_unwrap_at(&term, 10, 2)
+            .unwrap()
+            .expect("row 2 unwrapped");
+        let u3 = logical_line_with_tui_unwrap_at(&term, 6, 3)
+            .unwrap()
+            .expect("row 3 unwrapped");
+        let expected_path =
+            "/home/user/.cache/demo/2026-11-26-sample-session-id001/omarex_demo_video_v2.mp4";
+        assert!(
+            u2.text.contains(expected_path),
+            "expected stitched path on row 2, got {:?}",
+            u2.text
+        );
+        assert_eq!(u2.text, u3.text);
+
+        // Verify per-row cell spans cover BOTH row 2 and row 3 without including row 3's gutter.
+        let path_start = u2.text.find(expected_path).unwrap();
+        let char_start = u2.text[..path_start].chars().count();
+        let char_len = expected_path.chars().count();
+        let spans = u2.cell_spans_for_char_range(char_start..(char_start + char_len));
+        assert_eq!(
+            spans.len(),
+            2,
+            "expected 2 wrapped row spans, got {spans:?}"
+        );
+        assert_eq!(spans[0].row, 2);
+        assert_eq!(spans[0].start_col, 4);
+        assert_eq!(spans[1].row, 3);
+        assert_eq!(spans[1].start_col, 4);
+        assert_eq!(spans[1].end_col, 12);
+
+        // Hover hanging-indent `sh` block on row 6 (`│   unch_video_v2.mp4`):
+        let u6 = logical_line_with_tui_unwrap_at(&term, 8, 6)
+            .unwrap()
+            .expect("row 6 unwrapped");
+        assert!(
+            u6.text.contains(expected_path),
+            "expected stitched sh path on row 6, got {:?}",
+            u6.text
+        );
+        let sh_start = u6.text.find(expected_path).unwrap();
+        let sh_cstart = u6.text[..sh_start].chars().count();
+        let sh_spans = u6.cell_spans_for_char_range(sh_cstart..(sh_cstart + char_len));
+        assert_eq!(sh_spans.len(), 2);
+        assert_eq!(sh_spans[0].row, 5);
+        assert_eq!(sh_spans[1].row, 6);
+        assert_eq!(sh_spans[1].start_col, 6); // hanging indent skipped!
+
+        // Short consecutive path lines (rows 7 & 8) must NOT be falsely stitched together!
+        let u7 = logical_line_with_tui_unwrap_at(&term, 6, 7)
+            .unwrap()
+            .expect("row 7");
+        assert!(u7.text.contains("/tmp/a.png"));
+        assert!(!u7.text.contains("/tmp/b.png"));
+
+        // `viewport_text_lines` exposes the full stitched path for bare-filename resolution.
+        let all_lines = viewport_text_lines(&term).unwrap();
+        assert!(
+            all_lines.iter().any(|l| l.contains(expected_path)),
+            "expected viewport_text_lines to contain stitched path: {all_lines:?}"
         );
     }
 

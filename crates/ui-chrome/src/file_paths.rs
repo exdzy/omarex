@@ -4,6 +4,7 @@
 //! byte-slice scanner over the hovered wrapped line.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 /// A file path (with optional line & column) detected under a hovered terminal column/byte offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,7 +272,8 @@ fn detect_file_uri_token(
     // Strip authority (empty for `file:///...` or hostname for `file://localhost/...`).
     let slash_pos = rest.find('/')?;
     let path_with_loc = &rest[slash_pos..];
-    let (path_slice, line, column, loc_len) = split_path_and_location(path_with_loc);
+    let (path_slice, line, _end_line, column, loc_len) =
+        split_path_and_location_with_hash(path_with_loc);
     if !is_plausible_path(path_slice) {
         return None;
     }
@@ -452,6 +454,699 @@ fn char_col_to_byte(s: &str, col: usize) -> Option<usize> {
     s.char_indices().nth(col).map(|(idx, _)| idx)
 }
 
+/// Decoded filesystem path with optional line/end-line/column location parsed from `:line:col`,
+/// `(line,col)`, `#L12`, `#L12-L20`, or `#L12C5` suffixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFilePath {
+    pub path: String,
+    pub line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+/// Coarse semantic kind of a detected link or filesystem target (for badges, tooltips & routing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TargetKind {
+    TextCode,
+    Markdown,
+    Image,
+    Video,
+    ThreadLink,
+    ExternalUrl,
+    OtherFile,
+}
+
+/// Classified terminal link / file / media target ready for viewer or external dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTarget {
+    TextCode {
+        path: String,
+        line: Option<u32>,
+        end_line: Option<u32>,
+        col: Option<u32>,
+    },
+    Markdown {
+        path: String,
+        line: Option<u32>,
+        end_line: Option<u32>,
+        col: Option<u32>,
+    },
+    Image {
+        path: String,
+    },
+    Video {
+        path: String,
+    },
+    ThreadLink {
+        uri: String,
+    },
+    ExternalUrl {
+        url: String,
+    },
+    OtherFile {
+        path: String,
+    },
+}
+
+impl ResolvedTarget {
+    #[must_use]
+    pub const fn kind(&self) -> TargetKind {
+        match self {
+            Self::TextCode { .. } => TargetKind::TextCode,
+            Self::Markdown { .. } => TargetKind::Markdown,
+            Self::Image { .. } => TargetKind::Image,
+            Self::Video { .. } => TargetKind::Video,
+            Self::ThreadLink { .. } => TargetKind::ThreadLink,
+            Self::ExternalUrl { .. } => TargetKind::ExternalUrl,
+            Self::OtherFile { .. } => TargetKind::OtherFile,
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::TextCode { path, .. }
+            | Self::Markdown { path, .. }
+            | Self::Image { path }
+            | Self::Video { path }
+            | Self::OtherFile { path } => Some(path.as_str()),
+            Self::ThreadLink { .. } | Self::ExternalUrl { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn line(&self) -> Option<u32> {
+        match self {
+            Self::TextCode { line, .. } | Self::Markdown { line, .. } => *line,
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn end_line(&self) -> Option<u32> {
+        match self {
+            Self::TextCode { end_line, .. } | Self::Markdown { end_line, .. } => *end_line,
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn col(&self) -> Option<u32> {
+        match self {
+            Self::TextCode { col, .. } | Self::Markdown { col, .. } => *col,
+            _ => None,
+        }
+    }
+
+    /// Returns `true` when this target can be displayed inside OmaRex's built-in viewer pane.
+    #[must_use]
+    pub const fn is_in_app_viewable(&self) -> bool {
+        matches!(
+            self,
+            Self::TextCode { .. } | Self::Markdown { .. } | Self::Image { .. } | Self::Video { .. }
+        )
+    }
+}
+
+/// High-level link/file hit on a terminal line paired with its exact Unicode `char_span`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedLink {
+    pub target: ResolvedTarget,
+    pub display_text: String,
+    pub char_span: Range<usize>,
+}
+
+/// Decodes `%XX` UTF-8 percent-encoding (preserving invalid `%` sequences verbatim).
+#[must_use]
+pub fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    if !bytes.contains(&b'%') {
+        return input.to_owned();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[inline]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses `#L12`, `#L12-L20`, `#L12-20`, `#L12C5`, `#L12:5`, or `#12` location fragments.
+fn parse_hash_location(fragment: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = trimmed
+        .strip_prefix('L')
+        .or_else(|| trimmed.strip_prefix('l'))
+        .unwrap_or(trimmed);
+
+    // Range form: `L12-L20` or `L12-20`
+    if let Some((start_s, end_s)) = body.split_once('-') {
+        let start_line = parse_positive_u32(start_s)?;
+        let end_clean = end_s
+            .strip_prefix('L')
+            .or_else(|| end_s.strip_prefix('l'))
+            .unwrap_or(end_s);
+        let end_line = parse_positive_u32(end_clean)?;
+        return Some((start_line, Some(end_line), None));
+    }
+
+    // Column form: `L12C5`, `L12c5`, or `L12:5`
+    if let Some((line_s, col_s)) = body
+        .split_once('C')
+        .or_else(|| body.split_once('c'))
+        .or_else(|| body.split_once(':'))
+    {
+        let line = parse_positive_u32(line_s)?;
+        let col = parse_positive_u32(col_s)?;
+        return Some((line, None, Some(col)));
+    }
+
+    let line = parse_positive_u32(body)?;
+    Some((line, None, None))
+}
+
+fn split_path_and_location_with_hash(
+    token: &str,
+) -> (&str, Option<u32>, Option<u32>, Option<u32>, usize) {
+    if let Some((before_hash, fragment)) = token.rsplit_once('#')
+        && !before_hash.is_empty()
+        && let Some((line, end_line, col)) = parse_hash_location(fragment)
+    {
+        return (before_hash, Some(line), end_line, col, token.len());
+    }
+    let (base, line, col, len) = split_path_and_location(token);
+    (base, line, None, col, len)
+}
+
+/// Parses a `file://` URI (including `file:///...`, `file://localhost/...`, percent-encoding,
+/// `:line:col`, `(line,col)`, and `#L12` / `#L12-L20` / `#L12C5` fragments).
+#[must_use]
+pub fn parse_file_uri(uri: &str) -> Option<ParsedFilePath> {
+    let trimmed = uri.trim();
+    let rest = trimmed.strip_prefix("file://").or_else(|| {
+        trimmed
+            .get(..7)
+            .filter(|p| p.eq_ignore_ascii_case("file://"))
+            .map(|_| &trimmed[7..])
+    })?;
+    let slash_pos = rest.find('/')?;
+    let raw_path_loc = &rest[slash_pos..];
+    // Strip optional `?query` before location parsing if no `#` came first.
+    let (without_hash, hash_frag) = match raw_path_loc.rsplit_once('#') {
+        Some((before, frag)) => (before, Some(frag)),
+        None => (raw_path_loc, None),
+    };
+    let clean_path_part = without_hash.split('?').next().unwrap_or(without_hash);
+
+    if let Some(frag) = hash_frag
+        && let Some((line, end_line, col)) = parse_hash_location(frag)
+    {
+        return Some(ParsedFilePath {
+            path: percent_decode(clean_path_part),
+            line: Some(line),
+            end_line,
+            column: col,
+        });
+    }
+
+    let (base, line, col, _) = split_path_and_location(clean_path_part);
+    Some(ParsedFilePath {
+        path: percent_decode(base),
+        line,
+        end_line: None,
+        column: col,
+    })
+}
+
+/// Parses a raw path string (or `file://` URI) into a decoded path + optional line/range/column.
+#[must_use]
+pub fn parse_path_with_location(raw: &str) -> ParsedFilePath {
+    if let Some(parsed) = parse_file_uri(raw) {
+        return parsed;
+    }
+    let trimmed = raw.trim();
+    let (base, line, end_line, col, _) = split_path_and_location_with_hash(trimmed);
+    ParsedFilePath {
+        path: base.to_owned(),
+        line,
+        end_line,
+        column: col,
+    }
+}
+
+/// Classifies a filesystem path by extension or well-known filename into a [`TargetKind`].
+#[must_use]
+pub fn classify_extension(path: &str) -> TargetKind {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+
+    if let Some(ext) = Path::new(file_name).extension().and_then(|s| s.to_str()) {
+        return match ext.to_ascii_lowercase().as_str() {
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "ico" | "avif" | "tif"
+            | "tiff" => TargetKind::Image,
+            "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "ogv" | "flv" | "wmv" => {
+                TargetKind::Video
+            }
+            "md" | "markdown" | "mdx" | "rst" => TargetKind::Markdown,
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "pyi" | "go" | "c"
+            | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "java" | "kt" | "kts" | "swift"
+            | "rb" | "php" | "lua" | "sh" | "bash" | "zsh" | "fish" | "toml" | "json" | "jsonc"
+            | "jsonl" | "ndjson" | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "scss"
+            | "sass" | "less" | "sql" | "wgsl" | "glsl" | "vert" | "frag" | "zig" | "nix"
+            | "txt" | "log" | "csv" | "tsv" | "ini" | "conf" | "cfg" | "env" | "diff" | "patch"
+            | "lock" | "cmake" | "mk" | "proto" | "graphql" | "gql" | "vue" | "svelte"
+            | "astro" | "tf" | "hcl" | "dockerfile" | "service" | "desktop" | "tex" | "bib" => {
+                TargetKind::TextCode
+            }
+            _ => TargetKind::OtherFile,
+        };
+    }
+
+    if is_known_extensionless_filename(file_name) {
+        TargetKind::TextCode
+    } else {
+        TargetKind::OtherFile
+    }
+}
+
+fn is_known_extensionless_filename(name: &str) -> bool {
+    matches!(
+        name,
+        "Makefile"
+            | "GNUmakefile"
+            | "Dockerfile"
+            | "Containerfile"
+            | "PKGBUILD"
+            | "LICENSE"
+            | "COPYING"
+            | "README"
+            | "CHANGELOG"
+            | "Justfile"
+            | "justfile"
+            | "Procfile"
+            | "Vagrantfile"
+            | "Rakefile"
+            | "Gemfile"
+            | ".gitignore"
+            | ".gitattributes"
+            | ".dockerignore"
+            | ".editorconfig"
+            | ".env"
+            | ".bashrc"
+            | ".zshrc"
+    )
+}
+
+fn is_known_other_bare_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "pdf"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "7z"
+            | "rar"
+            | "mp3"
+            | "wav"
+            | "flac"
+            | "ogg"
+            | "aac"
+            | "m4a"
+            | "opus"
+            | "wasm"
+            | "sqlite"
+            | "db"
+            | "pkg"
+    )
+}
+
+/// Classifies a resolved filesystem path + optional location into a [`ResolvedTarget`].
+#[must_use]
+pub fn classify_path(
+    path: &str,
+    line: Option<u32>,
+    end_line: Option<u32>,
+    col: Option<u32>,
+) -> ResolvedTarget {
+    match classify_extension(path) {
+        TargetKind::Image => ResolvedTarget::Image {
+            path: path.to_owned(),
+        },
+        TargetKind::Video => ResolvedTarget::Video {
+            path: path.to_owned(),
+        },
+        TargetKind::Markdown => ResolvedTarget::Markdown {
+            path: path.to_owned(),
+            line,
+            end_line,
+            col,
+        },
+        TargetKind::TextCode => ResolvedTarget::TextCode {
+            path: path.to_owned(),
+            line,
+            end_line,
+            col,
+        },
+        _ => ResolvedTarget::OtherFile {
+            path: path.to_owned(),
+        },
+    }
+}
+
+/// Returns `true` when `uri` is a T3 Code thread deep link (`t3-thread://...` or `t3code://...`).
+#[must_use]
+pub fn is_thread_uri(uri: &str) -> bool {
+    let trimmed = uri.trim();
+    trimmed
+        .get(..12)
+        .is_some_and(|p| p.eq_ignore_ascii_case("t3-thread://"))
+        || trimmed
+            .get(..9)
+            .is_some_and(|p| p.eq_ignore_ascii_case("t3code://"))
+}
+
+/// Classifies an arbitrary URI or path (from an OSC 8 hyperlink or plain terminal text) into a
+/// [`ResolvedTarget`].
+#[must_use]
+pub fn classify_uri(uri: &str) -> ResolvedTarget {
+    let trimmed = uri.trim();
+    if is_thread_uri(trimmed) {
+        return ResolvedTarget::ThreadLink {
+            uri: trimmed.to_owned(),
+        };
+    }
+    if let Some(parsed) = parse_file_uri(trimmed) {
+        return classify_path(&parsed.path, parsed.line, parsed.end_line, parsed.column);
+    }
+    if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        || trimmed
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || trimmed
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("mailto:"))
+    {
+        return ResolvedTarget::ExternalUrl {
+            url: trimmed.to_owned(),
+        };
+    }
+    if looks_like_url(trimmed) {
+        return ResolvedTarget::ExternalUrl {
+            url: trimmed.to_owned(),
+        };
+    }
+    let parsed = parse_path_with_location(trimmed);
+    classify_path(&parsed.path, parsed.line, parsed.end_line, parsed.column)
+}
+
+/// Detects a `t3-thread://...` or `t3code://...` deep link around `hover_char_col` in `line_text`.
+#[must_use]
+pub fn detect_thread_uri_at_char_col(line_text: &str, hover_char_col: usize) -> Option<&str> {
+    let (tok, _) = token_around_char_col(line_text, hover_char_col)?;
+    is_thread_uri(tok).then_some(tok)
+}
+
+/// Detects a plausible bare filename (e.g. `omarex_launch_video_v2.mp4`, `README.md`, `main.rs:42`)
+/// without `/` around `hover_char_col`, rejecting prose words, version numbers, and URLs.
+#[must_use]
+pub fn detect_bare_filename_at_char_col(
+    line_text: &str,
+    hover_char_col: usize,
+) -> Option<DetectedFilePath<'_>> {
+    let hover_byte = char_col_to_byte(line_text, hover_char_col)?;
+    let (tok, byte_span) = token_around_byte(line_text, hover_byte)?;
+    if looks_like_url(tok) || tok.contains('/') {
+        return None;
+    }
+
+    let (token_start, token) = if let Some(eq_pos) = tok.find('=') {
+        let rhs_start = byte_span.start + eq_pos + 1;
+        if hover_byte >= rhs_start && rhs_start < byte_span.end {
+            let (s, e) = strip_wrappers(line_text, rhs_start, byte_span.end);
+            if s < e && hover_byte >= s && hover_byte < e {
+                (s, &line_text[s..e])
+            } else {
+                (byte_span.start, tok)
+            }
+        } else {
+            (byte_span.start, tok)
+        }
+    } else {
+        (byte_span.start, tok)
+    };
+    let token_end = token_start + token.len();
+
+    let (base, line, _end_line, column, link_len) = split_path_and_location_with_hash(token);
+    if !is_plausible_bare_filename(base) {
+        return None;
+    }
+
+    let final_end = (token_start + link_len).min(token_end);
+    if hover_byte < token_start || hover_byte >= final_end {
+        return None;
+    }
+
+    let char_start = line_text[..token_start].chars().count();
+    let char_len = line_text[token_start..final_end].chars().count();
+    Some(DetectedFilePath {
+        path: base,
+        line,
+        column,
+        byte_span: token_start..final_end,
+        char_span: char_start..(char_start + char_len),
+    })
+}
+
+fn is_plausible_bare_filename(name: &str) -> bool {
+    if name.len() < 3 || name.contains('/') || name.contains('\\') || name.contains("://") {
+        return false;
+    }
+    if is_known_extensionless_filename(name) {
+        return true;
+    }
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || ext.is_empty() || !stem.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return false;
+    }
+    classify_extension(name) != TargetKind::OtherFile || is_known_other_bare_extension(ext)
+}
+
+/// Scans stitched viewport lines for any full path or `file://` URI whose basename equals
+/// `filename`, returning the decoded full path (prefers absolute paths over relative ones).
+#[must_use]
+pub fn resolve_bare_filename_in_viewport(
+    filename: &str,
+    viewport_lines: &[String],
+) -> Option<String> {
+    let target_name = Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    if target_name.is_empty() {
+        return None;
+    }
+
+    let mut fallback_relative: Option<String> = None;
+
+    for line in viewport_lines {
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = line[search_from..].find(target_name) {
+            let match_byte = search_from + rel_idx;
+            if let Some(hit) = detect_at_byte_offset(line, match_byte) {
+                let decoded = if line[hit.byte_span.clone()].starts_with("file://") {
+                    percent_decode(hit.path)
+                } else {
+                    hit.path.to_owned()
+                };
+                let candidate_name = Path::new(&decoded).file_name().and_then(|s| s.to_str());
+                if candidate_name == Some(target_name) {
+                    if decoded.starts_with('/') || decoded.starts_with("~/") {
+                        return Some(decoded);
+                    }
+                    if fallback_relative.is_none() {
+                        fallback_relative = Some(decoded);
+                    }
+                }
+            }
+            search_from = match_byte + target_name.len();
+        }
+    }
+
+    fallback_relative
+}
+
+/// Resolves a bare filename against `cwd` if `cwd.join(filename)` exists on the local filesystem.
+#[must_use]
+pub fn resolve_bare_filename_in_cwd(filename: &str, cwd: &Path) -> Option<PathBuf> {
+    if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
+        return None;
+    }
+    let candidate = cwd.join(filename);
+    candidate.exists().then_some(candidate)
+}
+
+/// Unified terminal hover/click link detector combining:
+/// 1. Full/relative/quoted file paths & `file://` URIs (with percent-decoding & `#L`/`:line:col`)
+/// 2. `t3-thread://` & `t3code://` deep links
+/// 3. `http://` & `https://` URLs
+/// 4. Bare filenames (e.g. `omarex_launch_video_v2.mp4`, `README.md`) resolved via `viewport_lines`
+///    first, then `cwd` if provided.
+#[must_use]
+pub fn detect_link_at_char_col(
+    line_text: &str,
+    hover_char_col: usize,
+    viewport_lines: &[String],
+    cwd: Option<&Path>,
+) -> Option<DetectedLink> {
+    // 1. Explicit path or `file://` URI
+    if let Some(hit) = detect_at_char_col(line_text, hover_char_col) {
+        let raw_span = &line_text[hit.byte_span.clone()];
+        let parsed = if raw_span.starts_with("file://") {
+            parse_file_uri(raw_span).unwrap_or(ParsedFilePath {
+                path: percent_decode(hit.path),
+                line: hit.line,
+                end_line: None,
+                column: hit.column,
+            })
+        } else {
+            let (_base, line, end_line, col, _) = split_path_and_location_with_hash(raw_span);
+            ParsedFilePath {
+                path: hit.path.to_owned(),
+                line: line.or(hit.line),
+                end_line,
+                column: col.or(hit.column),
+            }
+        };
+        let target = classify_path(&parsed.path, parsed.line, parsed.end_line, parsed.column);
+        return Some(DetectedLink {
+            target,
+            display_text: raw_span.to_owned(),
+            char_span: hit.char_span,
+        });
+    }
+
+    // 2. `t3-thread://` or `t3code://` deep link
+    if let Some((tok, byte_span)) = token_around_char_col(line_text, hover_char_col)
+        && is_thread_uri(tok)
+    {
+        let char_start = line_text[..byte_span.start].chars().count();
+        let char_len = tok.chars().count();
+        return Some(DetectedLink {
+            target: ResolvedTarget::ThreadLink {
+                uri: tok.to_owned(),
+            },
+            display_text: tok.to_owned(),
+            char_span: char_start..(char_start + char_len),
+        });
+    }
+
+    // 3. `http://` or `https://` URL
+    if let Some(url) = detect_url_at_char_col(line_text, hover_char_col)
+        && let Some((_, byte_span)) = token_around_char_col(line_text, hover_char_col)
+    {
+        let char_start = line_text[..byte_span.start].chars().count();
+        let char_len = url.chars().count();
+        return Some(DetectedLink {
+            target: ResolvedTarget::ExternalUrl {
+                url: url.to_owned(),
+            },
+            display_text: url.to_owned(),
+            char_span: char_start..(char_start + char_len),
+        });
+    }
+
+    // 4. Bare filename resolved against visible viewport paths or CWD
+    if let Some(bare) = detect_bare_filename_at_char_col(line_text, hover_char_col) {
+        let resolved_path =
+            resolve_bare_filename_in_viewport(bare.path, viewport_lines).or_else(|| {
+                cwd.and_then(|dir| resolve_bare_filename_in_cwd(bare.path, dir))
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
+        if let Some(full_path) = resolved_path {
+            let raw_span = &line_text[bare.byte_span.clone()];
+            let (_, _, end_line, _, _) = split_path_and_location_with_hash(raw_span);
+            let target = classify_path(&full_path, bare.line, end_line, bare.column);
+            return Some(DetectedLink {
+                target,
+                display_text: raw_span.to_owned(),
+                char_span: bare.char_span,
+            });
+        }
+    }
+
+    None
+}
+
+fn token_around_char_col(line_text: &str, hover_char_col: usize) -> Option<(&str, Range<usize>)> {
+    let hover_byte = char_col_to_byte(line_text, hover_char_col)?;
+    token_around_byte(line_text, hover_byte)
+}
+
+fn token_around_byte(line_text: &str, hover_byte: usize) -> Option<(&str, Range<usize>)> {
+    let bytes = line_text.as_bytes();
+    if hover_byte >= bytes.len() || is_hard_delimiter(bytes[hover_byte]) {
+        return None;
+    }
+
+    let mut start = hover_byte;
+    while start > 0 && !is_hard_delimiter(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = hover_byte;
+    while end < bytes.len() && !is_hard_delimiter(bytes[end]) {
+        end += 1;
+    }
+    while start > 0 && !line_text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < bytes.len() && !line_text.is_char_boundary(end) {
+        end += 1;
+    }
+
+    let (s, e) = strip_wrappers(line_text, start, end);
+    if s >= e || hover_byte < s || hover_byte >= e {
+        return None;
+    }
+    Some((&line_text[s..e], s..e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +1241,171 @@ mod tests {
             Some("http://127.0.0.1:8080/test")
         );
         assert_eq!(detect_url_at_char_col(line, 0), None);
+    }
+
+    #[test]
+    fn parses_percent_encoded_file_uris_with_hash_and_colon_locations() {
+        let p1 = parse_file_uri("file:///home/user/My%20Videos/clip%20v2.mp4").unwrap();
+        assert_eq!(p1.path, "/home/user/My Videos/clip v2.mp4");
+        assert_eq!(p1.line, None);
+
+        let p2 = parse_file_uri("file://localhost/home/user/src/lib.rs#L12-L20").unwrap();
+        assert_eq!(p2.path, "/home/user/src/lib.rs");
+        assert_eq!(p2.line, Some(12));
+        assert_eq!(p2.end_line, Some(20));
+        assert_eq!(p2.column, None);
+
+        let p3 = parse_file_uri("file:///home/user/src/main.rs#L42C7").unwrap();
+        assert_eq!(p3.path, "/home/user/src/main.rs");
+        assert_eq!(p3.line, Some(42));
+        assert_eq!(p3.column, Some(7));
+
+        let p4 = parse_file_uri("file:///home/user/docs/guide.md:88:3").unwrap();
+        assert_eq!(p4.path, "/home/user/docs/guide.md");
+        assert_eq!(p4.line, Some(88));
+        assert_eq!(p4.column, Some(3));
+
+        // Hover scanning also accepts `#L` fragments on `file://` URIs.
+        let line = "open file:///home/user/src/lib.rs#L12-L20 right now";
+        let col = line.find("lib.rs").unwrap();
+        let link = detect_link_at_char_col(line, col, &[], None).expect("file URI with #L");
+        assert_eq!(
+            link.target,
+            ResolvedTarget::TextCode {
+                path: "/home/user/src/lib.rs".into(),
+                line: Some(12),
+                end_line: Some(20),
+                col: None,
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_case_bare_filename_resolves_via_stitched_viewport_and_cwd() {
+        let stitched_viewport = vec![
+            "• Clickable link: omarex_demo_video_v2.mp4".to_owned(),
+            "│ /home/user/.cache/demo/2026-11-26-sample-session/omarex_demo_video_v2.mp4"
+                .to_owned(),
+        ];
+
+        // 1. Hovering bare filename on line 0 resolves to the full stitched path from line 1!
+        let line0 = &stitched_viewport[0];
+        let col0 = line0
+            .chars()
+            .take(line0.find("omarex_demo").unwrap())
+            .count();
+        let link = detect_link_at_char_col(line0, col0, &stitched_viewport, None)
+            .expect("bare video filename should resolve via viewport");
+        assert_eq!(
+            link.target,
+            ResolvedTarget::Video {
+                path: "/home/user/.cache/demo/2026-11-26-sample-session/omarex_demo_video_v2.mp4"
+                    .into()
+            }
+        );
+        assert!(link.target.is_in_app_viewable());
+        assert_eq!(link.display_text, "omarex_demo_video_v2.mp4");
+
+        // 2. Hovering bare filename resolved via CWD when no full path is in viewport.
+        let tmp = std::env::temp_dir().join(format!("omarex-fp-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let readme = tmp.join("README.md");
+        std::fs::write(&readme, "# hello\n").unwrap();
+
+        let cwd_line = "See README.md:5 for details (version v0.1.8 or 28.0 s)";
+        let readme_col = cwd_line.find("README.md").unwrap();
+        let link_cwd = detect_link_at_char_col(cwd_line, readme_col, &[], Some(&tmp))
+            .expect("README.md should resolve against CWD");
+        assert_eq!(
+            link_cwd.target,
+            ResolvedTarget::Markdown {
+                path: readme.to_string_lossy().into_owned(),
+                line: Some(5),
+                end_line: None,
+                col: None,
+            }
+        );
+
+        // Version numbers / decimals must NOT trigger bare-filename detection.
+        assert!(
+            detect_bare_filename_at_char_col(cwd_line, cwd_line.find("v0.1.8").unwrap()).is_none()
+        );
+        assert!(
+            detect_bare_filename_at_char_col(cwd_line, cwd_line.find("28.0").unwrap()).is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn classifies_thread_links_images_videos_markdown_code_and_other_files() {
+        assert_eq!(
+            classify_uri("t3-thread://v2/env-1/thread-abc"),
+            ResolvedTarget::ThreadLink {
+                uri: "t3-thread://v2/env-1/thread-abc".into(),
+            }
+        );
+        assert_eq!(
+            classify_uri("t3code://threads/env-1/thread-abc"),
+            ResolvedTarget::ThreadLink {
+                uri: "t3code://threads/env-1/thread-abc".into(),
+            }
+        );
+        assert_eq!(
+            classify_uri("https://github.com/exdzy/omarex/releases"),
+            ResolvedTarget::ExternalUrl {
+                url: "https://github.com/exdzy/omarex/releases".into(),
+            }
+        );
+        assert_eq!(
+            classify_uri("file:///tmp/preview%20shot.webp"),
+            ResolvedTarget::Image {
+                path: "/tmp/preview shot.webp".into(),
+            }
+        );
+        assert_eq!(
+            classify_uri("file:///tmp/demo.mp4"),
+            ResolvedTarget::Video {
+                path: "/tmp/demo.mp4".into(),
+            }
+        );
+        assert_eq!(
+            classify_uri("/home/user/projects/omarex/README.md#L10-L25"),
+            ResolvedTarget::Markdown {
+                path: "/home/user/projects/omarex/README.md".into(),
+                line: Some(10),
+                end_line: Some(25),
+                col: None,
+            }
+        );
+        assert_eq!(
+            classify_uri("/home/user/projects/omarex/crates/vt-engine/src/lib.rs:170:9"),
+            ResolvedTarget::TextCode {
+                path: "/home/user/projects/omarex/crates/vt-engine/src/lib.rs".into(),
+                line: Some(170),
+                end_line: None,
+                col: Some(9),
+            }
+        );
+        assert_eq!(
+            classify_uri("/tmp/archive.tar.gz"),
+            ResolvedTarget::OtherFile {
+                path: "/tmp/archive.tar.gz".into(),
+            }
+        );
+
+        let line = "Jump to t3-thread://v2/env-1234/thread-5678 or t3code://threads/e/t";
+        let col = line.find("env-1234").unwrap();
+        assert_eq!(
+            detect_thread_uri_at_char_col(line, col),
+            Some("t3-thread://v2/env-1234/thread-5678")
+        );
+        let link = detect_link_at_char_col(line, col, &[], None).unwrap();
+        assert_eq!(
+            link.target,
+            ResolvedTarget::ThreadLink {
+                uri: "t3-thread://v2/env-1234/thread-5678".into(),
+            }
+        );
     }
 }

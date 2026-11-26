@@ -462,6 +462,186 @@ pub fn compute_chrome_layout(
     }
 }
 
+/// Default width fraction of `chrome.workspace` occupied by the docked right-hand viewer pane.
+pub const VIEWER_DEFAULT_RATIO: f32 = 0.45;
+/// Minimum allowed width fraction of `chrome.workspace` for the docked right-hand viewer pane.
+pub const VIEWER_MIN_RATIO: f32 = 0.22;
+/// Maximum allowed width fraction of `chrome.workspace` for the docked right-hand viewer pane.
+pub const VIEWER_MAX_RATIO: f32 = 0.78;
+
+/// Clamps a viewer split ratio into `[VIEWER_MIN_RATIO, VIEWER_MAX_RATIO]`, falling back to
+/// [`VIEWER_DEFAULT_RATIO`] for non-finite values.
+#[must_use]
+pub fn clamp_viewer_ratio(ratio: f32) -> f32 {
+    if ratio.is_finite() {
+        ratio.clamp(VIEWER_MIN_RATIO, VIEWER_MAX_RATIO)
+    } else {
+        VIEWER_DEFAULT_RATIO
+    }
+}
+
+/// Resolved pixel geometry for splitting `chrome.workspace` horizontally into
+/// `[Terminal Workspace | Draggable Divider | Right-Hand Viewer Pane]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewerSplitGeometry {
+    /// Area remaining for tiled/floating terminal panes (empty width when maximized).
+    pub terminal_workspace: RectF,
+    /// Visual divider strip between terminal workspace and viewer pane (`None` when maximized).
+    pub divider_visual_rect: Option<RectF>,
+    /// Expanded pointer hit-test rect (`>= 6px` wide) centered on the divider (`None` when maximized).
+    pub divider_hit_rect: Option<RectF>,
+    /// Outer card rect of the right-hand viewer pane (or full padded workspace when maximized).
+    pub viewer_rect: RectF,
+    /// Effective viewer width fraction clamped to `[0.22, 0.78]`, or `1.0` when maximized.
+    pub effective_ratio: f32,
+    /// Corner radius applied to the viewer card (`0.0` in `Compact`, up to `16.0` in `Comfortable`).
+    pub corner_radius: f32,
+}
+
+/// Computes horizontal split geometry inside `workspace` when the docked right-hand viewer pane is open.
+///
+/// Uses `taffy::TaffyTree` flexbox (`FlexDirection::Row`) to partition `workspace` cleanly into
+/// non-overlapping `[Terminal Workspace | Divider | Viewer Pane]` regions. Returns `None` when
+/// `viewer_open` is `false` or `workspace` is empty.
+#[must_use]
+pub fn layout_workspace_with_viewer(
+    workspace: RectF,
+    viewer_open: bool,
+    viewer_maximized: bool,
+    viewer_ratio: f32,
+    cfg: &ChromeLayoutConfig,
+) -> Option<ViewerSplitGeometry> {
+    if !viewer_open || workspace.is_empty() {
+        return None;
+    }
+
+    let margin = cfg.outer_margin();
+    let corner_radius = cfg.pane_corner_radius();
+
+    if viewer_maximized {
+        return Some(ViewerSplitGeometry {
+            terminal_workspace: RectF::new(workspace.x, workspace.y, 0.0, workspace.h),
+            divider_visual_rect: None,
+            divider_hit_rect: None,
+            viewer_rect: workspace.inset_uniform(margin),
+            effective_ratio: 1.0,
+            corner_radius,
+        });
+    }
+
+    let clamped = clamp_viewer_ratio(viewer_ratio);
+    let divider_w = if margin > 0.0 { 2.0 } else { 1.0 };
+    let avail_w = (workspace.w - divider_w).max(0.0);
+    let viewer_outer_w = (avail_w * clamped).round().clamp(0.0, avail_w);
+
+    let mut tree: TaffyTree<()> = TaffyTree::new();
+    let term_node = tree
+        .new_leaf(Style {
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            size: Size {
+                width: auto(),
+                height: percent(1.0),
+            },
+            ..Style::DEFAULT
+        })
+        .expect("taffy viewer terminal leaf");
+    let div_node = tree
+        .new_leaf(Style {
+            flex_shrink: 0.0,
+            size: Size {
+                width: length(divider_w),
+                height: percent(1.0),
+            },
+            ..Style::DEFAULT
+        })
+        .expect("taffy viewer divider leaf");
+    let viewer_node = tree
+        .new_leaf(Style {
+            flex_shrink: 0.0,
+            size: Size {
+                width: length(viewer_outer_w),
+                height: percent(1.0),
+            },
+            ..Style::DEFAULT
+        })
+        .expect("taffy viewer pane leaf");
+    let root = tree
+        .new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                size: Size {
+                    width: length(workspace.w),
+                    height: length(workspace.h),
+                },
+                ..Style::DEFAULT
+            },
+            &[term_node, div_node, viewer_node],
+        )
+        .expect("taffy viewer root");
+
+    tree.compute_layout(
+        root,
+        Size {
+            width: AvailableSpace::Definite(workspace.w),
+            height: AvailableSpace::Definite(workspace.h),
+        },
+    )
+    .expect("taffy viewer compute_layout");
+
+    let terminal_workspace = RectF::from_taffy(
+        tree.layout(term_node).expect("viewer terminal layout"),
+        workspace.x,
+        workspace.y,
+    );
+    let div_raw = RectF::from_taffy(
+        tree.layout(div_node).expect("viewer divider layout"),
+        workspace.x,
+        workspace.y,
+    );
+    let viewer_outer = RectF::from_taffy(
+        tree.layout(viewer_node).expect("viewer pane layout"),
+        workspace.x,
+        workspace.y,
+    );
+
+    let viewer_rect = viewer_outer.inset(0.0, margin, margin, margin);
+    let divider_visual_rect = RectF::new(
+        div_raw.x,
+        workspace.y + margin,
+        div_raw.w,
+        (workspace.h - margin * 2.0).max(0.0),
+    );
+    let hit_w = ChromeLayoutConfig::RESIZE_HANDLE_WIDTH.max(8.0);
+    let divider_hit_rect = RectF::new(
+        (div_raw.x + div_raw.w * 0.5 - hit_w * 0.5).clamp(workspace.x, workspace.right()),
+        workspace.y,
+        hit_w.min(workspace.w),
+        workspace.h,
+    );
+
+    Some(ViewerSplitGeometry {
+        terminal_workspace,
+        divider_visual_rect: Some(divider_visual_rect),
+        divider_hit_rect: Some(divider_hit_rect),
+        viewer_rect,
+        effective_ratio: clamped,
+        corner_radius,
+    })
+}
+
+/// Converts a pointer X coordinate dragged inside `workspace` into a clamped right-hand viewer
+/// split ratio in `[VIEWER_MIN_RATIO, VIEWER_MAX_RATIO]`.
+#[must_use]
+pub fn compute_viewer_drag_ratio(workspace: RectF, px: f32) -> f32 {
+    if workspace.w <= 0.0 || !px.is_finite() {
+        return VIEWER_DEFAULT_RATIO;
+    }
+    let viewer_fraction = (workspace.right() - px) / workspace.w;
+    clamp_viewer_ratio(viewer_fraction)
+}
+
 /// Direction of a binary split container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitAxis {

@@ -1,11 +1,13 @@
 //! Safe wrappers for `GhosttySelectionGesture`, plain-text selection extraction,
 //! OSC 8 hyperlink lookup, and incremental terminal scrollback search (`search.h`).
 
+use std::ops::Range;
 use std::ptr;
 use std::sync::Weak;
 
 use parking_lot::Mutex;
 
+use crate::images::KittyPlacement;
 use crate::{Terminal, TerminalInner, VtError, ffi};
 
 // ---------------------------------------------------------------------------
@@ -864,6 +866,575 @@ pub fn logical_line_at(
     let prefix = format_explicit_selection(guard.raw, &prefix_sel, true, false)?;
     let hover_char_col = prefix.chars().count().saturating_sub(1);
     Ok(Some((line_text, hover_char_col)))
+}
+
+/// A contiguous cell span on a single viewport row (0-based `row`, half-open column range).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RowCellSpan {
+    pub row: u32,
+    pub start_col: u16,
+    pub end_col: u16,
+}
+
+/// Origin cell of one Unicode character inside an [`UnwrappedLine`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct CharCellOrigin {
+    pub row: u32,
+    pub col: u16,
+    pub width: u8,
+}
+
+/// Logical line unwrapped across both VT soft-wraps and TUI box-gutter continuations
+/// (such as `│ ` / `┃ ` code blocks in `tr3x`), with exact per-character viewport cell mapping
+/// for multi-row hover underline rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwrappedLine {
+    pub text: String,
+    /// 0-based Unicode character index in `text` corresponding to the hovered `(col, row)`.
+    pub hover_char_col: usize,
+    /// Parallel to `text.chars()` — exact viewport `(row, col, width)` for each character.
+    pub char_cells: Vec<CharCellOrigin>,
+}
+
+impl UnwrappedLine {
+    /// Converts a Unicode character range (such as `DetectedFilePath::char_span`) into one or
+    /// more per-row [`RowCellSpan`]s suitable for rendering hover underlines across wrapped rows.
+    #[must_use]
+    pub fn cell_spans_for_char_range(&self, char_range: Range<usize>) -> Vec<RowCellSpan> {
+        let mut spans: Vec<RowCellSpan> = Vec::new();
+        let end = char_range.end.min(self.char_cells.len());
+        if char_range.start >= end {
+            return spans;
+        }
+        for cell in &self.char_cells[char_range.start..end] {
+            let cell_end = cell.col.saturating_add(u16::from(cell.width.max(1)));
+            if let Some(last) = spans.last_mut()
+                && last.row == cell.row
+                && cell.col <= last.end_col
+            {
+                last.end_col = last.end_col.max(cell_end);
+            } else {
+                spans.push(RowCellSpan {
+                    row: cell.row,
+                    start_col: cell.col,
+                    end_col: cell_end,
+                });
+            }
+        }
+        spans
+    }
+}
+
+/// Internal parsed representation of a single viewport row for TUI gutter stitching.
+struct RawViewportRow {
+    row: u32,
+    chars: Vec<(char, u16, u8)>,
+    vt_wraps_next: bool,
+    gutter: Option<(char, u16)>,
+    /// Leading space count before content (used when `gutter` is `None`).
+    indent_cols: u16,
+    /// Index into `chars` where non-gutter, non-indent content begins.
+    content_start_idx: usize,
+    /// Index into `chars` one past the last non-whitespace character.
+    trimmed_end_idx: usize,
+    /// 1-past-end column of the last non-whitespace character (0 if blank).
+    trimmed_end_col: u16,
+}
+
+impl RawViewportRow {
+    fn content_str(&self) -> String {
+        if self.content_start_idx >= self.trimmed_end_idx {
+            return String::new();
+        }
+        self.chars[self.content_start_idx..self.trimmed_end_idx]
+            .iter()
+            .map(|(ch, _, _)| *ch)
+            .collect()
+    }
+
+    fn full_str(&self) -> String {
+        self.chars.iter().map(|(ch, _, _)| *ch).collect()
+    }
+}
+
+#[inline]
+fn is_tui_gutter_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '│' | '┃' | '║' | '▏' | '▎' | '▍' | '▌' | '┆' | '┇' | '┊' | '┋' | '|'
+    )
+}
+
+#[inline]
+fn char_display_width(ch: char) -> u8 {
+    let cp = ch as u32;
+    if ch == '\0'
+        || ch == '\u{200D}'
+        || (0x0300..=0x036F).contains(&cp)
+        || (0xFE00..=0xFE0F).contains(&cp)
+    {
+        return 0;
+    }
+    if (0x1100..=0x115F).contains(&cp)
+        || (0x2E80..=0xA4CF).contains(&cp)
+        || (0xAC00..=0xD7A3).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFE10..=0xFE19).contains(&cp)
+        || (0xFE30..=0xFE6F).contains(&cp)
+        || (0xFF00..=0xFF60).contains(&cp)
+        || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0x1F300..=0x1FAFF).contains(&cp)
+        || (0x20000..=0x3FFFD).contains(&cp)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn read_viewport_row(
+    raw: ffi::GhosttyTerminal,
+    cols: u16,
+    rows: u16,
+    row: u32,
+) -> Result<Option<RawViewportRow>, VtError> {
+    if cols == 0 || row >= u32::from(rows) {
+        return Ok(None);
+    }
+
+    let mut ref0 = ffi::GhosttyGridRef::default();
+    let mut ref1 = ffi::GhosttyGridRef::default();
+    // SAFETY: `raw` is locked by caller; `(0, row)` and `(cols - 1, row)` are in-bounds.
+    let r0 = unsafe {
+        ffi::ghostty_terminal_grid_ref(raw, ffi::GhosttyPoint::viewport(0, row), &raw mut ref0)
+    };
+    let r1 = unsafe {
+        ffi::ghostty_terminal_grid_ref(
+            raw,
+            ffi::GhosttyPoint::viewport(cols.saturating_sub(1), row),
+            &raw mut ref1,
+        )
+    };
+    if r0 != ffi::GHOSTTY_SUCCESS || r1 != ffi::GHOSTTY_SUCCESS {
+        return Ok(None);
+    }
+
+    // Check if `libghostty-vt` considers this row soft-wrapped onto `row + 1`.
+    let mut vt_wraps_next = false;
+    if row + 1 < u32::from(rows) {
+        let opts = ffi::GhosttyTerminalSelectLineOptions {
+            size: std::mem::size_of::<ffi::GhosttyTerminalSelectLineOptions>(),
+            ref_: ref0,
+            whitespace: ptr::null(),
+            whitespace_len: 0,
+            semantic_prompt_boundary: false,
+        };
+        let mut line_sel = ffi::GhosttySelection::default();
+        // SAFETY: `raw` is locked; `opts` and `line_sel` have valid `.size`.
+        if unsafe { ffi::ghostty_terminal_select_line(raw, &raw const opts, &raw mut line_sel) }
+            == ffi::GHOSTTY_SUCCESS
+        {
+            let mut end_pt = ffi::GhosttyPointCoordinate::default();
+            if unsafe {
+                ffi::ghostty_terminal_point_from_grid_ref(
+                    raw,
+                    &raw const line_sel.end,
+                    ffi::GHOSTTY_POINT_TAG_VIEWPORT,
+                    &raw mut end_pt,
+                )
+            } == ffi::GHOSTTY_SUCCESS
+            {
+                vt_wraps_next = end_pt.y > row;
+            }
+        }
+    }
+
+    let row_sel = ffi::GhosttySelection {
+        size: std::mem::size_of::<ffi::GhosttySelection>(),
+        start: ref0,
+        end: ref1,
+        rectangle: true,
+    };
+    let text = format_explicit_selection(raw, &row_sel, false, !vt_wraps_next)?;
+
+    let mut chars = Vec::with_capacity(text.len());
+    let mut cur_col: u16 = 0;
+    for ch in text.chars() {
+        let w = char_display_width(ch);
+        if w == 0 {
+            let prev_col = cur_col.saturating_sub(1);
+            chars.push((ch, prev_col, 1));
+        } else {
+            chars.push((ch, cur_col, w));
+            cur_col = cur_col.saturating_add(u16::from(w));
+        }
+    }
+
+    let mut trimmed_end_idx = chars.len();
+    while trimmed_end_idx > 0 && chars[trimmed_end_idx - 1].0.is_whitespace() {
+        trimmed_end_idx -= 1;
+    }
+    let trimmed_end_col = if trimmed_end_idx > 0 {
+        let (_, c, w) = chars[trimmed_end_idx - 1];
+        c.saturating_add(u16::from(w))
+    } else {
+        0
+    };
+
+    // Detect leading whitespace and optional TUI box gutter (`│ `, `┃ `, etc.).
+    let mut i = 0usize;
+    while i < trimmed_end_idx && chars[i].0 == ' ' {
+        i += 1;
+    }
+    let indent_cols = chars.get(i).map_or(0, |&(_, c, _)| c);
+
+    let (gutter, content_start_idx) = if i < trimmed_end_idx
+        && indent_cols <= 16
+        && is_tui_gutter_char(chars[i].0)
+        && chars.get(i + 1).is_some_and(|&(next, _, _)| next == ' ')
+    {
+        let g = (chars[i].0, chars[i].1);
+        let mut j = i + 1;
+        while j < trimmed_end_idx && chars[j].0 == ' ' {
+            j += 1;
+        }
+        (Some(g), j)
+    } else {
+        (None, i)
+    };
+
+    Ok(Some(RawViewportRow {
+        row,
+        chars,
+        vt_wraps_next,
+        gutter,
+        indent_cols,
+        content_start_idx,
+        trimmed_end_idx,
+        trimmed_end_col,
+    }))
+}
+
+#[inline]
+fn is_path_or_url_continuation_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '-' | '.' | '/' | '~' | '%' | '+' | '@' | ':' | '=' | '&' | '?' | '#' | ','
+        )
+        || (!ch.is_ascii() && !ch.is_whitespace() && !is_tui_gutter_char(ch) && ch != '•')
+}
+
+/// Decides whether `prev` hard-wraps directly into `next` across a TUI gutter or margin.
+fn should_stitch_tui_rows(prev: &RawViewportRow, next: &RawViewportRow, cols: u16) -> bool {
+    if prev.vt_wraps_next {
+        return true;
+    }
+    if prev.content_start_idx >= prev.trimmed_end_idx
+        || next.content_start_idx >= next.trimmed_end_idx
+    {
+        return false;
+    }
+
+    // Must share the same TUI gutter (e.g. `│` at same column), or both be unguttered with
+    // compatible indentation.
+    match (prev.gutter, next.gutter) {
+        (Some(g1), Some(g2)) if g1 == g2 => {}
+        (None, None)
+            if next.indent_cols >= prev.indent_cols
+                && next.indent_cols <= prev.indent_cols.saturating_add(6) => {}
+        _ => return false,
+    }
+
+    // Require `prev` to reach a plausible wrap boundary so two consecutive short path lines
+    // (e.g. `│ /tmp/a.png` followed by `│ /tmp/b.png`) are never falsely concatenated.
+    let near_wrap_edge = prev.trimmed_end_col.saturating_add(16) >= cols
+        || u32::from(prev.trimmed_end_col) * 100 >= u32::from(cols.max(1)) * 55;
+    if !near_wrap_edge {
+        return false;
+    }
+
+    let prev_content = prev.content_str();
+    let next_content = next.content_str();
+
+    // Check trailing token of `prev_content`: must look like an active path or URL.
+    let trailing_token = prev_content
+        .rsplit(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '|'))
+        .next()
+        .unwrap_or("");
+    let trailing_clean = trailing_token.trim_start_matches(['(', '[', '{']);
+    let looks_like_path_or_url = trailing_clean.contains('/') || trailing_clean.contains("://");
+    if !looks_like_path_or_url {
+        return false;
+    }
+    let Some(last_ch) = trailing_clean.chars().last() else {
+        return false;
+    };
+    if !is_path_or_url_continuation_char(last_ch) || matches!(last_ch, ',' | ';' | '!' | '?') {
+        return false;
+    }
+
+    // Check leading content of `next_content`: must look like a path/URL continuation, not a new
+    // bullet, shell prompt, heading, or brand-new root URL/path (unless right at the right edge).
+    let Some(first_ch) = next_content.chars().next() else {
+        return false;
+    };
+    if !is_path_or_url_continuation_char(first_ch) {
+        return false;
+    }
+    if next_content.starts_with("- ")
+        || next_content.starts_with("* ")
+        || next_content.starts_with("# ")
+        || next_content.starts_with("$ ")
+        || next_content.starts_with("> ")
+        || next_content.starts_with("http://")
+        || next_content.starts_with("https://")
+        || next_content.starts_with("file://")
+        || next_content.starts_with("~/")
+        || next_content.starts_with("./")
+        || next_content.starts_with("../")
+    {
+        return false;
+    }
+    if first_ch == '/' && prev.trimmed_end_col.saturating_add(8) < cols {
+        return false;
+    }
+
+    true
+}
+
+fn stitch_row_group(
+    rows: &[RawViewportRow],
+    hover_target: Option<(u32, u16)>,
+) -> Option<(String, Vec<CharCellOrigin>, Option<usize>)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    let mut char_cells = Vec::new();
+    let mut hover_char_col = None;
+
+    for (idx, r) in rows.iter().enumerate() {
+        let start_idx = if idx == 0 || rows[idx - 1].vt_wraps_next {
+            0
+        } else {
+            r.content_start_idx
+        };
+        let end_idx = if r.vt_wraps_next {
+            r.chars.len()
+        } else {
+            r.trimmed_end_idx
+        };
+        if start_idx >= end_idx {
+            continue;
+        }
+        for &(ch, c, w) in &r.chars[start_idx..end_idx] {
+            if let Some((h_row, h_col)) = hover_target
+                && r.row == h_row
+                && h_col >= c
+                && h_col < c.saturating_add(u16::from(w.max(1)))
+            {
+                hover_char_col = Some(char_cells.len());
+            }
+            text.push(ch);
+            char_cells.push(CharCellOrigin {
+                row: r.row,
+                col: c,
+                width: w,
+            });
+        }
+    }
+
+    if text.is_empty() {
+        return None;
+    }
+    Some((text, char_cells, hover_char_col))
+}
+
+/// Extracts the unwrapped logical line at viewport `(col, row)`, stitching both VT soft-wraps
+/// AND TUI hard-wrapped gutter lines (such as `│ ` fenced code blocks in `tr3x`), and returning
+/// exact per-character viewport cell coordinates for hover underline rendering.
+pub fn logical_line_with_tui_unwrap_at(
+    terminal: &Terminal,
+    col: u16,
+    row: u32,
+) -> Result<Option<UnwrappedLine>, VtError> {
+    const MAX_STITCH_ROWS: u32 = 12;
+
+    let guard = terminal.inner.lock();
+    let mut cols: u16 = 0;
+    let mut rows: u16 = 0;
+    // SAFETY: `guard.raw` is locked.
+    let rc_c = unsafe {
+        ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_COLS,
+            (&raw mut cols).cast(),
+        )
+    };
+    let rc_r = unsafe {
+        ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_ROWS,
+            (&raw mut rows).cast(),
+        )
+    };
+    if rc_c != ffi::GHOSTTY_SUCCESS || rc_r != ffi::GHOSTTY_SUCCESS || cols == 0 || rows == 0 {
+        return Ok(None);
+    }
+    if col >= cols || row >= u32::from(rows) {
+        return Ok(None);
+    }
+
+    let Some(center) = read_viewport_row(guard.raw, cols, rows, row)? else {
+        return Ok(None);
+    };
+    if center.trimmed_end_idx == 0 && !center.vt_wraps_next {
+        return Ok(None);
+    }
+
+    // Expand upward while the previous row stitches into the current first row.
+    let mut above: Vec<RawViewportRow> = Vec::new();
+    let mut cur_top = row;
+    while cur_top > 0 && row - cur_top < MAX_STITCH_ROWS {
+        let prev_row_idx = cur_top - 1;
+        let Some(prev) = read_viewport_row(guard.raw, cols, rows, prev_row_idx)? else {
+            break;
+        };
+        let next_ref = above.last().unwrap_or(&center);
+        if should_stitch_tui_rows(&prev, next_ref, cols) {
+            above.push(prev);
+            cur_top = prev_row_idx;
+        } else {
+            break;
+        }
+    }
+    above.reverse();
+
+    // Expand downward while the current last row stitches into the next row.
+    let mut below: Vec<RawViewportRow> = Vec::new();
+    let mut cur_bot = row;
+    while cur_bot + 1 < u32::from(rows) && cur_bot - row < MAX_STITCH_ROWS {
+        let next_row_idx = cur_bot + 1;
+        let Some(next) = read_viewport_row(guard.raw, cols, rows, next_row_idx)? else {
+            break;
+        };
+        let prev_ref = below.last().unwrap_or(&center);
+        if should_stitch_tui_rows(prev_ref, &next, cols) {
+            below.push(next);
+            cur_bot = next_row_idx;
+        } else {
+            break;
+        }
+    }
+
+    let mut group = Vec::with_capacity(above.len() + 1 + below.len());
+    group.extend(above);
+    group.push(center);
+    group.extend(below);
+
+    let Some((text, char_cells, Some(hover_char_col))) = stitch_row_group(&group, Some((row, col)))
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(UnwrappedLine {
+        text,
+        hover_char_col,
+        char_cells,
+    }))
+}
+
+/// Returns all non-empty visible viewport lines with VT soft-wraps and TUI gutter continuations
+/// stitched together (handy for resolving bare filenames against full paths visible on screen).
+pub fn viewport_text_lines(terminal: &Terminal) -> Result<Vec<String>, VtError> {
+    let guard = terminal.inner.lock();
+    let mut cols: u16 = 0;
+    let mut rows: u16 = 0;
+    // SAFETY: `guard.raw` is locked.
+    let rc_c = unsafe {
+        ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_COLS,
+            (&raw mut cols).cast(),
+        )
+    };
+    let rc_r = unsafe {
+        ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_ROWS,
+            (&raw mut rows).cast(),
+        )
+    };
+    if rc_c != ffi::GHOSTTY_SUCCESS || rc_r != ffi::GHOSTTY_SUCCESS || cols == 0 || rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut raw_rows = Vec::with_capacity(usize::from(rows));
+    for r in 0..u32::from(rows) {
+        if let Some(parsed) = read_viewport_row(guard.raw, cols, rows, r)? {
+            raw_rows.push(parsed);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < raw_rows.len() {
+        let mut end = i;
+        while end + 1 < raw_rows.len()
+            && should_stitch_tui_rows(&raw_rows[end], &raw_rows[end + 1], cols)
+        {
+            end += 1;
+        }
+        if let Some((stitched, _, _)) = stitch_row_group(&raw_rows[i..=end], None) {
+            let trimmed = stitched.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_owned());
+            }
+        } else {
+            let fallback = raw_rows[i].full_str();
+            let trimmed = fallback.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_owned());
+            }
+        }
+        i = end + 1;
+    }
+
+    Ok(out)
+}
+
+/// Returns the topmost Kitty image placement covering viewport cell `(col, row)`, if any.
+///
+/// Placements are compared by `(z_layer, z_index)` so foreground images take priority over
+/// background images when overlapping.
+#[must_use]
+pub fn kitty_placement_at(
+    placements: &[KittyPlacement],
+    col: u16,
+    row: u32,
+) -> Option<KittyPlacement> {
+    let col_i = i32::from(col);
+    let row_i = i32::try_from(row).ok()?;
+    let mut best: Option<KittyPlacement> = None;
+
+    for &p in placements {
+        let gcols = i32::try_from(p.grid_cols.max(1)).unwrap_or(i32::MAX);
+        let grows = i32::try_from(p.grid_rows.max(1)).unwrap_or(i32::MAX);
+        let col_end = p.viewport_col.saturating_add(gcols);
+        let row_end = p.viewport_row.saturating_add(grows);
+        if col_i >= p.viewport_col && col_i < col_end && row_i >= p.viewport_row && row_i < row_end
+        {
+            let replace = match best {
+                None => true,
+                Some(prev) => (p.z_layer, p.z_index) >= (prev.z_layer, prev.z_index),
+            };
+            if replace {
+                best = Some(p);
+            }
+        }
+    }
+    best
 }
 
 /// Checks whether the cell span `[col_start..col_end)` on an arbitrary signed row offset relative

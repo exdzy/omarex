@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -37,19 +38,22 @@ use tr3x_bridge::{
     reply_to_proto, rollup_records,
 };
 use ui_chrome::{
-    ChromeLayoutConfig, DividerGeometry, DropZone, DropZoneHit, FloatingHitZone, FloatingLayerSpec,
-    FocusTarget, FontKind, FontWeight as UiFontWeight, HitTarget, HostConnectionState,
-    HoverPreviewState, IconId, ModalContent, ModalKey, ModalKind, ModalState, Osc94Progress,
-    Osc94State, PaletteItem, PaneDensity, PaneHeaderButton, PaneHeaderMode, PaneMeta, RectF,
-    ScrollbarMetrics, SettingChange, SettingsViewSnapshot, SidebarHostView, SidebarSessionView,
-    SidebarTabView, SplitAxis, SplitNode, TextAlign as UiTextAlign, ToastItem, ToastSeverity,
+    ChromeLayoutConfig, ContextMenuItem, DividerGeometry, DropZone, DropZoneHit, FloatingHitZone,
+    FloatingLayerSpec, FocusTarget, FontKind, FontWeight as UiFontWeight, HitTarget,
+    HostConnectionState, HoverPreviewState, IconId, ImageViewerState, ModalContent, ModalKey,
+    ModalKind, ModalState, Osc94Progress, Osc94State, PaletteItem, PaneDensity, PaneHeaderButton,
+    PaneHeaderMode, PaneMeta, RectF, ResolvedTarget, ScrollbarMetrics, SettingChange,
+    SettingsViewSnapshot, SidebarHostView, SidebarSessionView, SidebarTabView, SplitAxis,
+    SplitNode, TargetKind, TextAlign as UiTextAlign, TextViewerState, ToastItem, ToastSeverity,
     ToolbarBehavior, ToolbarPosition, UiAction, UiFrameInput, UiPrimitive, UiRenderOutput, UiTree,
-    WhichKeyState, compute_drag_ratio, detect_at_char_col, detect_url_at_char_col,
+    VideoViewerState, ViewerAction, ViewerContent, ViewerImagePlacement, WhichKeyState,
+    classify_path, classify_uri, compute_drag_ratio, compute_viewer_drag_ratio,
+    detect_link_at_char_col, parse_path_with_location, scrub_fraction_from_x,
 };
 use vt_engine::{
     KeyAction as VtKeyAction, KeyEventInput as VtKeyEventInput, Modifiers as VtModifiers,
-    MouseAction, MouseButton, MouseEventInput, MouseGeometry, Overscan, PhysicalKey, ProgressState,
-    ScrollViewport, SelectionGeometry, TerminalEvent,
+    MouseAction, MouseButton, MouseEventInput, MouseGeometry, MouseTrackingMode, Overscan,
+    PhysicalKey, ProgressState, RowCellSpan, ScrollViewport, SelectionGeometry, TerminalEvent,
 };
 
 use crate::config::{
@@ -59,6 +63,10 @@ use crate::config::{
 use crate::host_manager::{
     DataStreamEvent, DataStreamEventKind, HostCommand, HostManager, HostManagerConfig,
     LOCAL_HOST_ID, RuntimeEvent,
+};
+use crate::media_viewer::{
+    MediaEvent, MediaKind, MediaViewerBackend, RgbaFrame, texture_key_for_tab,
+    viewer_remote_cache_dir,
 };
 use crate::pane_store::{DEFAULT_BACKGROUND_SNAPSHOT_BUDGET, PaneStore, build_terminal_viewport};
 use crate::workspace::{
@@ -130,6 +138,8 @@ pub struct HeadlessRenderOptions {
     pub height: u32,
     pub scale_factor: f32,
     pub force_light: bool,
+    /// Optional local paths (`path[:line]`) to open in the right-hand Viewer Pane before capture.
+    pub viewer_paths: Vec<String>,
 }
 
 impl Default for HeadlessRenderOptions {
@@ -141,6 +151,7 @@ impl Default for HeadlessRenderOptions {
             height: 900,
             scale_factor: 1.0,
             force_light: false,
+            viewer_paths: Vec::new(),
         }
     }
 }
@@ -191,6 +202,19 @@ enum ActiveDrag {
         key: BlockKey,
         track_rect: RectF,
     },
+    ViewerDivider {
+        workspace: RectF,
+    },
+    ViewerPan {
+        last_px: (f32, f32),
+    },
+    ViewerScrollbar {
+        track_rect: RectF,
+    },
+    ViewerVideoSeek {
+        tab_id: u64,
+        bar_rect: RectF,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,21 +253,70 @@ const HOVER_PREVIEW_IMAGE_GPU_ID: u64 = u64::MAX - 1;
 const MAX_HOVER_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// Threshold above which remote uploads display an immediate progress toast (`1 MiB`).
 const LARGE_UPLOAD_TOAST_THRESHOLD_BYTES: u64 = 1024 * 1024;
+/// Minimum gap between two pointer-triggered `Take`s of the same block.
+const POINTER_TAKE_THROTTLE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HoveredTerminalTarget {
     Url(String),
+    ThreadLink(String),
     LocalFile {
         resolved_path: PathBuf,
         display_path: String,
+        target: ResolvedTarget,
         line: Option<u32>,
         column: Option<u32>,
+        is_osc8: bool,
     },
     RemoteFile {
         remote_path: String,
+        target: ResolvedTarget,
         line: Option<u32>,
         column: Option<u32>,
+        is_osc8: bool,
     },
+    KittyImage {
+        image_id: u32,
+        width: u32,
+        height: u32,
+        source_path: Option<PathBuf>,
+    },
+}
+
+impl HoveredTerminalTarget {
+    fn copyable_string(&self) -> Option<String> {
+        match self {
+            Self::Url(u) | Self::ThreadLink(u) => Some(u.clone()),
+            Self::LocalFile { resolved_path, .. } => {
+                Some(resolved_path.to_string_lossy().into_owned())
+            }
+            Self::RemoteFile { remote_path, .. } => Some(remote_path.clone()),
+            Self::KittyImage { source_path, .. } => source_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingViewerUpload {
+    texture_key: u64,
+    generation: u64,
+    frame: RgbaFrame,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRemoteViewerDownload {
+    tab_id: u64,
+    remote_path: String,
+    kind: MediaKind,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPlainLinkClick {
+    key: BlockKey,
+    target: HoveredTerminalTarget,
+    press_px: (f32, f32),
 }
 
 /// Complete, window-independent application engine for `omarex`.
@@ -271,6 +344,8 @@ pub struct OmarexController {
     last_ui_output: Option<UiRenderOutput>,
     last_cell_metrics: Option<CellMetrics>,
     pointer_pos: (f32, f32),
+    /// Last `Take` sent because of local pointer activity (throttles motion-event storms).
+    last_pointer_take: Option<(BlockKey, Instant)>,
     active_drag: Option<ActiveDrag>,
     collapsed_hosts: HashSet<String>,
     collapsed_sessions: HashSet<(String, String)>,
@@ -282,10 +357,18 @@ pub struct OmarexController {
     block_osc94: HashMap<BlockKey, Osc94Progress>,
     hovered_path_cell: Option<(BlockKey, u16, u32)>,
     hovered_terminal_target: Option<(BlockKey, HoveredTerminalTarget)>,
+    hovered_link_spans: Option<(BlockKey, Vec<RowCellSpan>)>,
+    pending_plain_link_click: Option<PendingPlainLinkClick>,
+    context_menu_terminal_target: Option<(BlockKey, HoveredTerminalTarget)>,
     hover_image_id: Option<u64>,
     pending_hover_image: Option<(PathBuf, u64)>,
     loaded_hover_image: Option<(PathBuf, u64)>,
     hover_image_gen: u64,
+    media_backend: MediaViewerBackend,
+    pending_viewer_uploads: Vec<PendingViewerUpload>,
+    pending_viewer_downloads: HashMap<String, PendingRemoteViewerDownload>,
+    pending_tab_jump_lines: HashMap<u64, (u32, Option<u32>)>,
+    viewer_upload_gen: u64,
     active_dnd_hover: Option<(f32, f32)>,
     downloaded_file_cache: HashMap<(String, String), (PathBuf, Option<String>)>,
     active_prompt_host: Option<String>,
@@ -381,6 +464,7 @@ impl OmarexController {
             last_ui_output: None,
             last_cell_metrics: None,
             pointer_pos: (0.0, 0.0),
+            last_pointer_take: None,
             active_drag: None,
             collapsed_hosts: HashSet::new(),
             collapsed_sessions,
@@ -392,10 +476,18 @@ impl OmarexController {
             block_osc94: HashMap::new(),
             hovered_path_cell: None,
             hovered_terminal_target: None,
+            hovered_link_spans: None,
+            pending_plain_link_click: None,
+            context_menu_terminal_target: None,
             hover_image_id: None,
             pending_hover_image: None,
             loaded_hover_image: None,
             hover_image_gen: 0,
+            media_backend: MediaViewerBackend::new(),
+            pending_viewer_uploads: Vec::new(),
+            pending_viewer_downloads: HashMap::new(),
+            pending_tab_jump_lines: HashMap::new(),
+            viewer_upload_gen: 1,
             active_dnd_hover: None,
             downloaded_file_cache: HashMap::new(),
             active_prompt_host: None,
@@ -429,6 +521,12 @@ impl OmarexController {
         for cmd in queued {
             self.send_command(cmd);
         }
+    }
+
+    /// Registers a thread-safe waker invoked by [`MediaViewerBackend`] whenever async file loads,
+    /// image decodes, or video/GIF playback frames become ready for the UI event loop.
+    pub fn set_media_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.media_backend.set_waker(waker);
     }
 
     /// Sets an optional initial session name or ID preference (e.g. CLI `--session "T3 Code"`).
@@ -845,6 +943,9 @@ impl OmarexController {
         if let Some(anim_ms) = self.next_kitty_anim_ms {
             consider(self.started_at + Duration::from_millis(anim_ms));
         }
+        if let Some(media_due) = self.media_backend.next_wakeup_instant() {
+            consider(media_due);
+        }
         if self.window_focused && self.has_visible_working_indicator() {
             consider(now + Duration::from_millis(120));
         }
@@ -858,14 +959,19 @@ impl OmarexController {
     pub fn cursor_hint(&self) -> CursorHint {
         if let Some(drag) = &self.active_drag {
             return match drag {
-                ActiveDrag::SidebarResize { .. } => CursorHint::ColResize,
+                ActiveDrag::SidebarResize { .. } | ActiveDrag::ViewerDivider { .. } => {
+                    CursorHint::ColResize
+                }
                 ActiveDrag::SplitDivider { divider, .. } => match divider.axis {
                     SplitAxis::Horizontal => CursorHint::ColResize,
                     SplitAxis::Vertical => CursorHint::RowResize,
                 },
                 ActiveDrag::FloatingLayer { zone, .. } => floating_zone_cursor(*zone, true),
                 ActiveDrag::TerminalSelection { .. } => CursorHint::Text,
-                ActiveDrag::PaneScrollbar { .. } => CursorHint::Pointer,
+                ActiveDrag::PaneScrollbar { .. }
+                | ActiveDrag::ViewerScrollbar { .. }
+                | ActiveDrag::ViewerVideoSeek { .. } => CursorHint::Pointer,
+                ActiveDrag::ViewerPan { .. } => CursorHint::Grabbing,
             };
         }
         let Some(out) = &self.last_ui_output else {
@@ -873,7 +979,9 @@ impl OmarexController {
         };
         let (px, py) = self.pointer_pos;
         match out.draw_list.hit_test(px, py) {
-            Some(HitTarget::SidebarResizeHandle) => CursorHint::ColResize,
+            Some(HitTarget::SidebarResizeHandle | HitTarget::ViewerDivider) => {
+                CursorHint::ColResize
+            }
             Some(HitTarget::SplitDivider { split_path }) => out
                 .dividers
                 .iter()
@@ -890,12 +998,17 @@ impl OmarexController {
                     CursorHint::Text
                 }
             }
+            Some(HitTarget::ViewerCanvas) => CursorHint::Pointer,
             Some(
                 HitTarget::ModalInput | HitTarget::FindBarInput | HitTarget::SidebarFilterInput,
             ) => CursorHint::Text,
-            Some(HitTarget::PaneScrollbarTrack { .. } | HitTarget::PaneScrollbarThumb { .. }) => {
-                CursorHint::Pointer
-            }
+            Some(
+                HitTarget::PaneScrollbarTrack { .. }
+                | HitTarget::PaneScrollbarThumb { .. }
+                | HitTarget::ViewerScrollbarTrack
+                | HitTarget::ViewerScrollbarThumb
+                | HitTarget::ViewerVideoSeekBar,
+            ) => CursorHint::Pointer,
             Some(target) if target.is_pointer_clickable() => CursorHint::Pointer,
             _ => CursorHint::Default,
         }
@@ -1048,12 +1161,13 @@ impl OmarexController {
         for (key, args) in ready_resizes {
             // Do NOT optimistically resize local VT before Rex's inline `RexApc::Resize` arrives
             // in `/api/data` (prevents pre-resize 80-col output from corrupting a wide local grid).
-            // Instead, ensure our focused window owns the block (`OwnMode::Take`) so Rex applies
-            // `com.superlogical.terminal.resize` immediately and streams back `RexApc::Resize` at
-            // the exact PTY byte boundary.
-            if self.window_focused {
-                self.maybe_claim_ownership(&key, OwnershipTrigger::ExplicitInteractOrFit);
-            }
+            // Only claim an *unowned* block here (`OwnMode::Request`). Never `Take` from this
+            // path: a queued resize is not a user action, and taking ownership from another
+            // device (e.g. the Mac mini showing the same tab) makes both clients steal it back
+            // and forth, resizing the PTY up and down in a loop. If another device owns the
+            // block, Rex records this resize as *desired* and applies it once we own it again
+            // (keypress, paste, window resize, focus gain or explicit `t3_fit`).
+            self.maybe_claim_ownership(&key, OwnershipTrigger::AttachOrView);
             self.send_command(HostCommand::TerminalResize {
                 host_id: key.host_id,
                 session_id: key.session_id,
@@ -1106,7 +1220,12 @@ impl OmarexController {
             self.needs_redraw = true;
         }
 
-        // 5. Auto-dismiss expired toasts so transient notices never accumulate permanently.
+        // 5. Poll async MediaViewerBackend events (text loads, decoded images/GIFs, video frames)
+        if self.poll_media_events() {
+            self.needs_redraw = true;
+        }
+
+        // 6. Auto-dismiss expired toasts so transient notices never accumulate permanently.
         if !self.toast_deadlines.is_empty() {
             let before = self.ui.toasts.len();
             self.toast_deadlines.retain(|_, deadline| *deadline > now);
@@ -1119,6 +1238,164 @@ impl OmarexController {
         }
 
         self.needs_redraw()
+    }
+
+    /// Drains ready [`MediaEvent`]s from [`MediaViewerBackend`], updating `ui.viewer` tab states
+    /// and queueing decoded RGBA8 frames for zero-copy GPU upload in [`Self::render_frame`].
+    pub fn poll_media_events(&mut self) -> bool {
+        let events = self.media_backend.poll_events();
+        if events.is_empty() {
+            return false;
+        }
+        for ev in events {
+            match ev {
+                MediaEvent::TextLoaded { tab_id, content } => {
+                    let is_md = matches!(
+                        ui_chrome::classify_extension(&content.display_path),
+                        TargetKind::Markdown
+                    );
+                    let lang = Path::new(&content.display_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase());
+                    let joined = content.lines.join("\n");
+                    let mut state = TextViewerState::new(joined, lang, is_md);
+                    state.file_size_bytes = Some(content.file_size_bytes);
+                    if let Some((line, col)) = self.pending_tab_jump_lines.remove(&tab_id) {
+                        let viewport_h = self
+                            .last_ui_output
+                            .as_ref()
+                            .and_then(|o| o.viewer_split)
+                            .map(|vs| (vs.viewer_rect.h - 60.0).max(200.0))
+                            .or_else(|| {
+                                (self.viewport_h > 120.0)
+                                    .then(|| (self.viewport_h - 100.0).max(200.0))
+                            });
+                        state.jump_to_line(line as usize, col.map(|c| c as usize), viewport_h);
+                    }
+                    self.ui
+                        .viewer
+                        .set_tab_content(tab_id, ViewerContent::Text(state));
+                }
+                MediaEvent::ImageLoaded {
+                    tab_id,
+                    texture_key,
+                    generation,
+                    metadata,
+                    frame,
+                    ..
+                } => {
+                    self.pending_tab_jump_lines.remove(&tab_id);
+                    let has_alpha = matches!(
+                        metadata.format_label.as_str(),
+                        "PNG" | "WebP" | "WebP (Animated)" | "GIF" | "GIF (Animated)" | "SVG"
+                    );
+                    let state = ImageViewerState::new(
+                        texture_key,
+                        metadata.width,
+                        metadata.height,
+                        metadata.format_label,
+                        Some(metadata.file_size_bytes),
+                        has_alpha,
+                    );
+                    self.ui
+                        .viewer
+                        .set_tab_content(tab_id, ViewerContent::Image(state));
+                    self.pending_viewer_uploads.push(PendingViewerUpload {
+                        texture_key,
+                        generation,
+                        frame,
+                    });
+                }
+                MediaEvent::AnimationFrame {
+                    texture_key,
+                    generation,
+                    frame,
+                    ..
+                } => {
+                    self.pending_viewer_uploads.push(PendingViewerUpload {
+                        texture_key,
+                        generation,
+                        frame,
+                    });
+                }
+                MediaEvent::VideoLoaded {
+                    tab_id,
+                    texture_key,
+                    generation,
+                    metadata,
+                    poster_frame,
+                    state: pb_state,
+                    ..
+                } => {
+                    self.pending_tab_jump_lines.remove(&tab_id);
+                    let fps = (metadata.fps.is_finite() && metadata.fps > 0.0)
+                        .then_some(metadata.fps as f32);
+                    let codec = (!metadata.video_codec.is_empty()).then_some(metadata.video_codec);
+                    let mut vstate = VideoViewerState::new(
+                        texture_key,
+                        metadata.render_width.max(metadata.width).max(1),
+                        metadata.render_height.max(metadata.height).max(1),
+                        metadata.duration_secs,
+                        fps,
+                        codec,
+                        Some(metadata.file_size_bytes),
+                    );
+                    vstate.playing = pb_state.playing;
+                    vstate.position_secs = pb_state.position_secs;
+                    vstate.muted = pb_state.muted;
+                    vstate.looping = pb_state.looping;
+                    self.ui
+                        .viewer
+                        .set_tab_content(tab_id, ViewerContent::Video(vstate));
+                    if let Some(frame) = poster_frame {
+                        self.pending_viewer_uploads.push(PendingViewerUpload {
+                            texture_key,
+                            generation,
+                            frame,
+                        });
+                    }
+                }
+                MediaEvent::VideoFrame {
+                    tab_id,
+                    texture_key,
+                    generation,
+                    position_secs,
+                    frame,
+                    state: pb_state,
+                    ..
+                } => {
+                    if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                        && let ViewerContent::Video(vid) = &mut tab.content
+                    {
+                        vid.position_secs = position_secs;
+                        vid.playing = pb_state.playing;
+                        vid.muted = pb_state.muted;
+                        vid.looping = pb_state.looping;
+                    }
+                    self.pending_viewer_uploads.push(PendingViewerUpload {
+                        texture_key,
+                        generation,
+                        frame,
+                    });
+                }
+                MediaEvent::VideoStateChanged { tab_id, state } => {
+                    if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                        && let ViewerContent::Video(vid) = &mut tab.content
+                    {
+                        vid.playing = state.playing;
+                        vid.position_secs = state.position_secs;
+                        vid.muted = state.muted;
+                        vid.looping = state.looping;
+                    }
+                }
+                MediaEvent::LoadError { tab_id, error, .. } => {
+                    self.pending_tab_jump_lines.remove(&tab_id);
+                    self.ui.viewer.set_tab_error(tab_id, error);
+                }
+            }
+        }
+        true
     }
 
     // =========================================================================
@@ -1155,6 +1432,31 @@ impl OmarexController {
 
         let anim_phase = now.saturating_duration_since(self.started_at).as_secs_f32();
         let ui_output = self.ui.render(&frame_input, &self.theme, now, anim_phase);
+        self.ui.sync_viewer_metrics(&ui_output.viewer_metrics);
+
+        // Flush any newly decoded viewer image / animated GIF / video RGBA8 frames to GPU.
+        if !self.pending_viewer_uploads.is_empty() {
+            let uploads = std::mem::take(&mut self.pending_viewer_uploads);
+            let device = renderer.device().clone();
+            let queue = renderer.queue().clone();
+            for up in uploads {
+                if let Err(err) = renderer.images_mut().upload_rgba8_frame(
+                    &device,
+                    &queue,
+                    up.texture_key,
+                    up.generation,
+                    up.frame.width,
+                    up.frame.height,
+                    &up.frame.rgba,
+                ) {
+                    tracing::warn!(
+                        ?err,
+                        texture_key = up.texture_key,
+                        "failed to upload viewer RGBA8 frame"
+                    );
+                }
+            }
+        }
 
         // Track currently visible pane keys so `needs_redraw()` ignores background tabs (0% idle CPU).
         self.visible_pane_keys.clear();
@@ -1249,6 +1551,26 @@ impl OmarexController {
                         .render_pane(&key, &viewport, overscan, renderer, &mut draw_list)
                 {
                     tracing::warn!(?err, block = %geo.id, "failed to render tiled pane");
+                }
+
+                // Draw crisp accent underline spans across all wrapped rows of a hovered link/path.
+                if let Some((hover_key, spans)) = &self.hovered_link_spans
+                    && hover_key == &key
+                {
+                    let underline_clip = rectf_to_gpu(if scroll_y.abs() > 0.01 {
+                        geo.terminal_rect
+                    } else {
+                        content_rect
+                    });
+                    emit_hovered_link_underlines(
+                        spans,
+                        content_rect,
+                        underline_clip,
+                        metrics,
+                        scroll_y,
+                        Color::from(tokens.accent_primary),
+                        &mut draw_list,
+                    );
                 }
             }
         }
@@ -2365,48 +2687,102 @@ impl OmarexController {
             },
 
             RuntimeEvent::DownloadFinished {
-                host_id, result, ..
-            } => match result {
-                Ok(DownloadResult::Downloaded {
-                    remote_path,
-                    local_path,
-                    version,
-                    ..
-                }) => {
-                    self.downloaded_file_cache
-                        .insert((host_id, remote_path), (local_path.clone(), version));
-                    if let Err(err) = open::that_detached(&local_path) {
-                        self.push_toast(
-                            ToastSeverity::Warning,
-                            "Downloaded file",
-                            format!("Saved to {} (open failed: {err})", local_path.display()),
-                        );
-                    }
-                }
-                Ok(DownloadResult::NotModified { remote_path, .. }) => {
-                    if let Some((cached_path, _)) = self
-                        .downloaded_file_cache
-                        .get(&(host_id, remote_path.clone()))
-                        .cloned()
-                        && cached_path.exists()
-                    {
-                        if let Err(err) = open::that_detached(&cached_path) {
-                            self.push_toast(
-                                ToastSeverity::Warning,
-                                "Open cached file failed",
-                                format!("{} ({err})", cached_path.display()),
+                host_id,
+                transfer_id,
+                result,
+                ..
+            } => {
+                if let Some(pending) = self.pending_viewer_downloads.remove(&transfer_id) {
+                    match result {
+                        Ok(DownloadResult::Downloaded {
+                            remote_path,
+                            local_path,
+                            version,
+                            ..
+                        }) => {
+                            self.downloaded_file_cache.insert(
+                                (host_id, remote_path.clone()),
+                                (local_path.clone(), version),
+                            );
+                            self.media_backend.ingest_remote_file(
+                                pending.tab_id,
+                                remote_path,
+                                local_path,
+                                pending.kind,
                             );
                         }
-                    } else {
-                        self.push_toast(
-                            ToastSeverity::Info,
-                            "File unchanged",
-                            format!("Cached copy of {remote_path} is up to date"),
-                        );
+                        Ok(DownloadResult::NotModified { remote_path, .. }) => {
+                            if let Some((cached_path, _)) = self
+                                .downloaded_file_cache
+                                .get(&(host_id, remote_path.clone()))
+                                .cloned()
+                                && cached_path.exists()
+                            {
+                                self.media_backend.ingest_remote_file(
+                                    pending.tab_id,
+                                    remote_path,
+                                    cached_path,
+                                    pending.kind,
+                                );
+                            } else {
+                                self.ui.viewer.set_tab_error(
+                                    pending.tab_id,
+                                    format!(
+                                        "Cached remote file missing for {}",
+                                        pending.remote_path
+                                    ),
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            self.ui.viewer.set_tab_error(pending.tab_id, err.clone());
+                            self.push_toast(ToastSeverity::Error, "Download failed", err);
+                        }
                     }
+                    return;
                 }
-                Err(err) => self.push_toast(ToastSeverity::Error, "Download failed", err),
-            },
+                match result {
+                    Ok(DownloadResult::Downloaded {
+                        remote_path,
+                        local_path,
+                        version,
+                        ..
+                    }) => {
+                        self.downloaded_file_cache
+                            .insert((host_id, remote_path), (local_path.clone(), version));
+                        if let Err(err) = open::that_detached(&local_path) {
+                            self.push_toast(
+                                ToastSeverity::Warning,
+                                "Downloaded file",
+                                format!("Saved to {} (open failed: {err})", local_path.display()),
+                            );
+                        }
+                    }
+                    Ok(DownloadResult::NotModified { remote_path, .. }) => {
+                        if let Some((cached_path, _)) = self
+                            .downloaded_file_cache
+                            .get(&(host_id, remote_path.clone()))
+                            .cloned()
+                            && cached_path.exists()
+                        {
+                            if let Err(err) = open::that_detached(&cached_path) {
+                                self.push_toast(
+                                    ToastSeverity::Warning,
+                                    "Open cached file failed",
+                                    format!("{} ({err})", cached_path.display()),
+                                );
+                            }
+                        } else {
+                            self.push_toast(
+                                ToastSeverity::Info,
+                                "File unchanged",
+                                format!("Cached copy of {remote_path} is up to date"),
+                            );
+                        }
+                    }
+                    Err(err) => self.push_toast(ToastSeverity::Error, "Download failed", err),
+                }
+            }
 
             RuntimeEvent::ThemeChanged(ev) => {
                 if self.theme.apply_event(ev) {
@@ -2605,9 +2981,8 @@ impl OmarexController {
                 if let Some(resize_args) = outcome.pending_resize
                     && !self.read_only
                 {
-                    if self.window_focused {
-                        self.maybe_claim_ownership(&key, OwnershipTrigger::ExplicitInteractOrFit);
-                    }
+                    // Request only (see `flush_ready_resizes`): never steal from another device.
+                    self.maybe_claim_ownership(&key, OwnershipTrigger::AttachOrView);
                     self.send_command(HostCommand::TerminalResize {
                         host_id: key.host_id.clone(),
                         session_id: key.session_id.clone(),
@@ -3022,17 +3397,52 @@ impl OmarexController {
         }
     }
 
+    #[track_caller]
     fn maybe_claim_ownership(&mut self, key: &BlockKey, trigger: OwnershipTrigger) {
         if self.read_only {
             return;
         }
         if let OwnershipDecision::Own { mode } = self.workspace.decide_ownership(key, trigger) {
+            tracing::debug!(
+                target: "omarex::ownership",
+                block = %key.block_id,
+                ?mode,
+                ?trigger,
+                caller = %std::panic::Location::caller(),
+                window_focused = self.window_focused,
+                "claiming block ownership"
+            );
             self.send_command(HostCommand::OwnBlock {
                 host_id: key.host_id.clone(),
                 session_id: key.session_id.clone(),
                 block_ids: Some(vec![key.block_id.clone()]),
                 mode,
             });
+        }
+    }
+
+    /// Local pointer activity over a pane (motion, wheel, click) means the user is at this
+    /// device now: take the block back from another device, like Rex.app does on hover.
+    /// Without this, a block last used on the Mac keeps the Mac's grid size here until the
+    /// next keypress. Throttled to one `Take` per block per [`POINTER_TAKE_THROTTLE`] so a
+    /// stream of motion events never floods the server while the owner change is in flight.
+    #[track_caller]
+    fn reclaim_on_pointer_activity(&mut self, key: &BlockKey, now: Instant) {
+        if self.read_only {
+            return;
+        }
+        if self.last_pointer_take.as_ref().is_some_and(|(k, t)| {
+            k == key && now.saturating_duration_since(*t) < POINTER_TAKE_THROTTLE
+        }) {
+            return;
+        }
+        if matches!(
+            self.workspace
+                .decide_ownership(key, OwnershipTrigger::ExplicitInteractOrFit),
+            OwnershipDecision::Own { .. }
+        ) {
+            self.last_pointer_take = Some((key.clone(), now));
+            self.maybe_claim_ownership(key, OwnershipTrigger::ExplicitInteractOrFit);
         }
     }
 
@@ -3502,9 +3912,29 @@ impl OmarexController {
                 self.open_modal_kind(kind);
             }
 
-            UiAction::RunCommand { action_id } => {
-                self.dispatch_command_id(&action_id, None, now);
-            }
+            UiAction::RunCommand { action_id } => match action_id.as_str() {
+                "__viewer_open_ctx_target" => {
+                    if let Some((key, target)) = self.context_menu_terminal_target.take() {
+                        self.open_terminal_target(&key, &target, false, now);
+                    }
+                }
+                "__viewer_open_ctx_external" => {
+                    if let Some((key, target)) = self.context_menu_terminal_target.take() {
+                        self.open_terminal_target(&key, &target, true, now);
+                    }
+                }
+                "__viewer_copy_ctx_target" => {
+                    if let Some((_, target)) = self.context_menu_terminal_target.take()
+                        && let Some(text) = target.copyable_string()
+                    {
+                        if self.clipboard_enabled {
+                            set_system_clipboard_text(&text);
+                        }
+                        self.push_toast_at(ToastSeverity::Info, "Copied to clipboard", text, now);
+                    }
+                }
+                _ => self.dispatch_command_id(&action_id, None, now),
+            },
 
             UiAction::ReplyRexPrompt(reply) => {
                 let call_id = reply.call_id.clone();
@@ -3871,6 +4301,199 @@ impl OmarexController {
                             .pane_store
                             .scroll_viewport(&key, ScrollViewport::Row(row));
                     }
+                }
+            }
+
+            UiAction::Viewer(viewer_action) => {
+                self.dispatch_viewer_action(viewer_action, now);
+            }
+        }
+    }
+
+    fn dispatch_viewer_action(&mut self, action: ViewerAction, now: Instant) {
+        match action {
+            ViewerAction::Focus => {
+                self.ui.focus_viewer();
+            }
+            ViewerAction::BeginDividerDrag => {
+                if let Some(workspace) = self.last_ui_output.as_ref().map(|o| o.chrome.workspace) {
+                    self.active_drag = Some(ActiveDrag::ViewerDivider { workspace });
+                }
+            }
+            ViewerAction::SelectTab { tab_id } => {
+                self.ui.viewer.select_tab_by_id(tab_id);
+                self.ui.focus_viewer();
+            }
+            ViewerAction::CloseTab { tab_id } => {
+                self.media_backend.close_tab(tab_id);
+                self.pending_tab_jump_lines.remove(&tab_id);
+                self.ui.viewer.close_tab_by_id(tab_id);
+                if !self.ui.viewer.open {
+                    if matches!(self.ui.focus.current(), FocusTarget::Viewer) {
+                        self.ui.focus.restore_terminal();
+                    }
+                    self.force_immediate_resize = true;
+                }
+            }
+            ViewerAction::CopyPath { path } => {
+                if self.clipboard_enabled {
+                    set_system_clipboard_text(&path);
+                }
+                self.push_toast_at(ToastSeverity::Info, "Copied path", path, now);
+            }
+            ViewerAction::OpenExternal { path, remote_host } => {
+                if let Some(host_ref) = remote_host {
+                    let resolved_host_id = self.resolve_remote_viewer_host_id(&host_ref);
+                    let cached_path = self
+                        .downloaded_file_cache
+                        .get(&(resolved_host_id.clone(), path.clone()))
+                        .or_else(|| {
+                            self.downloaded_file_cache
+                                .get(&(host_ref.clone(), path.clone()))
+                        })
+                        .map(|(p, _)| p)
+                        .filter(|p| p.exists())
+                        .cloned();
+                    if let Some(cached) = cached_path {
+                        if let Err(err) = open::that_detached(&cached) {
+                            self.push_toast_at(
+                                ToastSeverity::Warning,
+                                "Open external failed",
+                                format!("{} ({err})", cached.display()),
+                                now,
+                            );
+                        }
+                    } else if let Some(key) = self.focused_block_key().map(|k| {
+                        if k.host_id == resolved_host_id {
+                            k
+                        } else {
+                            BlockKey::new(resolved_host_id.clone(), k.session_id, k.block_id)
+                        }
+                    }) {
+                        self.download_remote_file_for_external(&key, &path);
+                    } else {
+                        self.push_toast_at(
+                            ToastSeverity::Warning,
+                            "Cannot open remote file externally",
+                            format!("No active session for {host_ref}:{path}"),
+                            now,
+                        );
+                    }
+                } else if let Err(err) = open::that_detached(&path) {
+                    self.push_toast_at(
+                        ToastSeverity::Warning,
+                        "Open external failed",
+                        format!("{path} ({err})"),
+                        now,
+                    );
+                }
+            }
+            ViewerAction::ToggleMaximize => {
+                self.ui.viewer.toggle_maximized();
+                self.force_immediate_resize = true;
+            }
+            ViewerAction::ClosePane => {
+                for tab in &mut self.ui.viewer.tabs {
+                    if let ViewerContent::Video(vid) = &mut tab.content
+                        && vid.playing
+                    {
+                        vid.playing = false;
+                        self.media_backend.video_pause(tab.id);
+                    }
+                }
+                self.ui.close_viewer();
+                self.force_immediate_resize = true;
+            }
+            ViewerAction::ToggleWrap => {
+                self.ui.viewer.toggle_wrap();
+            }
+            ViewerAction::ToggleRawMarkdown => {
+                self.ui.viewer.toggle_raw_markdown();
+            }
+            ViewerAction::ZoomIn => {
+                self.ui.viewer.zoom_in();
+            }
+            ViewerAction::ZoomOut => {
+                self.ui.viewer.zoom_out();
+            }
+            ViewerAction::ZoomReset => {
+                self.ui.viewer.zoom_reset();
+            }
+            ViewerAction::ZoomFit => {
+                self.ui.viewer.zoom_fit();
+            }
+            ViewerAction::BeginPan => {
+                self.ui.focus_viewer();
+                self.active_drag = Some(ActiveDrag::ViewerPan {
+                    last_px: self.pointer_pos,
+                });
+            }
+            ViewerAction::ToggleVideoPlayPause { tab_id } => {
+                self.ui.focus_viewer();
+                let toggled_backend = self.media_backend.video_toggle_play(tab_id);
+                if let Some(state) = self.media_backend.video_state(tab_id) {
+                    if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                        && let ViewerContent::Video(vid) = &mut tab.content
+                    {
+                        vid.playing = state.playing;
+                        vid.position_secs = state.position_secs;
+                        vid.muted = state.muted;
+                        vid.looping = state.looping;
+                    }
+                } else if !toggled_backend
+                    && let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Video(vid) = &mut tab.content
+                {
+                    vid.playing = !vid.playing;
+                }
+            }
+            ViewerAction::SeekVideo { tab_id, fraction } => {
+                self.ui.focus_viewer();
+                if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Video(vid) = &mut tab.content
+                {
+                    let secs = vid.seek_to_fraction(fraction);
+                    self.media_backend.video_seek(tab_id, secs);
+                }
+                if let Some(bar_rect) = self
+                    .last_ui_output
+                    .as_ref()
+                    .and_then(|o| o.viewer_metrics.seek_bar_rect)
+                {
+                    self.active_drag = Some(ActiveDrag::ViewerVideoSeek { tab_id, bar_rect });
+                }
+            }
+            ViewerAction::ToggleVideoMute { tab_id } => {
+                if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Video(vid) = &mut tab.content
+                {
+                    vid.muted = !vid.muted;
+                    self.media_backend.video_set_muted(tab_id, vid.muted);
+                }
+            }
+            ViewerAction::ToggleVideoLoop { tab_id } => {
+                if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Video(vid) = &mut tab.content
+                {
+                    vid.looping = !vid.looping;
+                    self.media_backend.video_set_loop(tab_id, vid.looping);
+                }
+            }
+            ViewerAction::ScrollToFraction { tab_id, fraction } => {
+                self.ui.focus_viewer();
+                if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Text(txt) = &mut tab.content
+                {
+                    txt.scroll_to_fraction(fraction);
+                }
+                if let Some(track_rect) = self.last_ui_output.as_ref().and_then(|out| {
+                    out.draw_list
+                        .hits
+                        .iter()
+                        .find(|h| matches!(h.target, HitTarget::ViewerScrollbarTrack))
+                        .map(|h| h.rect)
+                }) {
+                    self.active_drag = Some(ActiveDrag::ViewerScrollbar { track_rect });
                 }
             }
         }
@@ -4377,6 +5000,7 @@ impl OmarexController {
             return;
         }
         if let Some(sk) = self.workspace.active_session.clone() {
+            tracing::debug!(target: "omarex::ownership", "fit_active_session_to_device: take all");
             self.send_command(HostCommand::OwnBlock {
                 host_id: sk.host_id,
                 session_id: sk.session_id,
@@ -4732,6 +5356,68 @@ impl OmarexController {
             ClientCommand::ServerAction { action, args } => {
                 self.send_server_action(host_id, &action, args);
             }
+            ClientCommand::ViewerOpen {
+                path,
+                line,
+                col,
+                remote_host,
+            } => {
+                let effective_host = remote_host
+                    .as_deref()
+                    .filter(|h| !h.is_empty())
+                    .unwrap_or(host_id);
+                let parsed = parse_path_with_location(&path);
+                let final_line = line.or(parsed.line);
+                let final_col = col.or(parsed.column);
+                let target = classify_path(&parsed.path, final_line, parsed.end_line, final_col);
+                if effective_host == LOCAL_HOST_ID {
+                    let block_pwd = self.focused_block_key().and_then(|k| {
+                        self.workspace
+                            .block(&k)
+                            .and_then(|b| b.pwd.as_deref())
+                            .and_then(normalize_osc7_pwd)
+                            .or_else(|| {
+                                self.pane_store
+                                    .pwd(&k)
+                                    .as_deref()
+                                    .and_then(normalize_osc7_pwd)
+                            })
+                    });
+                    if let Some(resolved) =
+                        self.resolve_local_file_path(&parsed.path, block_pwd.as_deref())
+                    {
+                        self.open_local_path_in_viewer(
+                            resolved,
+                            parsed.path,
+                            final_line,
+                            final_col,
+                            Some(target.kind()),
+                        );
+                    }
+                } else if let Some(key) = self.focused_block_key() {
+                    let remote_key = BlockKey::new(effective_host, key.session_id, key.block_id);
+                    self.open_remote_path_in_viewer(
+                        &remote_key,
+                        &parsed.path,
+                        target.kind(),
+                        final_line,
+                        final_col,
+                    );
+                }
+            }
+            ClientCommand::QuickLook => {
+                if let Some((key, target)) = self.hovered_terminal_target.clone() {
+                    self.open_terminal_target(&key, &target, false, now);
+                } else if !self.ui.viewer.tabs.is_empty() {
+                    if self.ui.viewer.open {
+                        self.dispatch_viewer_action(ViewerAction::ClosePane, now);
+                    } else {
+                        self.ui.viewer.open = true;
+                        self.ui.focus_viewer();
+                        self.force_immediate_resize = true;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4940,6 +5626,7 @@ impl OmarexController {
                     }
                     _ => {}
                 },
+                FocusTarget::Viewer => self.handle_viewer_key(input, now),
                 FocusTarget::Terminal(_) => {}
             }
             return;
@@ -5074,10 +5761,169 @@ impl OmarexController {
         let _ = apply_key_to_text_input(&mut self.ui.sidebar.filter_input, input);
     }
 
+    fn handle_viewer_key(&mut self, input: &KeyInputEvent, now: Instant) {
+        let key = input.canonical_key.as_str();
+        let active_tab_id = self.ui.viewer.active_tab().map(|t| t.id);
+
+        if (input.mods.ctrl || input.mods.super_key) && key == "w" {
+            if let Some(tab_id) = active_tab_id {
+                self.dispatch_viewer_action(ViewerAction::CloseTab { tab_id }, now);
+            } else {
+                self.dispatch_viewer_action(ViewerAction::ClosePane, now);
+            }
+            return;
+        }
+        if input.mods.ctrl && key == "tab" {
+            if input.mods.shift {
+                self.ui.viewer.prev_tab();
+            } else {
+                self.ui.viewer.next_tab();
+            }
+            return;
+        }
+
+        match key {
+            "escape" => {
+                if input.mods.shift {
+                    self.dispatch_viewer_action(ViewerAction::ClosePane, now);
+                } else if self.ui.viewer.maximized {
+                    self.ui.viewer.toggle_maximized();
+                    self.force_immediate_resize = true;
+                } else {
+                    self.ui.focus.restore_terminal();
+                }
+            }
+            "+" | "=" => {
+                self.ui.viewer.zoom_in();
+            }
+            "-" | "_" => {
+                self.ui.viewer.zoom_out();
+            }
+            "0" => {
+                self.ui.viewer.zoom_reset();
+            }
+            "f" => {
+                self.ui.viewer.zoom_fit();
+            }
+            "space" | " " => {
+                if let Some(tab_id) = active_tab_id
+                    && self
+                        .ui
+                        .viewer
+                        .tab_by_id(tab_id)
+                        .is_some_and(|t| matches!(t.content, ViewerContent::Video(_)))
+                {
+                    self.dispatch_viewer_action(ViewerAction::ToggleVideoPlayPause { tab_id }, now);
+                }
+            }
+            "m" => {
+                if let Some(tab_id) = active_tab_id
+                    && self
+                        .ui
+                        .viewer
+                        .tab_by_id(tab_id)
+                        .is_some_and(|t| matches!(t.content, ViewerContent::Video(_)))
+                {
+                    self.dispatch_viewer_action(ViewerAction::ToggleVideoMute { tab_id }, now);
+                }
+            }
+            "l" => {
+                if let Some(tab_id) = active_tab_id
+                    && self
+                        .ui
+                        .viewer
+                        .tab_by_id(tab_id)
+                        .is_some_and(|t| matches!(t.content, ViewerContent::Video(_)))
+                {
+                    self.dispatch_viewer_action(ViewerAction::ToggleVideoLoop { tab_id }, now);
+                }
+            }
+            "w" => {
+                self.ui.viewer.toggle_wrap();
+            }
+            "r" => {
+                self.ui.viewer.toggle_raw_markdown();
+            }
+            "up" | "k" => {
+                if !self.ui.viewer.scroll_by(-40.0) {
+                    self.ui.viewer.pan_by(0.0, 40.0);
+                }
+            }
+            "down" | "j" => {
+                if !self.ui.viewer.scroll_by(40.0) {
+                    self.ui.viewer.pan_by(0.0, -40.0);
+                }
+            }
+            "left" => {
+                if let Some(tab_id) = active_tab_id
+                    && let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Video(vid) = &mut tab.content
+                {
+                    let next = (vid.position_secs - 5.0).max(0.0);
+                    vid.position_secs = next;
+                    self.media_backend.video_seek(tab_id, next);
+                } else {
+                    self.ui.viewer.pan_by(40.0, 0.0);
+                }
+            }
+            "right" => {
+                if let Some(tab_id) = active_tab_id
+                    && let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                    && let ViewerContent::Video(vid) = &mut tab.content
+                {
+                    let max_t = vid.duration_secs.max(0.0);
+                    let next = (vid.position_secs + 5.0).min(max_t);
+                    vid.position_secs = next;
+                    self.media_backend.video_seek(tab_id, next);
+                } else {
+                    self.ui.viewer.pan_by(-40.0, 0.0);
+                }
+            }
+            "page_up" => {
+                let step = self
+                    .ui
+                    .viewer
+                    .active_tab()
+                    .and_then(|t| match &t.content {
+                        ViewerContent::Text(txt) => Some((txt.last_viewport_h * 0.85).max(120.0)),
+                        _ => None,
+                    })
+                    .unwrap_or(320.0);
+                self.ui.viewer.scroll_by(-step);
+            }
+            "page_down" => {
+                let step = self
+                    .ui
+                    .viewer
+                    .active_tab()
+                    .and_then(|t| match &t.content {
+                        ViewerContent::Text(txt) => Some((txt.last_viewport_h * 0.85).max(120.0)),
+                        _ => None,
+                    })
+                    .unwrap_or(320.0);
+                self.ui.viewer.scroll_by(step);
+            }
+            "home" => {
+                self.ui.viewer.scroll_active_to_fraction(0.0);
+            }
+            "end" => {
+                self.ui.viewer.scroll_active_to_fraction(1.0);
+            }
+            _ => {}
+        }
+    }
+
     /// Handles pointer motion (hover tracking, active drag updates, terminal mouse motion / selection,
     /// and cell-debounced file-path hover detection).
-    pub fn handle_pointer_move(&mut self, px: f32, py: f32, mods: Modifiers, _now: Instant) {
+    pub fn handle_pointer_move(&mut self, px: f32, py: f32, mods: Modifiers, now: Instant) {
+        let moved = self.pointer_pos != (px, py);
         self.pointer_pos = (px, py);
+        if moved
+            && self.active_drag.is_none()
+            && let Some((key, ..)) = self.pane_cell_at_pointer(px, py)
+        {
+            self.reclaim_on_pointer_activity(&key, now);
+        }
 
         // 1. Active drag takes priority
         if let Some(drag) = self.active_drag.clone() {
@@ -5178,8 +6024,38 @@ impl OmarexController {
                             .scroll_viewport(&key, ScrollViewport::Row(row));
                     }
                 }
+                ActiveDrag::ViewerDivider { workspace } => {
+                    let ratio = compute_viewer_drag_ratio(workspace, px);
+                    self.ui.viewer.set_split_ratio(ratio);
+                }
+                ActiveDrag::ViewerPan { last_px } => {
+                    let dx = px - last_px.0;
+                    let dy = py - last_px.1;
+                    self.ui.viewer.pan_by(dx, dy);
+                    self.active_drag = Some(ActiveDrag::ViewerPan { last_px: (px, py) });
+                }
+                ActiveDrag::ViewerScrollbar { track_rect } => {
+                    let frac = ((py - track_rect.y) / track_rect.h.max(1.0)).clamp(0.0, 1.0);
+                    self.ui.viewer.scroll_active_to_fraction(frac);
+                }
+                ActiveDrag::ViewerVideoSeek { tab_id, bar_rect } => {
+                    let frac = scrub_fraction_from_x(bar_rect, px);
+                    if let Some(tab) = self.ui.viewer.tab_by_id_mut(tab_id)
+                        && let ViewerContent::Video(vid) = &mut tab.content
+                    {
+                        let secs = vid.seek_to_fraction(frac);
+                        self.media_backend.video_seek(tab_id, secs);
+                    }
+                }
             }
             return;
+        }
+
+        // Cancel a pending plain link click once the pointer drags beyond click jitter.
+        if let Some(pending) = &self.pending_plain_link_click
+            && (px - pending.press_px.0).hypot(py - pending.press_px.1) >= 5.0
+        {
+            self.pending_plain_link_click = None;
         }
 
         // 2. Update unified chrome hover state + on-hover toolbar reveal
@@ -5202,7 +6078,9 @@ impl OmarexController {
                 }
             }
 
-            // 3. Forward mouse motion to mouse-tracking terminal if pointer is inside a pane
+            // 3. Forward mouse motion to mouse-tracking terminal if pointer is inside a pane,
+            //    and ALWAYS continue to cell-debounced link/path/image hover detection so SGR
+            //    mouse-tracking TUIs (such as `tr3x`) never hide clickable links.
             if let Some((key, content_rect, col, row, rel_x, rel_y)) =
                 self.pane_cell_at_pointer(px, py)
             {
@@ -5237,15 +6115,14 @@ impl OmarexController {
                     && let Ok(data) = String::from_utf8(bytes)
                 {
                     self.send_command(HostCommand::TerminalWrite {
-                        host_id: key.host_id,
-                        session_id: key.session_id,
-                        block_id: key.block_id,
+                        host_id: key.host_id.clone(),
+                        session_id: key.session_id.clone(),
+                        block_id: key.block_id.clone(),
                         data,
                     });
-                    return;
                 }
 
-                // Cell-debounced hover file-path detection (`orex` P3 fix: only runs on cell change!).
+                // Cell-debounced hover link/path/media detection (only runs on cell change!).
                 let cell_id = (key.clone(), col, row);
                 if self.hovered_path_cell.as_ref() != Some(&cell_id) {
                     self.hovered_path_cell = Some(cell_id);
@@ -5254,6 +6131,9 @@ impl OmarexController {
             } else {
                 self.hovered_path_cell = None;
                 self.hovered_terminal_target = None;
+                if self.hovered_link_spans.take().is_some() {
+                    self.needs_redraw = true;
+                }
                 self.pending_hover_image = None;
                 if self.ui.hover_preview.take().is_some() {
                     self.needs_redraw = true;
@@ -5262,12 +6142,41 @@ impl OmarexController {
         }
     }
 
+    fn osc8_row_span(&self, key: &BlockKey, col: u16, row: u32, uri: &str) -> RowCellSpan {
+        let mut start = col;
+        while start > 0 {
+            if let Ok(Some(prev)) = self.pane_store.hyperlink_at(key, start - 1, row)
+                && prev == uri
+            {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut end = col.saturating_add(1);
+        let max_scan = col.saturating_add(256);
+        while end < max_scan {
+            if let Ok(Some(next)) = self.pane_store.hyperlink_at(key, end, row)
+                && next == uri
+            {
+                end = end.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        RowCellSpan {
+            row,
+            start_col: start,
+            end_col: end,
+        }
+    }
+
     fn resolve_terminal_target(
         &self,
         key: &BlockKey,
         col: u16,
         row: u32,
-    ) -> Option<HoveredTerminalTarget> {
+    ) -> Option<(HoveredTerminalTarget, Vec<RowCellSpan>)> {
         let is_local = self.is_block_local(key);
         let block_pwd = self
             .workspace
@@ -5284,86 +6193,175 @@ impl OmarexController {
         // 1. Explicit OSC 8 terminal hyperlink always takes priority.
         if let Ok(Some(uri)) = self.pane_store.hyperlink_at(key, col, row) {
             let trimmed = uri.trim();
-            if trimmed.starts_with("http://")
-                || trimmed.starts_with("https://")
-                || trimmed.starts_with("mailto:")
-            {
-                return Some(HoveredTerminalTarget::Url(trimmed.to_owned()));
-            }
-            if let Some(local_from_uri) = normalize_osc7_pwd(trimmed) {
-                if is_local {
-                    let p = PathBuf::from(&local_from_uri);
-                    if p.exists() {
-                        return Some(HoveredTerminalTarget::LocalFile {
-                            resolved_path: p,
-                            display_path: local_from_uri,
-                            line: None,
-                            column: None,
-                        });
+            if !trimmed.is_empty() {
+                let spans = vec![self.osc8_row_span(key, col, row, &uri)];
+                let classified = classify_uri(trimmed);
+                match &classified {
+                    ResolvedTarget::ThreadLink { uri: thread_uri } => {
+                        return Some((
+                            HoveredTerminalTarget::ThreadLink(thread_uri.clone()),
+                            spans,
+                        ));
                     }
-                } else {
-                    return Some(HoveredTerminalTarget::RemoteFile {
-                        remote_path: local_from_uri,
-                        line: None,
-                        column: None,
-                    });
+                    ResolvedTarget::ExternalUrl { url } => {
+                        return Some((HoveredTerminalTarget::Url(url.clone()), spans));
+                    }
+                    _ => {
+                        if let Some(raw_path) = classified.path() {
+                            let line = classified.line();
+                            let column = classified.col();
+                            if is_local {
+                                if let Some(resolved) =
+                                    self.resolve_local_file_path(raw_path, block_pwd.as_deref())
+                                    && resolved.exists()
+                                {
+                                    return Some((
+                                        HoveredTerminalTarget::LocalFile {
+                                            resolved_path: resolved,
+                                            display_path: raw_path.to_owned(),
+                                            target: classified,
+                                            line,
+                                            column,
+                                            is_osc8: true,
+                                        },
+                                        spans,
+                                    ));
+                                }
+                            } else {
+                                return Some((
+                                    HoveredTerminalTarget::RemoteFile {
+                                        remote_path: raw_path.to_owned(),
+                                        target: classified,
+                                        line,
+                                        column,
+                                        is_osc8: true,
+                                    },
+                                    spans,
+                                ));
+                            }
+                        }
+                        if trimmed.contains("://") {
+                            return Some((HoveredTerminalTarget::Url(trimmed.to_owned()), spans));
+                        }
+                    }
                 }
             }
-            if let Some(detected) = detect_at_char_col(trimmed, 0) {
-                if is_local {
-                    if let Some(resolved) =
-                        self.resolve_local_file_path(detected.path, block_pwd.as_deref())
+        }
+
+        // 2. Plain terminal text across VT soft-wraps AND TUI gutter continuations (`│ ` / `┃ `),
+        //    plus bare filename resolution against visible viewport paths & CWD.
+        if let Ok(Some(unwrapped)) = self
+            .pane_store
+            .logical_line_with_tui_unwrap_at(key, col, row)
+        {
+            let viewport_lines = self.pane_store.viewport_text_lines(key).unwrap_or_default();
+            let cwd_path = if is_local {
+                block_pwd
+                    .as_deref()
+                    .or(self.default_working_dir.as_deref())
+                    .map(PathBuf::from)
+            } else {
+                None
+            };
+            if let Some(link) = detect_link_at_char_col(
+                &unwrapped.text,
+                unwrapped.hover_char_col,
+                &viewport_lines,
+                cwd_path.as_deref(),
+            ) {
+                let spans = unwrapped.cell_spans_for_char_range(link.char_span);
+                match &link.target {
+                    ResolvedTarget::ThreadLink { uri } => {
+                        return Some((HoveredTerminalTarget::ThreadLink(uri.clone()), spans));
+                    }
+                    ResolvedTarget::ExternalUrl { url } => {
+                        return Some((HoveredTerminalTarget::Url(url.clone()), spans));
+                    }
+                    _ => {
+                        if let Some(raw_path) = link.target.path() {
+                            let line = link.target.line();
+                            let column = link.target.col();
+                            if is_local {
+                                if let Some(resolved) =
+                                    self.resolve_local_file_path(raw_path, block_pwd.as_deref())
+                                    && resolved.exists()
+                                {
+                                    return Some((
+                                        HoveredTerminalTarget::LocalFile {
+                                            resolved_path: resolved,
+                                            display_path: raw_path.to_owned(),
+                                            target: link.target,
+                                            line,
+                                            column,
+                                            is_osc8: false,
+                                        },
+                                        spans,
+                                    ));
+                                }
+                            } else if looks_like_remote_file_path(raw_path) {
+                                return Some((
+                                    HoveredTerminalTarget::RemoteFile {
+                                        remote_path: raw_path.to_owned(),
+                                        target: link.target,
+                                        line,
+                                        column,
+                                        is_osc8: false,
+                                    },
+                                    spans,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Inline Kitty graphics placement hit-test (click inline image to open in full zoom viewer!).
+        if let Some(placement) = self.pane_store.kitty_placement_at(key, col, row) {
+            let source_path = if is_local {
+                self.find_adjacent_kitty_caption_path(key, &placement, block_pwd.as_deref())
+            } else {
+                None
+            };
+            return Some((
+                HoveredTerminalTarget::KittyImage {
+                    image_id: placement.image_id,
+                    width: placement.pixel_width,
+                    height: placement.pixel_height,
+                    source_path,
+                },
+                Vec::new(),
+            ));
+        }
+
+        None
+    }
+
+    fn find_adjacent_kitty_caption_path(
+        &self,
+        key: &BlockKey,
+        placement: &vt_engine::KittyPlacement,
+        block_pwd: Option<&str>,
+    ) -> Option<PathBuf> {
+        let top_row = placement.viewport_row.max(0) as u32;
+        let bottom_row = top_row.saturating_add(placement.grid_rows.max(1));
+        let candidate_rows = [top_row.saturating_sub(1), bottom_row];
+        let start_col = placement.viewport_col.max(0) as u16;
+        let end_col = start_col.saturating_add(placement.grid_cols.min(120) as u16);
+
+        for r in candidate_rows {
+            for c in start_col..=end_col {
+                if let Ok(Some(uri)) = self.pane_store.hyperlink_at(key, c, r) {
+                    let classified = classify_uri(uri.trim());
+                    if let Some(raw) = classified.path()
+                        && let Some(resolved) = self.resolve_local_file_path(raw, block_pwd)
                         && resolved.exists()
                     {
-                        return Some(HoveredTerminalTarget::LocalFile {
-                            resolved_path: resolved,
-                            display_path: detected.path.to_owned(),
-                            line: detected.line,
-                            column: detected.column,
-                        });
+                        return Some(resolved);
                     }
-                } else {
-                    return Some(HoveredTerminalTarget::RemoteFile {
-                        remote_path: detected.path.to_owned(),
-                        line: detected.line,
-                        column: detected.column,
-                    });
                 }
             }
-            return Some(HoveredTerminalTarget::Url(trimmed.to_owned()));
         }
-
-        // 2. Plain terminal text across soft-wrapped logical lines: check file paths then URLs.
-        let Ok(Some((line_text, char_col))) = self.pane_store.logical_line_at(key, col, row) else {
-            return None;
-        };
-
-        if let Some(detected) = detect_at_char_col(&line_text, char_col) {
-            if is_local {
-                if let Some(resolved) =
-                    self.resolve_local_file_path(detected.path, block_pwd.as_deref())
-                    && resolved.exists()
-                {
-                    return Some(HoveredTerminalTarget::LocalFile {
-                        resolved_path: resolved,
-                        display_path: detected.path.to_owned(),
-                        line: detected.line,
-                        column: detected.column,
-                    });
-                }
-            } else if looks_like_remote_file_path(detected.path) {
-                return Some(HoveredTerminalTarget::RemoteFile {
-                    remote_path: detected.path.to_owned(),
-                    line: detected.line,
-                    column: detected.column,
-                });
-            }
-        }
-
-        if let Some(url) = detect_url_at_char_col(&line_text, char_col) {
-            return Some(HoveredTerminalTarget::Url(url.to_owned()));
-        }
-
         None
     }
 
@@ -5395,9 +6393,9 @@ impl OmarexController {
     }
 
     fn update_hovered_file_path(&mut self, key: &BlockKey, col: u16, row: u32, px: f32, py: f32) {
-        if let Some(target) = self.resolve_terminal_target(key, col, row) {
+        if let Some((target, spans)) = self.resolve_terminal_target(key, col, row) {
             match &target {
-                HoveredTerminalTarget::Url(url) => {
+                HoveredTerminalTarget::Url(url) | HoveredTerminalTarget::ThreadLink(url) => {
                     self.pending_hover_image = None;
                     self.ui.hover_preview = Some(HoverPreviewState::FilePath {
                         path: url.clone(),
@@ -5412,6 +6410,7 @@ impl OmarexController {
                     display_path,
                     line,
                     column,
+                    ..
                 } => {
                     let preview_dims = if is_previewable_image_path(resolved_path)
                         && std::fs::metadata(resolved_path)
@@ -5465,6 +6464,7 @@ impl OmarexController {
                     remote_path,
                     line,
                     column,
+                    ..
                 } => {
                     self.pending_hover_image = None;
                     self.ui.hover_preview = Some(HoverPreviewState::FilePath {
@@ -5475,11 +6475,37 @@ impl OmarexController {
                         anchor_y: py,
                     });
                 }
+                HoveredTerminalTarget::KittyImage {
+                    width,
+                    height,
+                    source_path,
+                    ..
+                } => {
+                    self.pending_hover_image = None;
+                    let label = source_path
+                        .as_ref()
+                        .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+                        .map(|n| format!("{n} ({width}×{height}) — Click to open viewer"))
+                        .unwrap_or_else(|| {
+                            format!("Inline image ({width}×{height}) — Click to open viewer")
+                        });
+                    self.ui.hover_preview = Some(HoverPreviewState::FilePath {
+                        path: label,
+                        line: None,
+                        column: None,
+                        anchor_x: px,
+                        anchor_y: py,
+                    });
+                }
             }
+            self.hovered_link_spans = (!spans.is_empty()).then(|| (key.clone(), spans));
             self.hovered_terminal_target = Some((key.clone(), target));
             self.needs_redraw = true;
         } else {
             self.hovered_terminal_target = None;
+            if self.hovered_link_spans.take().is_some() {
+                self.needs_redraw = true;
+            }
             self.pending_hover_image = None;
             if self.ui.hover_preview.take().is_some() {
                 self.needs_redraw = true;
@@ -5487,48 +6513,402 @@ impl OmarexController {
         }
     }
 
-    fn open_terminal_target(&mut self, key: &BlockKey, target: &HoveredTerminalTarget) {
+    fn media_kind_for_target(kind: Option<TargetKind>) -> MediaKind {
+        match kind {
+            Some(TargetKind::Image) => MediaKind::Image,
+            Some(TargetKind::Video) => MediaKind::Video,
+            Some(TargetKind::TextCode | TargetKind::Markdown) => MediaKind::Text,
+            _ => MediaKind::Auto,
+        }
+    }
+
+    fn open_local_path_in_viewer(
+        &mut self,
+        resolved_path: PathBuf,
+        display_path: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        kind: Option<TargetKind>,
+    ) -> u64 {
+        let path_key = resolved_path.to_string_lossy().into_owned();
+        let tab_label = if display_path.is_empty() {
+            path_key.clone()
+        } else {
+            display_path
+        };
+
+        // If this exact local file is already loaded in a viewer tab, focus & jump immediately.
+        if let Some(existing) = self
+            .ui
+            .viewer
+            .tabs
+            .iter()
+            .find(|t| t.remote_host.is_none() && t.path == path_key)
+            .map(|t| (t.id, matches!(t.content, ViewerContent::Text(_))))
+        {
+            let (tab_id, is_text) = existing;
+            self.ui.viewer.select_tab_by_id(tab_id);
+            if let Some(l) = line {
+                if is_text {
+                    self.ui
+                        .viewer
+                        .jump_active_to_line(l as usize, column.map(|c| c as usize));
+                } else {
+                    self.pending_tab_jump_lines.insert(tab_id, (l, column));
+                }
+            }
+            self.ui.focus_viewer();
+            self.force_immediate_resize = true;
+            self.needs_redraw = true;
+            return tab_id;
+        }
+
+        let tab_id =
+            self.ui
+                .viewer
+                .open_loading_tab(path_key, None, format!("Loading {tab_label}…"));
+        if let Some(l) = line {
+            self.pending_tab_jump_lines.insert(tab_id, (l, column));
+        }
+        self.media_backend.request_load_local(
+            tab_id,
+            resolved_path,
+            Self::media_kind_for_target(kind),
+        );
+        self.ui.focus_viewer();
+        self.force_immediate_resize = true;
+        self.needs_redraw = true;
+        tab_id
+    }
+
+    fn open_remote_path_in_viewer(
+        &mut self,
+        key: &BlockKey,
+        remote_path: &str,
+        kind: TargetKind,
+        line: Option<u32>,
+        column: Option<u32>,
+    ) -> u64 {
+        let host_label = self
+            .workspace
+            .host(&key.host_id)
+            .map(|h| h.label.clone())
+            .unwrap_or_else(|| key.host_id.clone());
+        let tab_id = self.ui.viewer.open_loading_tab(
+            remote_path.to_owned(),
+            Some(host_label),
+            format!("Downloading {remote_path}…"),
+        );
+        if let Some(l) = line {
+            self.pending_tab_jump_lines.insert(tab_id, (l, column));
+        }
+
+        let media_kind = Self::media_kind_for_target(Some(kind));
+        let if_none_match = self
+            .downloaded_file_cache
+            .get(&(key.host_id.clone(), remote_path.to_owned()))
+            .and_then(|(path, ver)| path.exists().then(|| ver.clone()).flatten());
+        let transfer_id = format!("viewer-dl-{}", self.next_transfer_id);
+        self.next_transfer_id = self.next_transfer_id.saturating_add(1);
+        self.pending_viewer_downloads.insert(
+            transfer_id.clone(),
+            PendingRemoteViewerDownload {
+                tab_id,
+                remote_path: remote_path.to_owned(),
+                kind: media_kind,
+            },
+        );
+        self.send_command(HostCommand::DownloadFile {
+            host_id: key.host_id.clone(),
+            session_id: key.session_id.clone(),
+            block_id: key.block_id.clone(),
+            transfer_id,
+            remote_path: remote_path.to_owned(),
+            cache_dir: viewer_remote_cache_dir(),
+            if_none_match,
+            max_bytes: None,
+        });
+        self.ui.focus_viewer();
+        self.force_immediate_resize = true;
+        self.needs_redraw = true;
+        tab_id
+    }
+
+    fn resolve_remote_viewer_host_id(&self, host_ref: &str) -> String {
+        if self.workspace.host(host_ref).is_some() {
+            host_ref.to_owned()
+        } else {
+            self.workspace
+                .hosts
+                .values()
+                .find(|h| h.label == host_ref)
+                .map(|h| h.id.clone())
+                .unwrap_or_else(|| host_ref.to_owned())
+        }
+    }
+
+    fn download_remote_file_for_external(&mut self, key: &BlockKey, remote_path: &str) {
+        let if_none_match = self
+            .downloaded_file_cache
+            .get(&(key.host_id.clone(), remote_path.to_owned()))
+            .and_then(|(path, ver)| path.exists().then(|| ver.clone()).flatten());
+        let transfer_id = format!("dl-{}", self.next_transfer_id);
+        self.next_transfer_id = self.next_transfer_id.saturating_add(1);
+        self.push_toast(
+            ToastSeverity::Info,
+            "Downloading remote file",
+            remote_path.to_owned(),
+        );
+        self.send_command(HostCommand::DownloadFile {
+            host_id: key.host_id.clone(),
+            session_id: key.session_id.clone(),
+            block_id: key.block_id.clone(),
+            transfer_id,
+            remote_path: remote_path.to_owned(),
+            cache_dir: remote_download_cache_dir(),
+            if_none_match,
+            max_bytes: None,
+        });
+    }
+
+    fn try_focus_thread_uri(&mut self, uri: &str, now: Instant) -> bool {
+        let stripped = uri
+            .trim()
+            .strip_prefix("t3-thread://v2/")
+            .or_else(|| uri.trim().strip_prefix("t3-thread://"))
+            .or_else(|| uri.trim().strip_prefix("t3code://threads/"))
+            .or_else(|| uri.trim().strip_prefix("t3code://"))
+            .unwrap_or("");
+        let needle = stripped.trim_matches('/');
+        if needle.is_empty() {
+            return false;
+        }
+        let thread_tail = needle.rsplit('/').next().unwrap_or(needle);
+
+        let mut matched: Option<(String, String, Option<String>, Option<String>)> = None;
+        'hosts: for (host_id, host) in &self.workspace.hosts {
+            for (session_id, sess) in &host.sessions {
+                if let Some(view) = &sess.view {
+                    for win in &view.windows {
+                        let win_matches = win.label.contains(needle)
+                            || win.label.contains(thread_tail)
+                            || win.window_id.as_deref().is_some_and(|id| id == thread_tail);
+                        if win_matches {
+                            matched = Some((
+                                host_id.clone(),
+                                session_id.clone(),
+                                win.window_id.clone(),
+                                primary_block_id_of_window(win).map(str::to_owned),
+                            ));
+                            break 'hosts;
+                        }
+                        for layer in &win.layers {
+                            for blk in &layer.blocks {
+                                if blk.label.contains(needle)
+                                    || blk.label.contains(thread_tail)
+                                    || blk.block_id.as_deref().is_some_and(|id| id == thread_tail)
+                                {
+                                    matched = Some((
+                                        host_id.clone(),
+                                        session_id.clone(),
+                                        win.window_id.clone(),
+                                        blk.block_id.clone(),
+                                    ));
+                                    break 'hosts;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((host_id, session_id, window_id, block_id)) = matched {
+            if let Some(wid) = window_id {
+                self.dispatch_ui_action(
+                    UiAction::SelectTab {
+                        host_id,
+                        session_id,
+                        window_id: wid,
+                    },
+                    now,
+                );
+            } else {
+                self.dispatch_ui_action(
+                    UiAction::SelectSession {
+                        host_id,
+                        session_id,
+                    },
+                    now,
+                );
+            }
+            if let Some(bid) = block_id {
+                self.dispatch_ui_action(UiAction::FocusPane { block_id: bid }, now);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn open_terminal_target(
+        &mut self,
+        key: &BlockKey,
+        target: &HoveredTerminalTarget,
+        open_external: bool,
+        now: Instant,
+    ) {
         match target {
             HoveredTerminalTarget::Url(uri) => {
                 if let Err(err) = open::that_detached(uri) {
-                    self.push_toast(
+                    self.push_toast_at(
                         ToastSeverity::Warning,
                         "Open link failed",
                         format!("{uri} ({err})"),
+                        now,
                     );
                 }
             }
-            HoveredTerminalTarget::LocalFile { resolved_path, .. } => {
-                if let Err(err) = open::that_detached(resolved_path) {
-                    self.push_toast(
+            HoveredTerminalTarget::ThreadLink(uri) => {
+                if !self.try_focus_thread_uri(uri, now)
+                    && let Err(err) = open::that_detached(uri)
+                {
+                    self.push_toast_at(
                         ToastSeverity::Warning,
-                        "Open file failed",
-                        format!("{} ({err})", resolved_path.display()),
+                        "Open thread link failed",
+                        format!("{uri} ({err})"),
+                        now,
                     );
                 }
             }
-            HoveredTerminalTarget::RemoteFile { remote_path, .. } => {
-                let if_none_match = self
-                    .downloaded_file_cache
-                    .get(&(key.host_id.clone(), remote_path.clone()))
-                    .and_then(|(path, ver)| path.exists().then(|| ver.clone()).flatten());
-                let transfer_id = format!("dl-{}", self.next_transfer_id);
-                self.next_transfer_id = self.next_transfer_id.saturating_add(1);
-                self.push_toast(
-                    ToastSeverity::Info,
-                    "Downloading remote file",
-                    remote_path.clone(),
-                );
-                self.send_command(HostCommand::DownloadFile {
-                    host_id: key.host_id.clone(),
-                    session_id: key.session_id.clone(),
-                    block_id: key.block_id.clone(),
-                    transfer_id,
-                    remote_path: remote_path.clone(),
-                    cache_dir: remote_download_cache_dir(),
-                    if_none_match,
-                    max_bytes: None,
-                });
+            HoveredTerminalTarget::LocalFile {
+                resolved_path,
+                display_path,
+                target: resolved_target,
+                line,
+                column,
+                ..
+            } => {
+                if open_external {
+                    if let Err(err) = open::that_detached(resolved_path) {
+                        self.push_toast_at(
+                            ToastSeverity::Warning,
+                            "Open file failed",
+                            format!("{} ({err})", resolved_path.display()),
+                            now,
+                        );
+                    }
+                } else {
+                    self.open_local_path_in_viewer(
+                        resolved_path.clone(),
+                        display_path.clone(),
+                        *line,
+                        *column,
+                        Some(resolved_target.kind()),
+                    );
+                }
+            }
+            HoveredTerminalTarget::RemoteFile {
+                remote_path,
+                target: resolved_target,
+                line,
+                column,
+                ..
+            } => {
+                if open_external {
+                    self.download_remote_file_for_external(key, remote_path);
+                } else {
+                    self.open_remote_path_in_viewer(
+                        key,
+                        remote_path,
+                        resolved_target.kind(),
+                        *line,
+                        *column,
+                    );
+                }
+            }
+            HoveredTerminalTarget::KittyImage {
+                image_id,
+                width,
+                height,
+                source_path,
+            } => {
+                if let Some(path) = source_path
+                    && path.exists()
+                {
+                    if open_external {
+                        if let Err(err) = open::that_detached(path) {
+                            self.push_toast_at(
+                                ToastSeverity::Warning,
+                                "Open image failed",
+                                format!("{} ({err})", path.display()),
+                                now,
+                            );
+                        }
+                    } else {
+                        let display = path.to_string_lossy().into_owned();
+                        self.open_local_path_in_viewer(
+                            path.clone(),
+                            display,
+                            None,
+                            None,
+                            Some(TargetKind::Image),
+                        );
+                    }
+                    return;
+                }
+
+                match self.pane_store.read_kitty_image(key, *image_id) {
+                    Ok(Some(pixels)) if pixels.width > 0 && pixels.height > 0 => {
+                        let title = format!("inline-image-{image_id}.png");
+                        let tab_id = self.ui.viewer.open_loading_tab(
+                            title,
+                            None,
+                            format!("Opening inline image ({width}×{height})…"),
+                        );
+                        let texture_key = texture_key_for_tab(tab_id);
+                        self.viewer_upload_gen = self.viewer_upload_gen.saturating_add(1);
+                        let byte_len = pixels.rgba8.len() as u64;
+                        let img_state = ImageViewerState::new(
+                            texture_key,
+                            pixels.width,
+                            pixels.height,
+                            "Inline RGBA",
+                            Some(byte_len),
+                            true,
+                        );
+                        self.ui
+                            .viewer
+                            .set_tab_content(tab_id, ViewerContent::Image(img_state));
+                        self.pending_viewer_uploads.push(PendingViewerUpload {
+                            texture_key,
+                            generation: self.viewer_upload_gen,
+                            frame: RgbaFrame {
+                                width: pixels.width,
+                                height: pixels.height,
+                                rgba: pixels.rgba8,
+                            },
+                        });
+                        self.ui.focus_viewer();
+                        self.force_immediate_resize = true;
+                        self.needs_redraw = true;
+                    }
+                    Ok(_) => {
+                        self.push_toast_at(
+                            ToastSeverity::Warning,
+                            "Inline image unavailable",
+                            format!("Kitty image #{image_id} has no decoded pixels"),
+                            now,
+                        );
+                    }
+                    Err(err) => {
+                        self.push_toast_at(
+                            ToastSeverity::Warning,
+                            "Inline image read failed",
+                            err.to_string(),
+                            now,
+                        );
+                    }
+                }
             }
         }
     }
@@ -5545,6 +6925,7 @@ impl OmarexController {
         now: Instant,
     ) {
         self.pointer_pos = (px, py);
+        self.pending_plain_link_click = None;
         self.needs_redraw = true;
 
         // Middle-click on a tab closes it immediately (`gui-spec.md §2.2`).
@@ -5579,85 +6960,129 @@ impl OmarexController {
             )
         });
 
+        let mut right_click_terminal_target: Option<(BlockKey, HoveredTerminalTarget)> = None;
+
         if is_pane_surface_hit
             && let Some((key, content_rect, col, row, rel_x, rel_y)) =
                 self.pane_cell_at_pointer(px, py)
         {
             self.ui.focus.focus_terminal(Some(key.block_id.clone()));
-            self.maybe_claim_ownership(&key, OwnershipTrigger::FocusPane);
+            self.reclaim_on_pointer_activity(&key, now);
 
-            // 1. Terminal SGR mouse tracking (honors Shift-bypass automatically via `encode_mouse`)
-            let metrics = self.last_cell_metrics.unwrap_or(CellMetrics {
-                font_size: 14.0,
-                scale_factor: 1.0,
-                cell_width: 8.0,
-                cell_height: 19.0,
-                baseline_y: 14.0,
-                underline_y: 16.0,
-                underline_thickness: 1.0,
-                strikethrough_y: 10.0,
-            });
-            let geom = MouseGeometry {
-                screen_width: content_rect.w.round().max(1.0) as u32,
-                screen_height: content_rect.h.round().max(1.0) as u32,
-                cell_width: metrics.cell_width.round().max(1.0) as u32,
-                cell_height: metrics.cell_height.round().max(1.0) as u32,
-                padding_top: 0,
-                padding_bottom: 0,
-                padding_left: 0,
-                padding_right: 0,
-            };
-            let mouse_in = MouseEventInput {
-                action: MouseAction::Press,
-                button: Some(button.to_vt()),
-                mods: bridge_mods_to_vt(mods),
-                x: rel_x,
-                y: rel_y,
-            };
-            if let Ok(Some(bytes)) = self.pane_store.encode_mouse(&key, &mouse_in, geom)
-                && let Ok(data) = String::from_utf8(bytes)
-            {
-                self.send_command(HostCommand::TerminalWrite {
-                    host_id: key.host_id,
-                    session_id: key.session_id,
-                    block_id: key.block_id,
-                    data,
-                });
-                return;
-            }
-
-            // 2. Ctrl+Click opens OSC 8 links, plain file paths (local or remote), and plain URLs
-            if button == PointerButton::Left && mods.ctrl {
-                let target = self
-                    .hovered_terminal_target
+            let clicked_target = if matches!(button, PointerButton::Left | PointerButton::Right) {
+                self.hovered_terminal_target
                     .as_ref()
                     .filter(|(k, _)| k == &key)
                     .map(|(_, t)| t.clone())
-                    .or_else(|| self.resolve_terminal_target(&key, col, row));
-                if let Some(target) = target {
-                    self.open_terminal_target(&key, &target);
+                    .or_else(|| self.resolve_terminal_target(&key, col, row).map(|(t, _)| t))
+            } else {
+                None
+            };
+
+            // 1. Ctrl+Click / Super+Click ALWAYS intercepts clickable links, paths, and inline
+            //    Kitty images BEFORE SGR mouse tracking (`tr3x` / TUIs never swallow it!).
+            if button == PointerButton::Left
+                && (mods.ctrl || mods.super_key)
+                && let Some(target) = clicked_target
+            {
+                self.open_terminal_target(&key, &target, mods.alt, now);
+                return;
+            }
+
+            // 2. Plain Left-Click on a detected clickable link, file path, or inline Kitty image:
+            //    arm a non-drag click (fires on pointer-up if movement < 5px). When SGR mouse
+            //    tracking is active (e.g. `tr3x`), consume press so TUI doesn't swallow the click;
+            //    when tracking is off, fall through to selection so dragging still selects text!
+            let mut armed_plain_click = false;
+            if button == PointerButton::Left
+                && !mods.ctrl
+                && !mods.super_key
+                && !mods.alt
+                && !mods.shift
+                && let Some(target) = clicked_target.clone()
+            {
+                self.pending_plain_link_click = Some(PendingPlainLinkClick {
+                    key: key.clone(),
+                    target,
+                    press_px: (px, py),
+                });
+                armed_plain_click = true;
+                let mouse_tracking_active = self
+                    .pane_store
+                    .mouse_tracking_mode(&key)
+                    .is_some_and(|m| m != MouseTrackingMode::None);
+                if mouse_tracking_active {
                     return;
                 }
             }
 
-            // 3. Left-click starts native text selection gesture (Alt+drag = rectangle!)
-            if button == PointerButton::Left {
-                let _ = self.pane_store.selection_press(
-                    &key,
-                    col,
-                    row,
-                    f64::from(rel_x),
-                    f64::from(rel_y),
-                    time_ns,
-                );
-                self.active_drag = Some(ActiveDrag::TerminalSelection {
-                    key,
-                    content_rect,
-                    cell_w: metrics.cell_width.max(1.0),
-                    cell_h: metrics.cell_height.max(1.0),
-                    rectangle: mods.alt,
+            // 3. Right-click over a detected link/path/image opens OmaRex's context menu with
+            //    `Open in Right Pane`, `Open External`, and `Copy Path` instead of being swallowed.
+            if button == PointerButton::Right
+                && let Some(target) = clicked_target
+            {
+                right_click_terminal_target = Some((key.clone(), target));
+            } else {
+                // 4. Terminal SGR mouse tracking (honors Shift-bypass automatically via `encode_mouse`)
+                let metrics = self.last_cell_metrics.unwrap_or(CellMetrics {
+                    font_size: 14.0,
+                    scale_factor: 1.0,
+                    cell_width: 8.0,
+                    cell_height: 19.0,
+                    baseline_y: 14.0,
+                    underline_y: 16.0,
+                    underline_thickness: 1.0,
+                    strikethrough_y: 10.0,
                 });
-                return;
+                let geom = MouseGeometry {
+                    screen_width: content_rect.w.round().max(1.0) as u32,
+                    screen_height: content_rect.h.round().max(1.0) as u32,
+                    cell_width: metrics.cell_width.round().max(1.0) as u32,
+                    cell_height: metrics.cell_height.round().max(1.0) as u32,
+                    padding_top: 0,
+                    padding_bottom: 0,
+                    padding_left: 0,
+                    padding_right: 0,
+                };
+                let mouse_in = MouseEventInput {
+                    action: MouseAction::Press,
+                    button: Some(button.to_vt()),
+                    mods: bridge_mods_to_vt(mods),
+                    x: rel_x,
+                    y: rel_y,
+                };
+                if !armed_plain_click
+                    && let Ok(Some(bytes)) = self.pane_store.encode_mouse(&key, &mouse_in, geom)
+                    && let Ok(data) = String::from_utf8(bytes)
+                {
+                    self.send_command(HostCommand::TerminalWrite {
+                        host_id: key.host_id,
+                        session_id: key.session_id,
+                        block_id: key.block_id,
+                        data,
+                    });
+                    return;
+                }
+
+                // 5. Left-click starts native text selection gesture (Alt+drag = rectangle!)
+                if button == PointerButton::Left {
+                    let _ = self.pane_store.selection_press(
+                        &key,
+                        col,
+                        row,
+                        f64::from(rel_x),
+                        f64::from(rel_y),
+                        time_ns,
+                    );
+                    self.active_drag = Some(ActiveDrag::TerminalSelection {
+                        key,
+                        content_rect,
+                        cell_w: metrics.cell_width.max(1.0),
+                        cell_h: metrics.cell_height.max(1.0),
+                        rectangle: mods.alt,
+                    });
+                    return;
+                }
             }
         }
 
@@ -5736,13 +7161,87 @@ impl OmarexController {
             }
         }
 
-        // Route all other clicks (sidebar, tabs, headers, modals, context menu) through `UiTree`.
+        // Route all other clicks (sidebar, tabs, headers, viewer, modals, context menu) through `UiTree`.
         let action = if let Some(out) = self.last_ui_output.clone() {
             self.ui
                 .handle_click(&out.draw_list, px, py, button == PointerButton::Right)
         } else {
             UiAction::None
         };
+
+        // Augment pane right-click context menu with viewer/link entries when clicking a target.
+        if button == PointerButton::Right {
+            if let Some((key, target)) = right_click_terminal_target {
+                let copyable = target.copyable_string();
+                let is_file_or_image = matches!(
+                    target,
+                    HoveredTerminalTarget::LocalFile { .. }
+                        | HoveredTerminalTarget::RemoteFile { .. }
+                        | HoveredTerminalTarget::KittyImage { .. }
+                );
+                self.context_menu_terminal_target = Some((key, target));
+                if let Some(menu) = self.ui.context_menu.as_mut() {
+                    let mut extra = Vec::new();
+                    if is_file_or_image {
+                        extra.push(ContextMenuItem {
+                            label: "Open in Right Pane".to_owned(),
+                            icon: Some(IconId::SplitRight),
+                            shortcut: Some("Click".to_owned()),
+                            danger: false,
+                            separator_before: false,
+                            action: UiAction::RunCommand {
+                                action_id: "__viewer_open_ctx_target".to_owned(),
+                            },
+                        });
+                        extra.push(ContextMenuItem {
+                            label: "Open External".to_owned(),
+                            icon: Some(IconId::Link),
+                            shortcut: Some("Ctrl+Alt+Click".to_owned()),
+                            danger: false,
+                            separator_before: false,
+                            action: UiAction::RunCommand {
+                                action_id: "__viewer_open_ctx_external".to_owned(),
+                            },
+                        });
+                    } else {
+                        extra.push(ContextMenuItem {
+                            label: "Open Link".to_owned(),
+                            icon: Some(IconId::Link),
+                            shortcut: Some("Click".to_owned()),
+                            danger: false,
+                            separator_before: false,
+                            action: UiAction::RunCommand {
+                                action_id: "__viewer_open_ctx_target".to_owned(),
+                            },
+                        });
+                    }
+                    if copyable.is_some() {
+                        extra.push(ContextMenuItem {
+                            label: if is_file_or_image {
+                                "Copy Path".to_owned()
+                            } else {
+                                "Copy Link".to_owned()
+                            },
+                            icon: Some(IconId::Document),
+                            shortcut: None,
+                            danger: false,
+                            separator_before: false,
+                            action: UiAction::RunCommand {
+                                action_id: "__viewer_copy_ctx_target".to_owned(),
+                            },
+                        });
+                    }
+                    if let Some(first_existing) = menu.items.first_mut() {
+                        first_existing.separator_before = true;
+                    }
+                    extra.append(&mut menu.items);
+                    menu.items = extra;
+                }
+            } else {
+                self.context_menu_terminal_target = None;
+            }
+        }
+
         self.dispatch_ui_action(action, now);
     }
 
@@ -5752,9 +7251,13 @@ impl OmarexController {
         if self.ui.hover_preview.take().is_some() {
             changed = true;
         }
+        if self.hovered_link_spans.take().is_some() {
+            changed = true;
+        }
         self.hovered_path_cell = None;
         self.hovered_terminal_target = None;
         self.pending_hover_image = None;
+        self.pending_plain_link_click = None;
         if self
             .ui
             .update_pointer_hover(&ui_chrome::UiDrawList::new(), -1.0, -1.0)
@@ -5766,18 +7269,23 @@ impl OmarexController {
         }
     }
 
-    /// Handles pointer button release (finalizes active drags, selection gestures, or mouse release).
+    /// Handles pointer button release (finalizes active drags, selection gestures, plain link clicks, or mouse release).
     pub fn handle_pointer_up(&mut self, px: f32, py: f32, button: PointerButton, mods: Modifiers) {
         self.pointer_pos = (px, py);
         if self.ui.clear_pointer_pressed() {
             self.needs_redraw = true;
         }
+
+        let pending_link = self.pending_plain_link_click.take();
         if let Some(drag) = self.active_drag.take() {
             self.needs_redraw = true;
             match drag {
                 ActiveDrag::SidebarResize { .. } => {
                     self.force_immediate_resize = true;
                     self.save_settings_best_effort();
+                }
+                ActiveDrag::ViewerDivider { .. } => {
+                    self.force_immediate_resize = true;
                 }
                 ActiveDrag::TerminalSelection {
                     key,
@@ -5789,11 +7297,30 @@ impl OmarexController {
                     let col = ((px - content_rect.x).max(0.0) / cell_w).floor() as u16;
                     let row = ((py - content_rect.y).max(0.0) / cell_h).floor() as u32;
                     let _ = self.pane_store.selection_release(&key, Some((col, row)));
+                    // If this was a non-drag plain click on a detected link/path/image, open it!
+                    if button == PointerButton::Left
+                        && let Some(click) = pending_link
+                        && (px - click.press_px.0).hypot(py - click.press_px.1) < 5.0
+                    {
+                        self.open_terminal_target(&click.key, &click.target, false, Instant::now());
+                    }
                 }
                 ActiveDrag::SplitDivider { .. }
                 | ActiveDrag::FloatingLayer { .. }
-                | ActiveDrag::PaneScrollbar { .. } => {}
+                | ActiveDrag::PaneScrollbar { .. }
+                | ActiveDrag::ViewerPan { .. }
+                | ActiveDrag::ViewerScrollbar { .. }
+                | ActiveDrag::ViewerVideoSeek { .. } => {}
             }
+            return;
+        }
+
+        // Fire non-drag plain link click in SGR mouse-tracking panes (where selection drag didn't run).
+        if button == PointerButton::Left
+            && let Some(click) = pending_link
+            && (px - click.press_px.0).hypot(py - click.press_px.1) < 5.0
+        {
+            self.open_terminal_target(&click.key, &click.target, false, Instant::now());
             return;
         }
 
@@ -5854,7 +7381,28 @@ impl OmarexController {
             return;
         }
 
-        // 1. Scroll sidebar or overflowing horizontal tab bar if pointer is over chrome toolbar
+        // 1. Scroll or zoom inside the docked right-hand Viewer Pane if pointer is over it.
+        if let Some(out) = &self.last_ui_output
+            && let Some(vs) = out.viewer_split
+            && vs.viewer_rect.contains(px, py)
+        {
+            match self.ui.viewer.active_tab().map(|t| &t.content) {
+                Some(ViewerContent::Text(_)) => {
+                    self.ui.viewer.scroll_by(-delta_y_px);
+                }
+                Some(ViewerContent::Image(_) | ViewerContent::Video(_)) => {
+                    if delta_y_px > 0.0 {
+                        self.ui.viewer.zoom_in();
+                    } else if delta_y_px < 0.0 {
+                        self.ui.viewer.zoom_out();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // 2. Scroll sidebar or overflowing horizontal tab bar if pointer is over chrome toolbar
         if let Some(out) = &self.last_ui_output {
             if out.chrome.sidebar.is_some_and(|r| r.contains(px, py)) {
                 self.ui
@@ -5875,6 +7423,7 @@ impl OmarexController {
 
         // 2. Scroll or report wheel to hovered terminal pane
         if let Some((key, content_rect, _, _, rel_x, rel_y)) = self.pane_cell_at_pointer(px, py) {
+            self.reclaim_on_pointer_activity(&key, Instant::now());
             let cell_h = self
                 .last_cell_metrics
                 .map_or(19.0, |m| m.cell_height.max(1.0));
@@ -6007,7 +7556,7 @@ impl OmarexController {
             FocusTarget::SidebarFilter => {
                 self.ui.sidebar.filter_input.paste(text);
             }
-            FocusTarget::ContextMenu => {}
+            FocusTarget::ContextMenu | FocusTarget::Viewer => {}
             FocusTarget::Terminal(_) => {
                 if let Some(key) = self.focused_block_key() {
                     self.paste_into_block(&key, text);
@@ -6614,6 +8163,39 @@ impl OmarexController {
 // 5. `UiDrawList` -> `gpu_renderer::DrawList` Z-Ordered Translator
 // ============================================================================
 
+/// Renders crisp accent underline spans across every viewport row occupied by a hovered link/path.
+fn emit_hovered_link_underlines(
+    spans: &[RowCellSpan],
+    content_rect: RectF,
+    clip_rect: Rect,
+    metrics: CellMetrics,
+    scroll_y: f32,
+    color: Color,
+    draw_list: &mut DrawList,
+) {
+    if spans.is_empty() {
+        return;
+    }
+    let cell_w = metrics.cell_width.max(1.0);
+    let cell_h = metrics.cell_height.max(1.0);
+    let underline_h = metrics.underline_thickness.max(1.5);
+    let underline_y_offset = metrics.underline_y.min((cell_h - underline_h).max(0.0));
+
+    draw_list.with_layer(layers::TERMINAL_FG, |dl| {
+        dl.with_clip(clip_rect, |dl| {
+            for span in spans {
+                if span.end_col <= span.start_col {
+                    continue;
+                }
+                let x = content_rect.x + f32::from(span.start_col) * cell_w;
+                let w = f32::from(span.end_col - span.start_col) * cell_w;
+                let y = content_rect.y + span.row as f32 * cell_h + underline_y_offset + scroll_y;
+                dl.push_rect(Rect::new(x, y, w, underline_h), color);
+            }
+        });
+    });
+}
+
 /// Translates `ui_chrome`'s backend-agnostic [`UiRenderOutput`] into `gpu_renderer`'s layered
 /// [`DrawList`], preserving exact painter's order across tiled pane cards, live terminal grids,
 /// floating layers (such as `tr3x`'s `/pr` drawer), modals, hover previews, and context menus.
@@ -6634,6 +8216,26 @@ pub fn translate_ui_to_gpu(
     let mut current_layer: i32 = layers::CHROME;
     let mut layer_has_foreground = false;
     let mut clip_depth: usize = 0;
+    let mut viewer_images_emitted = ui_out.viewer_images.is_empty();
+    let viewer_canvas_rect = ui_out.viewer_metrics.canvas_rect;
+
+    let emit_viewer_images =
+        |images: &[ViewerImagePlacement], layer: &mut i32, has_fg: &mut bool, dl: &mut DrawList| {
+            dl.with_layer(*layer, |dl| {
+                for vi in images {
+                    let mut quad = ImageQuad::new(vi.texture_key, rectf_to_gpu(vi.dest_rect));
+                    quad.uv_bounds = vi.uv_bounds;
+                    quad.clip_rect = rectf_to_gpu(vi.clip_rect).to_clip_rect();
+                    quad.corner_radius = vi.corner_radius;
+                    quad.opacity = vi.opacity;
+                    dl.push_image(quad);
+                }
+            });
+            // Advance layer so paused video play badges, image borders, toolbars, modals & menus
+            // always composite strictly ABOVE the viewer media frame!
+            *layer += 1;
+            *has_fg = false;
+        };
 
     for (idx, prim) in ui_out.draw_list.primitives.iter().enumerate() {
         match prim {
@@ -6730,7 +8332,26 @@ pub fn translate_ui_to_gpu(
                     continue;
                 }
 
-                // 4. General UI rect: if prior glyphs/icons exist on `current_layer`, advance to
+                // 4. Viewer image border rect (`fill.a == 0` matching `vi.dest_rect`): emit viewer
+                //    image quad on `current_layer` (ABOVE backdrop & checkerboard) BEFORE advancing
+                //    layer for the border, toolbars, and overlays!
+                if !viewer_images_emitted
+                    && fill.a == 0
+                    && ui_out
+                        .viewer_images
+                        .iter()
+                        .any(|vi| rects_match(*rect, vi.dest_rect))
+                {
+                    emit_viewer_images(
+                        &ui_out.viewer_images,
+                        &mut current_layer,
+                        &mut layer_has_foreground,
+                        draw_list,
+                    );
+                    viewer_images_emitted = true;
+                }
+
+                // 5. General UI rect: if prior glyphs/icons exist on `current_layer`, advance to
                 //    the next Z-layer so overlapping cards/modals/menus always respect painter's order!
                 if layer_has_foreground {
                     current_layer += 1;
@@ -6747,6 +8368,22 @@ pub fn translate_ui_to_gpu(
                         *shadow,
                     );
                 });
+
+                // 5b. Video viewer dark canvas backdrop (`rect.inset_uniform(8.0) == canvas_rect`):
+                //     emit the video frame immediately on `current_layer` (above backdrop, strictly
+                //     below the paused `▶` play badge, scrub bar, and overlays).
+                if !viewer_images_emitted
+                    && let Some(canvas_r) = viewer_canvas_rect
+                    && rects_match(rect.inset_uniform(8.0), canvas_r)
+                {
+                    emit_viewer_images(
+                        &ui_out.viewer_images,
+                        &mut current_layer,
+                        &mut layer_has_foreground,
+                        draw_list,
+                    );
+                    viewer_images_emitted = true;
+                }
             }
             UiPrimitive::ProgressBar {
                 rect,
@@ -6876,6 +8513,16 @@ pub fn translate_ui_to_gpu(
     // Balance any stray open clips defensively.
     for _ in 0..clip_depth {
         draw_list.pop_clip();
+    }
+
+    // Fallback: if viewer images were not spliced inline above, emit them before hover previews.
+    if !viewer_images_emitted {
+        emit_viewer_images(
+            &ui_out.viewer_images,
+            &mut current_layer,
+            &mut layer_has_foreground,
+            draw_list,
+        );
     }
 
     // Render hover preview image GPU quad inside its reserved card slot if active.
@@ -7121,6 +8768,7 @@ pub fn render_headless_live_png(
         height,
         scale_factor,
         force_light: false,
+        viewer_paths: Vec::new(),
     };
     render_headless_live_png_with_options(&opts, out_path)
 }
@@ -7264,8 +8912,45 @@ pub fn render_headless_live_png_with_options(
         tokio::time::sleep(Duration::from_millis(30)).await;
     });
 
-    // Warm up glyphs/icons on first frame and render final PNG.
-    let frame = controller.render_frame(&mut renderer, Instant::now())?;
+    // Optional `--headless-viewer <PATH>[:LINE]` tabs: open and wait for async decode/poster load.
+    if !opts.viewer_paths.is_empty() {
+        for raw_spec in &opts.viewer_paths {
+            let parsed = parse_path_with_location(raw_spec);
+            let target = classify_path(&parsed.path, parsed.line, parsed.end_line, parsed.column);
+            if let Some(resolved) = controller.resolve_local_file_path(&parsed.path, None) {
+                controller.open_local_path_in_viewer(
+                    resolved,
+                    parsed.path,
+                    parsed.line,
+                    parsed.column,
+                    Some(target.kind()),
+                );
+            }
+        }
+        let load_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < load_deadline {
+            controller.poll_media_events();
+            let any_loading = controller
+                .ui
+                .viewer
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content, ViewerContent::Loading { .. }));
+            if !any_loading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        controller.poll_media_events();
+    }
+
+    // Warm up glyphs/icons & sync viewer layout metrics, then render final PNG.
+    let mut frame = controller.render_frame(&mut renderer, Instant::now())?;
+    if controller.ui.viewer.open {
+        // Second pass guarantees `sync_viewer_metrics` (canvas fit zoom, text viewport height & jump)
+        // is reflected cleanly in the saved screenshot.
+        frame = controller.render_frame(&mut renderer, Instant::now())?;
+    }
     let frame_stats = renderer.render_to_png(&frame, out_path.as_ref())?;
 
     let (active_session_label, total_windows) = controller
@@ -8419,6 +10104,10 @@ mod tests {
         ctrl.workspace
             .note_server_resize(&key, 80, 32, Some("client:mac-mini".into()));
         let t0 = Instant::now();
+        // The app has already painted frames before Hyprland resizes the window, so the visible
+        // panes are known (only a real window resize may take ownership from another device).
+        let _ = ctrl.render_frame(&mut renderer, t0).expect("initial frame");
+        let _ = ctrl.drain_pending_commands();
 
         // 1. Wide viewport (1920x1080): must claim OwnMode::Take and send wide TerminalResize.
         ctrl.set_viewport(1920, 1080, 1.0);
@@ -8530,6 +10219,187 @@ mod tests {
             })
             .expect("expected restored wide TerminalResize (must not be dropped by stale cache!)");
         assert_eq!(restored_cols, wide_cols);
+
+        if let Some(parent) = ctrl.settings_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn local_pointer_activity_takes_block_back_from_other_device() {
+        let mut renderer =
+            GpuRenderer::new_headless(GpuConfig::default()).expect("headless Vulkan renderer");
+        register_all_ui_icons(renderer.atlas_mut());
+
+        let mut ctrl = make_test_controller();
+        seed_single_pane_workspace(&mut ctrl);
+        let key = BlockKey::new(LOCAL_HOST_ID, "session:t3", "block:1");
+        let _ = ctrl.workspace.mark_snapshot_ready(&key);
+        ctrl.set_viewport(1920, 1080, 1.0);
+        let t0 = Instant::now();
+        // The Mac mini owns the tab at its own (smaller) size.
+        ctrl.process_runtime_event(
+            RuntimeEvent::DataStream(DataStreamEvent {
+                host_id: LOCAL_HOST_ID.into(),
+                session_id: "session:t3".into(),
+                block_id: "block:1".into(),
+                kind: DataStreamEventKind::RexApc(rex_proto::RexControlMessage::Resize {
+                    cols: 80,
+                    rows: 32,
+                    cell_width_px: 9,
+                    cell_height_px: 18,
+                    owner: Some("client:mac-mini".into()),
+                }),
+            }),
+            t0,
+        );
+        let _ = ctrl.render_frame(&mut renderer, t0).expect("frame");
+        let _ = ctrl.drain_pending_commands();
+        let is_take = |c: &HostCommand| {
+            matches!(
+                c,
+                HostCommand::OwnBlock {
+                    mode: OwnMode::Take,
+                    ..
+                }
+            )
+        };
+
+        // Pointer that did not move (e.g. compositor re-sending its position): no take.
+        let (px, py) = ctrl.pointer_pos;
+        ctrl.handle_pointer_move(px, py, Modifiers::default(), t0);
+        assert!(!ctrl.drain_pending_commands().iter().any(is_take));
+
+        // User comes back and moves the mouse over the pane: exactly one take, even for a burst.
+        for i in 0..10u16 {
+            let t = t0 + Duration::from_millis(5 * u64::from(i));
+            ctrl.handle_pointer_move(900.0 + f32::from(i), 500.0, Modifiers::default(), t);
+        }
+        let takes = ctrl
+            .drain_pending_commands()
+            .iter()
+            .filter(|c| is_take(c))
+            .count();
+        assert_eq!(
+            takes, 1,
+            "pointer activity must send exactly one throttled Take"
+        );
+
+        if let Some(parent) = ctrl.settings_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn second_device_owning_same_tab_is_not_fought_over() {
+        let mut renderer =
+            GpuRenderer::new_headless(GpuConfig::default()).expect("headless Vulkan renderer");
+        register_all_ui_icons(renderer.atlas_mut());
+
+        let mut ctrl = make_test_controller();
+        seed_single_pane_workspace(&mut ctrl);
+        let key = BlockKey::new(LOCAL_HOST_ID, "session:t3", "block:1");
+        let _ = ctrl.workspace.mark_snapshot_ready(&key);
+        ctrl.set_viewport(1920, 1080, 1.0);
+        assert!(
+            ctrl.window_focused,
+            "omarex keeps Hyprland focus while user is on the Mac"
+        );
+
+        let mac_resize = |cols: u16, rows: u16| {
+            RuntimeEvent::DataStream(DataStreamEvent {
+                host_id: LOCAL_HOST_ID.into(),
+                session_id: "session:t3".into(),
+                block_id: "block:1".into(),
+                kind: DataStreamEventKind::RexApc(rex_proto::RexControlMessage::Resize {
+                    cols,
+                    rows,
+                    cell_width_px: 9,
+                    cell_height_px: 18,
+                    owner: Some("client:mac-mini".into()),
+                }),
+            })
+        };
+        let is_take = |c: &HostCommand| {
+            matches!(
+                c,
+                HostCommand::OwnBlock {
+                    mode: OwnMode::Take,
+                    ..
+                }
+            )
+        };
+
+        // The Mac mini owns the tab at its own (smaller) size.
+        let t0 = Instant::now();
+        ctrl.process_runtime_event(mac_resize(80, 32), t0);
+        assert_eq!(ctrl.pane_store.size(&key), Some((80, 32)));
+
+        // Many frames pass while the Mac keeps owning the block: omarex must never steal it and
+        // may only record its desired size once.
+        let mut cmds = Vec::new();
+        for i in 0..20u64 {
+            let t = t0 + Duration::from_millis(20 * i);
+            let _ = ctrl.render_frame(&mut renderer, t).expect("frame");
+            cmds.extend(ctrl.drain_pending_commands());
+        }
+        assert!(
+            !cmds.iter().any(is_take),
+            "must not take ownership from another device on passive frames, got {cmds:?}"
+        );
+        let resizes = cmds
+            .iter()
+            .filter(|c| matches!(c, HostCommand::TerminalResize { .. }))
+            .count();
+        assert!(
+            resizes <= 1,
+            "desired size must be sent at most once, got {resizes}"
+        );
+
+        // The Mac re-asserts its size (user typing there): still no fight from omarex.
+        let t1 = t0 + Duration::from_millis(500);
+        ctrl.process_runtime_event(mac_resize(80, 32), t1);
+        let mut cmds = Vec::new();
+        for i in 0..10u64 {
+            let t = t1 + Duration::from_millis(20 * i);
+            let _ = ctrl.render_frame(&mut renderer, t).expect("frame");
+            cmds.extend(ctrl.drain_pending_commands());
+        }
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| is_take(c) || matches!(c, HostCommand::TerminalResize { .. })),
+            "no ownership take or resize while the Mac owns the block, got {cmds:?}"
+        );
+
+        // Ownership moves to us (e.g. user typed here): our size is reconciled immediately.
+        let t2 = t1 + Duration::from_millis(500);
+        ctrl.process_runtime_event(
+            RuntimeEvent::ControlEvent {
+                host_id: LOCAL_HOST_ID.into(),
+                seq: 30,
+                event: Box::new(ServerEvent::SessionEvent {
+                    session_id: "session:t3".into(),
+                    event: SessionEvent::BlockOwnerChanged {
+                        block_id: "block:1".into(),
+                        owner: Some("client:1".into()),
+                        previous: Some("client:mac-mini".into()),
+                        reason: Some("take".into()),
+                    },
+                }),
+            },
+            t2,
+        );
+        let _ = ctrl.render_frame(&mut renderer, t2).expect("owned frame");
+        let cmds = ctrl.drain_pending_commands();
+        let cols = cmds
+            .iter()
+            .find_map(|c| match c {
+                HostCommand::TerminalResize { args, .. } => Some(args.columns),
+                _ => None,
+            })
+            .expect("expected resize to our grid after ownership moved to us");
+        assert!(cols > 140, "expected wide columns, got {cols}");
 
         if let Some(parent) = ctrl.settings_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
@@ -9869,5 +11739,381 @@ mod tests {
             report.frame_stats.glyph_count,
             png_path
         );
+    }
+
+    #[test]
+    fn sgr_mouse_tracking_allows_link_hover_and_plain_click_to_open_viewer_while_forwarding_non_link_clicks()
+     {
+        let mut ctrl = make_test_controller();
+        seed_single_pane_workspace(&mut ctrl);
+        let now = Instant::now();
+        let key = BlockKey::new(LOCAL_HOST_ID, "session:t3", "block:1");
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omarex-sgr-viewer-test-{}", std::process::id()));
+        let sub_dir = tmp_dir.join("nested_dir");
+        std::fs::create_dir_all(&sub_dir).expect("create temp test dir");
+        let code_file = sub_dir.join("demo_target.rs");
+        let mut file_body = String::new();
+        for idx in 1..=25 {
+            file_body.push_str(&format!("fn line_{idx}() {{}}\n"));
+        }
+        std::fs::write(&code_file, &file_body).expect("write demo_target.rs");
+
+        ctrl.pane_store
+            .create_local_test_pane(&key, 80, 24)
+            .unwrap();
+        // Enable SGR mouse tracking (`tr3x` enables `?1000h` + `?1006h`) and emit a TUI gutter-wrapped path.
+        let prefix = format!("│ {}/\r\n", sub_dir.display());
+        let cont = "│ demo_target.rs:12\r\n";
+        let osc8 = format!(
+            "OSC8 \x1b]8;;file://{}\x1b\\demo_link\x1b]8;;\x1b\\  plain_words\r\n",
+            code_file.display()
+        );
+        let payload = format!("\x1b[?1000h\x1b[?1006h{prefix}{cont}{osc8}");
+        ctrl.pane_store
+            .feed_local_test_bytes(&key, payload.as_bytes())
+            .unwrap();
+
+        // Populate `last_ui_output` and `last_cell_metrics` so pointer hit-testing maps cleanly.
+        ctrl.last_cell_metrics = Some(CellMetrics {
+            font_size: 14.0,
+            scale_factor: 1.0,
+            cell_width: 8.0,
+            cell_height: 20.0,
+            baseline_y: 15.0,
+            underline_y: 17.0,
+            underline_thickness: 1.5,
+            strikethrough_y: 10.0,
+        });
+        let frame_input = ctrl.build_ui_frame_input(now);
+        ctrl.last_ui_output = Some(ctrl.ui.render(&frame_input, &ctrl.theme, now, 1.0));
+
+        let pane_rect = ctrl
+            .last_ui_output
+            .as_ref()
+            .unwrap()
+            .tiled_panes
+            .first()
+            .unwrap()
+            .terminal_rect;
+        let (pad_x, pad_y) = ctrl.pane_content_padding();
+        let content_x = pane_rect.x + pad_x;
+        let content_y = pane_rect.y + pad_y;
+
+        // 1. Hover row 1 (`│ demo_target.rs:12`) over `demo_target.rs` -> resolves wrapped path across 2 rows!
+        let wrapped_px = content_x + 5.0 * 8.0 + 4.0;
+        let wrapped_py = content_y + 1.0 * 20.0 + 10.0;
+        ctrl.handle_pointer_move(wrapped_px, wrapped_py, Modifiers::default(), now);
+        assert!(
+            matches!(
+                ctrl.hovered_terminal_target.as_ref(),
+                Some((_, HoveredTerminalTarget::LocalFile { line: Some(12), .. }))
+            ),
+            "expected wrapped LocalFile hover with line 12 under SGR mouse tracking, got {:?}",
+            ctrl.hovered_terminal_target
+        );
+        assert!(
+            ctrl.hovered_link_spans
+                .as_ref()
+                .is_some_and(|(_, spans)| spans.len() >= 2),
+            "expected multi-row underline spans across wrapped TUI gutter lines"
+        );
+
+        // 2. Plain left-click on the wrapped link -> opens right-hand Viewer Pane without forwarding SGR press!
+        let _ = ctrl.drain_pending_commands();
+        ctrl.handle_pointer_down(
+            wrapped_px,
+            wrapped_py,
+            PointerButton::Left,
+            Modifiers::default(),
+            1,
+            now,
+        );
+        ctrl.handle_pointer_up(
+            wrapped_px,
+            wrapped_py,
+            PointerButton::Left,
+            Modifiers::default(),
+        );
+        let cmds_after_link = ctrl.drain_pending_commands();
+        assert!(
+            !cmds_after_link
+                .iter()
+                .any(|c| matches!(c, HostCommand::TerminalWrite { .. })),
+            "plain link click must not forward SGR mouse sequence to TUI"
+        );
+        assert!(
+            ctrl.ui.viewer.open,
+            "viewer pane must open on plain link click"
+        );
+        assert!(matches!(ctrl.ui.focus.current(), FocusTarget::Viewer));
+
+        // Wait briefly for async text load in MediaViewerBackend and verify jump-to-line 12.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            ctrl.poll_media_events();
+            if ctrl
+                .ui
+                .viewer
+                .active_tab()
+                .is_some_and(|t| matches!(t.content, ViewerContent::Text(_)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match ctrl.ui.viewer.active_tab().map(|t| &t.content) {
+            Some(ViewerContent::Text(txt)) => {
+                assert_eq!(txt.highlight_line, Some(12));
+                assert_eq!(txt.line_count(), 25);
+            }
+            other => panic!("expected loaded TextViewerState at line 12, got {other:?}"),
+        }
+
+        // 3. Re-render chrome (terminal pane shrunk to left) and click non-link cell -> forwards SGR press!
+        let frame_input = ctrl.build_ui_frame_input(now);
+        ctrl.last_ui_output = Some(ctrl.ui.render(&frame_input, &ctrl.theme, now, 1.0));
+        let plain_px = content_x + 20.0 * 8.0 + 4.0;
+        let plain_py = content_y + 2.0 * 20.0 + 10.0;
+        ctrl.handle_pointer_move(plain_px, plain_py, Modifiers::default(), now);
+        assert!(ctrl.hovered_terminal_target.is_none());
+        let _ = ctrl.drain_pending_commands();
+        ctrl.handle_pointer_down(
+            plain_px,
+            plain_py,
+            PointerButton::Left,
+            Modifiers::default(),
+            2,
+            now,
+        );
+        let cmds_after_plain = ctrl.drain_pending_commands();
+        assert!(
+            cmds_after_plain.iter().any(
+                |c| matches!(c, HostCommand::TerminalWrite { data, .. } if data.contains("\x1b[<"))
+            ),
+            "clicking non-link cell under SGR mouse tracking must still forward SGR mouse press"
+        );
+
+        // 4. Right-click on the OSC 8 hyperlink -> context menu includes `Open in Right Pane`, `Open External`, `Copy Path`.
+        let osc8_px = content_x + 7.0 * 8.0 + 4.0;
+        let osc8_py = content_y + 2.0 * 20.0 + 10.0;
+        ctrl.handle_pointer_move(osc8_px, osc8_py, Modifiers::default(), now);
+        ctrl.handle_pointer_down(
+            osc8_px,
+            osc8_py,
+            PointerButton::Right,
+            Modifiers::default(),
+            3,
+            now,
+        );
+        let labels: Vec<String> = ctrl
+            .ui
+            .context_menu
+            .as_ref()
+            .expect("context menu should open on right-click over OSC 8 link")
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert_eq!(
+            labels.first().map(String::as_str),
+            Some("Open in Right Pane")
+        );
+        assert_eq!(labels.get(1).map(String::as_str), Some("Open External"));
+        assert_eq!(labels.get(2).map(String::as_str), Some("Copy Path"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        if let Some(parent) = ctrl.settings_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn viewer_client_command_image_load_and_keyboard_shortcuts_work_end_to_end() {
+        let mut ctrl = make_test_controller();
+        seed_single_pane_workspace(&mut ctrl);
+        let now = Instant::now();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omarex-viewer-img-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+        let png_path = tmp_dir.join("sample.png");
+        let rgba = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        gpu_renderer::save_rgba_png(&png_path, 2, 2, &rgba).expect("write sample.png");
+
+        // Open via Rex `client.viewer.open` command.
+        ctrl.execute_client_command(
+            LOCAL_HOST_ID,
+            ClientCommand::ViewerOpen {
+                path: png_path.to_string_lossy().into_owned(),
+                line: None,
+                col: None,
+                remote_host: None,
+            },
+            now,
+        );
+        assert!(ctrl.ui.viewer.open);
+        assert!(matches!(ctrl.ui.focus.current(), FocusTarget::Viewer));
+
+        // Poll MediaViewerBackend until image finishes decoding and queues GPU upload.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            ctrl.poll_media_events();
+            if ctrl
+                .ui
+                .viewer
+                .active_tab()
+                .is_some_and(|t| matches!(t.content, ViewerContent::Image(_)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !ctrl.pending_viewer_uploads.is_empty(),
+            "decoded image must queue a GPU RGBA8 upload"
+        );
+
+        let send_key = |ctrl: &mut OmarexController, canonical: &str, mods: Modifiers| {
+            ctrl.handle_key(
+                &KeyInputEvent {
+                    physical_key: PhysicalKey::Unidentified,
+                    canonical_key: canonical.to_owned(),
+                    text: None,
+                    unshifted_codepoint: 0,
+                    mods,
+                    pressed: true,
+                    repeat: false,
+                    composing: false,
+                },
+                now,
+            );
+        };
+
+        // `+` zooms in (exiting fit mode), `0` resets to 1.0, `f` re-enables fit mode.
+        send_key(&mut ctrl, "+", Modifiers::default());
+        match ctrl.ui.viewer.active_tab().map(|t| &t.content) {
+            Some(ViewerContent::Image(img)) => {
+                assert!(!img.viewport.fit_mode);
+                assert!(img.viewport.zoom > 1.0);
+            }
+            other => panic!("expected Image viewer tab, got {other:?}"),
+        }
+        send_key(&mut ctrl, "0", Modifiers::default());
+        match ctrl.ui.viewer.active_tab().map(|t| &t.content) {
+            Some(ViewerContent::Image(img)) => {
+                assert!(!img.viewport.fit_mode);
+                assert!((img.viewport.zoom - 1.0).abs() < 1e-4);
+            }
+            other => panic!("expected Image viewer tab, got {other:?}"),
+        }
+        send_key(&mut ctrl, "f", Modifiers::default());
+        match ctrl.ui.viewer.active_tab().map(|t| &t.content) {
+            Some(ViewerContent::Image(img)) => assert!(img.viewport.fit_mode),
+            other => panic!("expected Image viewer tab, got {other:?}"),
+        }
+
+        // `QuickLook` closes open viewer when no link is hovered, then reopens it.
+        ctrl.execute_client_command(LOCAL_HOST_ID, ClientCommand::QuickLook, now);
+        assert!(!ctrl.ui.viewer.open);
+        ctrl.execute_client_command(LOCAL_HOST_ID, ClientCommand::QuickLook, now);
+        assert!(ctrl.ui.viewer.open);
+
+        // `Ctrl+W` closes the active viewer tab and closes the pane when last tab is closed.
+        send_key(
+            &mut ctrl,
+            "w",
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(ctrl.ui.viewer.tabs.is_empty());
+        assert!(!ctrl.ui.viewer.open);
+        assert!(matches!(ctrl.ui.focus.current(), FocusTarget::Terminal(_)));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        if let Some(parent) = ctrl.settings_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn text_jump_uses_viewport_height_and_remote_external_resolves_host_label() {
+        let mut ctrl = make_test_controller();
+        seed_single_pane_workspace(&mut ctrl);
+        ctrl.set_viewport(1440, 900, 1.0);
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omarex-jump-viewport-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+        let md_path = tmp_dir.join("README.md");
+        let mut body = String::new();
+        for idx in 1..=60 {
+            body.push_str(&format!("Line {idx} content\n"));
+        }
+        std::fs::write(&md_path, &body).expect("write README.md");
+
+        ctrl.open_local_path_in_viewer(
+            md_path.clone(),
+            "README.md".to_owned(),
+            Some(10),
+            None,
+            Some(TargetKind::Markdown),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            ctrl.poll_media_events();
+            if ctrl
+                .ui
+                .viewer
+                .active_tab()
+                .is_some_and(|t| matches!(t.content, ViewerContent::Text(_)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match ctrl.ui.viewer.active_tab().map(|t| &t.content) {
+            Some(ViewerContent::Text(txt)) => {
+                assert_eq!(txt.highlight_line, Some(10));
+                assert!(
+                    txt.last_viewport_h >= 700.0,
+                    "expected real viewport height >= 700, got {}",
+                    txt.last_viewport_h
+                );
+                assert!(
+                    txt.scroll_y <= 1.0,
+                    "jumping to line 10 on a 900px viewport must keep line 1 visible, got scroll_y={}",
+                    txt.scroll_y
+                );
+            }
+            other => panic!("expected TextViewerState, got {other:?}"),
+        }
+
+        // Verify remote host label -> host_id resolution for ViewerAction::OpenExternal cache lookup.
+        let mut remote = HostEntry::new(
+            "remote:mac-studio",
+            "Mac Studio",
+            RexEndpoint::parse("https://mac.example.ts.net").unwrap(),
+        );
+        remote.is_local = false;
+        ctrl.workspace.add_host(remote);
+        assert_eq!(
+            ctrl.resolve_remote_viewer_host_id("Mac Studio"),
+            "remote:mac-studio"
+        );
+        assert_eq!(
+            ctrl.resolve_remote_viewer_host_id("remote:mac-studio"),
+            "remote:mac-studio"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        if let Some(parent) = ctrl.settings_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }

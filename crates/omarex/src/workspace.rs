@@ -20,6 +20,15 @@ pub const MAX_RESIZE_DEFER: Duration = Duration::from_millis(36);
 /// Default bounded warm-session LRU capacity (keeps top N recently visited sessions live!).
 pub const DEFAULT_WARM_SESSION_LIMIT: usize = 4;
 
+/// `true` when a client other than `me` owns the block.
+///
+/// The owner's size is then authoritative: Rex only records our resize as *desired* and applies
+/// it once ownership moves to us. A server size that differs from our grid is expected in that
+/// state and must not trigger resize retries — otherwise two devices on the same tab fight.
+fn owned_by_other(owner: Option<&str>, me: Option<&str>) -> bool {
+    owner.is_some_and(|o| me != Some(o))
+}
+
 /// Connection lifecycle state of a Rex host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatus {
@@ -719,17 +728,16 @@ impl WorkspaceState {
     /// If a resize was requested before `READY`, it is returned immediately so resize sequencing
     /// never races initial snapshot decode (`orex` B6 fix).
     pub fn mark_snapshot_ready(&mut self, key: &BlockKey) -> Option<TerminalResizeArgs> {
-        let session = self
-            .hosts
-            .get_mut(&key.host_id)?
-            .sessions
-            .get_mut(&key.session_id)?;
+        let host = self.hosts.get_mut(&key.host_id)?;
+        let me = host.client_id().map(str::to_owned);
+        let session = host.sessions.get_mut(&key.session_id)?;
         let blk = session.blocks.entry(key.block_id.clone()).or_default();
         blk.snapshot_ready = true;
         if let Some(pending) = blk.pending_resize.take() {
-            let server_matches = blk
-                .last_server_size
-                .is_some_and(|(c, r)| c == pending.args.columns && r == pending.args.rows);
+            let server_matches = owned_by_other(blk.owner.as_deref(), me.as_deref())
+                || blk
+                    .last_server_size
+                    .is_some_and(|(c, r)| c == pending.args.columns && r == pending.args.rows);
             if blk.last_sent_resize.as_ref() != Some(&pending.args) || !server_matches {
                 blk.last_sent_resize = Some(pending.args.clone());
                 return Some(pending.args);
@@ -750,20 +758,23 @@ impl WorkspaceState {
         rows: u16,
         owner: Option<String>,
     ) {
-        let Some(session) = self
-            .hosts
-            .get_mut(&key.host_id)
-            .and_then(|h| h.sessions.get_mut(&key.session_id))
-        else {
+        let Some(host) = self.hosts.get_mut(&key.host_id) else {
+            return;
+        };
+        let me = host.client_id().map(str::to_owned);
+        let Some(session) = host.sessions.get_mut(&key.session_id) else {
             return;
         };
         let blk = session.blocks.entry(key.block_id.clone()).or_default();
         blk.last_server_size = Some((cols, rows));
         blk.owner = owner;
-        if blk
-            .last_sent_resize
-            .as_ref()
-            .is_some_and(|sent| sent.columns != cols || sent.rows != rows)
+        // A size set by another owner says nothing about our desired size: keep it cached so we
+        // don't re-send it (and fight that device) on every frame.
+        if !owned_by_other(blk.owner.as_deref(), me.as_deref())
+            && blk
+                .last_sent_resize
+                .as_ref()
+                .is_some_and(|sent| sent.columns != cols || sent.rows != rows)
         {
             blk.last_sent_resize = None;
         }
@@ -835,15 +846,18 @@ impl WorkspaceState {
         let Some(host) = self.hosts.get_mut(&key.host_id) else {
             return;
         };
+        let me = host.client_id().map(str::to_owned);
         let Some(session) = host.sessions.get_mut(&key.session_id) else {
             return;
         };
         let blk = session.blocks.entry(key.block_id.clone()).or_default();
 
-        // Only skip when BOTH last_sent_resize AND server's authoritative size already match `args`.
-        let server_diverges = blk
-            .last_server_size
-            .is_some_and(|(c, r)| c != args.columns || r != args.rows);
+        // Only skip when BOTH last_sent_resize AND server's authoritative size already match `args`
+        // (another owner's size never counts as divergence — see `owned_by_other`).
+        let server_diverges = !owned_by_other(blk.owner.as_deref(), me.as_deref())
+            && blk
+                .last_server_size
+                .is_some_and(|(c, r)| c != args.columns || r != args.rows);
         if !server_diverges
             && blk.last_sent_resize.as_ref() == Some(&args)
             && blk.pending_resize.is_none()
@@ -880,6 +894,7 @@ impl WorkspaceState {
         let max_defer = MAX_RESIZE_DEFER.max(window);
 
         for (host_id, host) in &mut self.hosts {
+            let me = host.client_id().map(str::to_owned);
             for (session_id, session) in &mut host.sessions {
                 for (block_id, blk) in &mut session.blocks {
                     if !blk.snapshot_ready {
@@ -891,9 +906,10 @@ impl WorkspaceState {
                             || now.saturating_duration_since(p.first_requested_at) >= max_defer
                     });
                     if due && let Some(pending) = blk.pending_resize.take() {
-                        let server_diverges = blk.last_server_size.is_some_and(|(c, r)| {
-                            c != pending.args.columns || r != pending.args.rows
-                        });
+                        let server_diverges = !owned_by_other(blk.owner.as_deref(), me.as_deref())
+                            && blk.last_server_size.is_some_and(|(c, r)| {
+                                c != pending.args.columns || r != pending.args.rows
+                            });
                         if blk.last_sent_resize.as_ref() != Some(&pending.args) || server_diverges {
                             blk.last_sent_resize = Some(pending.args.clone());
                             ready.push((
@@ -1463,14 +1479,27 @@ mod tests {
         let due = ws.drain_ready_resizes(t0 + Duration::from_millis(18));
         assert_eq!(due, vec![(key.clone(), wide.clone())]);
 
-        // Server shrinks block to 82x50 (e.g. side window opened) -> stale last_sent_resize cleared.
-        ws.note_server_resize(&key, 82, 50, Some("client:side".into()));
+        // Server shrinks the unowned block to 82x50 -> stale last_sent_resize cleared.
+        ws.note_server_resize(&key, 82, 50, None);
 
         // Expanding back to the exact previous 190x50 dimensions MUST NOT be dropped!
         let t1 = t0 + Duration::from_millis(100);
         ws.queue_resize_immediate(&key, wide.clone(), t1);
         let restored = ws.drain_ready_resizes(t1);
-        assert_eq!(restored, vec![(key, wide)]);
+        assert_eq!(restored, vec![(key.clone(), wide.clone())]);
+
+        // Another device (side window / Mac mini) takes the block at 82x50: its size is
+        // authoritative, so re-queuing our desired size must NOT re-send it (no resize fight).
+        ws.note_server_resize(&key, 82, 50, Some("client:side".into()));
+        let t2 = t1 + Duration::from_millis(100);
+        ws.queue_resize_immediate(&key, wide.clone(), t2);
+        assert!(ws.drain_ready_resizes(t2).is_empty());
+
+        // A real local window resize invalidates the cache and reclaims: resize goes out again.
+        ws.invalidate_sent_resize(&key);
+        let t3 = t2 + Duration::from_millis(100);
+        ws.queue_resize_immediate(&key, wide.clone(), t3);
+        assert_eq!(ws.drain_ready_resizes(t3), vec![(key, wide)]);
     }
 
     #[test]

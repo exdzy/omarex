@@ -282,17 +282,134 @@ impl ImageTextureCache {
             return Err(RenderError::InvalidDimensions { width, height });
         }
 
+        // Fast path: reuse existing GPU texture & bind group in-place when dimensions match
+        // (avoids per-frame Vulkan texture/bind-group reallocation for video & animated GIFs).
+        if let Some(existing) = self.entries.get_mut(&upload.id)
+            && existing.width == width
+            && existing.height == height
+        {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &existing.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &owned_rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            existing.generation = upload.generation;
+            existing.last_used_frame = self.frame_counter;
+            return Ok(true);
+        }
+
+        self.insert_rgba8_texture(
+            device,
+            queue,
+            upload.id,
+            upload.generation,
+            width,
+            height,
+            &owned_rgba,
+        )?;
+        Ok(true)
+    }
+
+    /// Uploads or replaces a dynamic RGBA8 frame (e.g. viewer image, animated GIF, or video frame)
+    /// directly from a borrowed slice without an intermediate `Vec<u8>` copy.
+    ///
+    /// Reuses the existing GPU texture in-place via `queue.write_texture` when `(width, height)`
+    /// matches the currently cached texture for `id`.
+    /// Returns `Ok(true)` if an upload occurred, or `Ok(false)` on a generation hit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_rgba8_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        id: u64,
+        generation: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<bool, RenderError> {
+        if let Some(existing) = self.entries.get_mut(&id)
+            && existing.generation == generation
+        {
+            existing.last_used_frame = self.frame_counter;
+            return Ok(false);
+        }
+
+        let expected = checked_byte_len(width, height, 4)?;
+        if rgba.len() != expected {
+            return Err(RenderError::Image(format!(
+                "RGBA8 frame {id} size mismatch: got {}, expected {expected}",
+                rgba.len()
+            )));
+        }
+
+        if let Some(existing) = self.entries.get_mut(&id)
+            && existing.width == width
+            && existing.height == height
+        {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &existing.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            existing.generation = generation;
+            existing.last_used_frame = self.frame_counter;
+            return Ok(true);
+        }
+
+        self.insert_rgba8_texture(device, queue, id, generation, width, height, rgba)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_rgba8_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        id: u64,
+        generation: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
         let vram_bytes = (width as usize) * (height as usize) * 4;
 
         // Remove previous version of this ID before accounting budget.
-        if let Some(prev) = self.entries.remove(&upload.id) {
+        if let Some(prev) = self.entries.remove(&id) {
             self.total_vram_bytes = self.total_vram_bytes.saturating_sub(prev.vram_bytes);
         }
 
         // Evict LRU entries if needed before allocating the new GPU texture.
         if self.total_vram_bytes.saturating_add(vram_bytes) > self.max_vram_bytes {
             let target_limit = self.max_vram_bytes.saturating_sub(vram_bytes);
-            self.evict_down_to(target_limit, Some(upload.id));
+            self.evict_down_to(target_limit, Some(id));
         }
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -317,7 +434,7 @@ impl ImageTextureCache {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &owned_rgba,
+            rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width * 4),
@@ -348,10 +465,10 @@ impl ImageTextureCache {
 
         self.total_vram_bytes = self.total_vram_bytes.saturating_add(vram_bytes);
         self.entries.insert(
-            upload.id,
+            id,
             CachedImage {
-                id: upload.id,
-                generation: upload.generation,
+                id,
+                generation,
                 width,
                 height,
                 vram_bytes,
@@ -362,7 +479,7 @@ impl ImageTextureCache {
             },
         );
 
-        Ok(true)
+        Ok(())
     }
 
     /// Removes a cached image by ID (e.g. on Kitty `a=d` delete command).
@@ -440,4 +557,84 @@ fn checked_byte_len(width: u32, height: u32, bpp: usize) -> Result<usize, Render
         .checked_mul(height as usize)
         .and_then(|px| px.checked_mul(bpp))
         .ok_or(RenderError::InvalidDimensions { width, height })
+}
+
+/// Rasterizes an SVG document into straight-alpha sRGB RGBA8 pixels using `resvg` + `tiny-skia`.
+///
+/// Preserves the SVG's natural aspect ratio and dimensions, downscaling proportionally only when
+/// either side exceeds `max_dim` (e.g. `8192`). Returns `(width, height, rgba_bytes, orig_w, orig_h)`.
+pub fn rasterize_svg_rgba8(
+    svg_bytes: &[u8],
+    max_dim: u32,
+) -> Result<(u32, u32, Vec<u8>, u32, u32), RenderError> {
+    let opt = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(svg_bytes, &opt)
+        .map_err(|e| RenderError::Svg(e.to_string()))?;
+
+    let size = tree.size();
+    let svg_w = size.width().max(1.0);
+    let svg_h = size.height().max(1.0);
+    let orig_w = svg_w.round().clamp(1.0, u32::MAX as f32) as u32;
+    let orig_h = svg_h.round().clamp(1.0, u32::MAX as f32) as u32;
+
+    let cap = max_dim.max(1) as f32;
+    let longest = svg_w.max(svg_h);
+    let scale = if longest > cap { cap / longest } else { 1.0 };
+
+    let px_w = (svg_w * scale).round().clamp(1.0, cap) as u32;
+    let px_h = (svg_h * scale).round().clamp(1.0, cap) as u32;
+
+    let mut pixmap = tiny_skia::Pixmap::new(px_w, px_h).ok_or(RenderError::InvalidDimensions {
+        width: px_w,
+        height: px_h,
+    })?;
+
+    let sx = px_w as f32 / svg_w;
+    let sy = px_h as f32 / svg_h;
+    let transform = tiny_skia::Transform::from_scale(sx, sy);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // tiny-skia produces premultiplied sRGB RGBA8; unpremultiply into straight sRGB RGBA8
+    // to match Rgba8UnormSrgb sampling + ALPHA_BLENDING.
+    let raw = pixmap.data();
+    let mut rgba = Vec::with_capacity(raw.len());
+    for px in raw.as_chunks::<4>().0 {
+        let a = px[3];
+        if a == 0 {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else if a == 255 {
+            rgba.extend_from_slice(px);
+        } else {
+            let a_u16 = u16::from(a);
+            let unpremul = |c: u8| -> u8 {
+                let v = (u16::from(c) * 255 + (a_u16 / 2)) / a_u16;
+                v.min(255) as u8
+            };
+            rgba.extend_from_slice(&[unpremul(px[0]), unpremul(px[1]), unpremul(px[2]), a]);
+        }
+    }
+
+    Ok((px_w, px_h, rgba, orig_w, orig_h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rasterize_svg_rgba8_preserves_aspect_and_caps_max_dim() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+            <rect x="0" y="0" width="200" height="100" fill="#1080ff"/>
+        </svg>"##;
+
+        let (w, h, rgba, ow, oh) = rasterize_svg_rgba8(svg, 8192).expect("rasterize svg");
+        assert_eq!((w, h, ow, oh), (200, 100, 200, 100));
+        assert_eq!(rgba.len(), 200 * 100 * 4);
+        let mid = ((50 * 200) + 100) * 4;
+        assert_eq!(&rgba[mid..mid + 4], &[0x10, 0x80, 0xff, 0xff]);
+
+        let (cw, ch, capped, cow, coh) = rasterize_svg_rgba8(svg, 64).expect("rasterize capped");
+        assert_eq!((cw, ch, cow, coh), (64, 32, 200, 100));
+        assert_eq!(capped.len(), 64 * 32 * 4);
+    }
 }

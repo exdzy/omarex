@@ -130,6 +130,7 @@ pub fn run_gui(opts: GuiLaunchOptions) -> Result<()> {
     let wake_ui: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = wake_proxy.send_event(AppWakeEvent::RuntimeEventReady);
     });
+    controller.set_media_waker(Arc::clone(&wake_ui));
     let hm_cfg = controller.build_host_manager_config(Some(local_endpoint), Some(wake_ui));
 
     let (host_manager, event_rx) = {

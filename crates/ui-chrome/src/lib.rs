@@ -14,6 +14,7 @@ pub mod pane_chrome;
 pub mod sidebar;
 pub mod tabbar;
 pub mod text_input;
+pub mod viewer;
 
 use std::time::Instant;
 
@@ -23,23 +24,28 @@ use tr3x_bridge::prompts::PromptSession;
 pub use draw::{
     FocusGuard, FocusTarget, FontKind, FontWeight, HitEntry, HitTarget, ModalKind,
     PaneHeaderButton, SettingChange, ShadowSpec, TextAlign, UiAction, UiDrawList, UiInteraction,
-    UiPrimitive, cap_radius, z_layer,
+    UiPrimitive, ViewerAction, cap_radius, z_layer,
 };
 pub use drawer::{
     ContextMenuItem, ContextMenuState, HoverPreviewState, render_context_menu,
     render_hover_preview, render_pr_drawer_chrome, render_tooltip,
 };
 pub use file_paths::{
-    DetectedFilePath, detect_at_byte_offset, detect_at_char_col, detect_url_at_char_col,
+    DetectedFilePath, DetectedLink, ParsedFilePath, ResolvedTarget, TargetKind, classify_extension,
+    classify_path, classify_uri, detect_at_byte_offset, detect_at_char_col,
+    detect_bare_filename_at_char_col, detect_link_at_char_col, detect_thread_uri_at_char_col,
+    detect_url_at_char_col, is_thread_uri, parse_file_uri, parse_path_with_location,
+    percent_decode, resolve_bare_filename_in_cwd, resolve_bare_filename_in_viewport,
 };
 pub use icons::IconId;
 pub use layout::{
     ChromeLayoutConfig, ChromeRects, DividerGeometry, DropZone, DropZoneHit, FloatingHitZone,
     FloatingLayerSpec, FloatingPaneGeometry, MinimizedCapsuleGeometry, MinimizedCorner,
     PaneDensity, PaneGeometry, PaneHeaderMode, RectF, SplitAxis, SplitLayoutResult, SplitNode,
-    ToolbarBehavior, ToolbarPosition, compute_chrome_layout, compute_drag_ratio, hit_test_divider,
-    hit_test_drop_zone, hit_test_floating_pane, layout_floating_layers, layout_minimized_capsules,
-    layout_splits,
+    ToolbarBehavior, ToolbarPosition, VIEWER_DEFAULT_RATIO, VIEWER_MAX_RATIO, VIEWER_MIN_RATIO,
+    ViewerSplitGeometry, clamp_viewer_ratio, compute_chrome_layout, compute_drag_ratio,
+    compute_viewer_drag_ratio, hit_test_divider, hit_test_drop_zone, hit_test_floating_pane,
+    layout_floating_layers, layout_minimized_capsules, layout_splits, layout_workspace_with_viewer,
 };
 pub use modal::{
     FindBarState, ModalContent, ModalKey, ModalKeyOutcome, ModalState, SettingsViewSnapshot,
@@ -58,6 +64,13 @@ pub use sidebar::{
 };
 pub use tabbar::{TabBarView, render_tab_bar};
 pub use text_input::{ImePreedit, TextInput};
+pub use viewer::{
+    ComputedMediaPlacement, ImageViewerState, MAX_ZOOM, MIN_ZOOM, MediaViewportState,
+    TEXT_LINE_HEIGHT, TextViewerState, VideoViewerState, ViewerContent, ViewerImagePlacement,
+    ViewerRenderMetrics, ViewerRenderOutput, ViewerState, ViewerTab, ViewerTabKind,
+    ZOOM_STEP_FACTOR, compute_fit_zoom, compute_media_placement, format_file_size, render_viewer,
+    scrub_fraction_from_x, scrub_time_from_x,
+};
 
 /// Snapshot of workspace state fed into [`UiTree::render`] each frame.
 #[derive(Debug, Clone)]
@@ -86,6 +99,9 @@ pub struct UiRenderOutput {
     pub dividers: Vec<DividerGeometry>,
     pub floating_panes: Vec<FloatingPaneGeometry<String>>,
     pub hover_image_slot: Option<RectF>,
+    pub viewer_split: Option<ViewerSplitGeometry>,
+    pub viewer_images: Vec<ViewerImagePlacement>,
+    pub viewer_metrics: ViewerRenderMetrics,
     pub draw_list: UiDrawList,
 }
 
@@ -95,6 +111,7 @@ pub struct UiTree {
     pub layout_cfg: ChromeLayoutConfig,
     pub sidebar: SidebarState,
     pub pane_options: PaneChromeOptions,
+    pub viewer: ViewerState,
     pub modal: Option<ModalState>,
     pub find_bar: FindBarState,
     pub context_menu: Option<ContextMenuState>,
@@ -130,6 +147,7 @@ impl UiTree {
             layout_cfg: ChromeLayoutConfig::default(),
             sidebar: SidebarState::default(),
             pane_options: PaneChromeOptions::default(),
+            viewer: ViewerState::new(),
             modal: None,
             find_bar: FindBarState::default(),
             context_menu: None,
@@ -290,6 +308,26 @@ impl UiTree {
         if matches!(self.focus.current(), FocusTarget::ContextMenu) {
             self.focus.restore_terminal();
         }
+    }
+
+    /// Transfers keyboard focus to the docked right-hand Viewer Pane.
+    pub fn focus_viewer(&mut self) {
+        if self.viewer.open {
+            self.focus.focus_viewer();
+        }
+    }
+
+    /// Closes the docked right-hand Viewer Pane and restores terminal focus if it owned focus.
+    pub fn close_viewer(&mut self) {
+        self.viewer.close_pane();
+        if matches!(self.focus.current(), FocusTarget::Viewer) {
+            self.focus.restore_terminal();
+        }
+    }
+
+    /// Feeds measured viewer layout metrics from [`UiRenderOutput::viewer_metrics`] back into [`ViewerState`].
+    pub fn sync_viewer_metrics(&mut self, metrics: &ViewerRenderMetrics) {
+        self.viewer.sync_render_metrics(metrics);
     }
 
     /// Routes a key event to the active modal (if any) and maps it to a [`UiAction`].
@@ -667,6 +705,131 @@ impl UiTree {
                 self.toasts.retain(|t| t.id != id);
                 UiAction::DismissToast { id }
             }
+            HitTarget::ViewerDivider => UiAction::Viewer(ViewerAction::BeginDividerDrag),
+            HitTarget::ViewerSurface => {
+                self.focus_viewer();
+                UiAction::Viewer(ViewerAction::Focus)
+            }
+            HitTarget::ViewerTab { tab_id } => {
+                self.viewer.select_tab_by_id(tab_id);
+                self.focus_viewer();
+                UiAction::Viewer(ViewerAction::SelectTab { tab_id })
+            }
+            HitTarget::ViewerTabClose { tab_id } => {
+                self.viewer.close_tab_by_id(tab_id);
+                if !self.viewer.open && matches!(self.focus.current(), FocusTarget::Viewer) {
+                    self.focus.restore_terminal();
+                }
+                UiAction::Viewer(ViewerAction::CloseTab { tab_id })
+            }
+            HitTarget::ViewerCopyPath => {
+                self.focus_viewer();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::CopyPath {
+                        path: tab.path.clone(),
+                    })
+                })
+            }
+            HitTarget::ViewerOpenExternal => {
+                self.focus_viewer();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::OpenExternal {
+                        path: tab.path.clone(),
+                        remote_host: tab.remote_host.clone(),
+                    })
+                })
+            }
+            HitTarget::ViewerMaximizeToggle => {
+                self.viewer.toggle_maximized();
+                self.focus_viewer();
+                UiAction::Viewer(ViewerAction::ToggleMaximize)
+            }
+            HitTarget::ViewerClose => {
+                self.close_viewer();
+                UiAction::Viewer(ViewerAction::ClosePane)
+            }
+            HitTarget::ViewerWrapToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_wrap();
+                UiAction::Viewer(ViewerAction::ToggleWrap)
+            }
+            HitTarget::ViewerRawToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_raw_markdown();
+                UiAction::Viewer(ViewerAction::ToggleRawMarkdown)
+            }
+            HitTarget::ViewerZoomOut => {
+                self.focus_viewer();
+                self.viewer.zoom_out();
+                UiAction::Viewer(ViewerAction::ZoomOut)
+            }
+            HitTarget::ViewerZoomReset => {
+                self.focus_viewer();
+                self.viewer.zoom_reset();
+                UiAction::Viewer(ViewerAction::ZoomReset)
+            }
+            HitTarget::ViewerZoomIn => {
+                self.focus_viewer();
+                self.viewer.zoom_in();
+                UiAction::Viewer(ViewerAction::ZoomIn)
+            }
+            HitTarget::ViewerZoomFit => {
+                self.focus_viewer();
+                self.viewer.zoom_fit();
+                UiAction::Viewer(ViewerAction::ZoomFit)
+            }
+            HitTarget::ViewerCanvas => {
+                self.focus_viewer();
+                UiAction::Viewer(ViewerAction::BeginPan)
+            }
+            HitTarget::ViewerVideoPlayPause => {
+                self.focus_viewer();
+                self.viewer.toggle_video_play_pause();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ToggleVideoPlayPause { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerVideoSeekBar => {
+                self.focus_viewer();
+                let fraction = scrub_fraction_from_x(hit_rect, px);
+                self.viewer.seek_active_video_fraction(fraction);
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::SeekVideo {
+                        tab_id: tab.id,
+                        fraction,
+                    })
+                })
+            }
+            HitTarget::ViewerVideoMuteToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_video_mute();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ToggleVideoMute { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerVideoLoopToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_video_loop();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ToggleVideoLoop { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerScrollbarTrack | HitTarget::ViewerScrollbarThumb => {
+                self.focus_viewer();
+                let track = draw_list
+                    .hits
+                    .iter()
+                    .find(|h| h.target == HitTarget::ViewerScrollbarTrack)
+                    .map_or(hit_rect, |h| h.rect);
+                let fraction = ((py - track.y) / track.h.max(1.0)).clamp(0.0, 1.0);
+                self.viewer.scroll_active_to_fraction(fraction);
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ScrollToFraction {
+                        tab_id: tab.id,
+                        fraction,
+                    })
+                })
+            }
         }
     }
 
@@ -761,47 +924,88 @@ impl UiTree {
             draw_list.push_hit(edge, HitTarget::ToolbarHotEdge, z_layer::OVERLAY_TOOLBAR);
         }
 
-        // 2. Binary split tree, floating layers, and minimized capsules inside `chrome.workspace`
-        let split_res = input.split_root.as_ref().map(|root| {
-            layout_splits(
-                chrome.workspace,
-                root,
-                &cfg,
-                input.zoomed_pane.as_ref(),
-                input.hovered_header_pane.as_ref(),
-            )
-        });
+        // 2. Optional docked right-hand Viewer Pane horizontal split inside `chrome.workspace`
+        let viewer_split = layout_workspace_with_viewer(
+            chrome.workspace,
+            self.viewer.open,
+            self.viewer.maximized,
+            self.viewer.split_ratio,
+            &cfg,
+        );
+        let terminal_workspace = viewer_split.map_or(chrome.workspace, |vs| vs.terminal_workspace);
+
+        // 2b. Binary split tree, floating layers, and minimized capsules inside `terminal_workspace`
+        let split_res = if terminal_workspace.is_empty() {
+            None
+        } else {
+            input.split_root.as_ref().map(|root| {
+                layout_splits(
+                    terminal_workspace,
+                    root,
+                    &cfg,
+                    input.zoomed_pane.as_ref(),
+                    input.hovered_header_pane.as_ref(),
+                )
+            })
+        };
         let (tiled_panes, dividers) = match split_res {
             Some(r) => (r.panes, r.dividers),
             None => (Vec::new(), Vec::new()),
         };
-        let floating_panes = layout_floating_layers(chrome.workspace, &input.floating_layers, &cfg);
-        let capsules = layout_minimized_capsules(
-            chrome.workspace,
-            &input.floating_layers,
-            cfg.minimized_corner,
-        );
+        let floating_panes = if terminal_workspace.is_empty() {
+            Vec::new()
+        } else {
+            layout_floating_layers(terminal_workspace, &input.floating_layers, &cfg)
+        };
+        let capsules = if terminal_workspace.is_empty() {
+            Vec::new()
+        } else {
+            layout_minimized_capsules(
+                terminal_workspace,
+                &input.floating_layers,
+                cfg.minimized_corner,
+            )
+        };
 
         let interaction = self.interaction();
         let show_sidebar_expand = cfg.toolbar_position.is_sidebar()
             && chrome.sidebar.is_none()
             && cfg.toolbar_behavior != ToolbarBehavior::Hidden;
 
-        render_workspace_chrome(
-            &mut draw_list,
-            chrome.workspace,
-            &tiled_panes,
-            &dividers,
-            &floating_panes,
-            &capsules,
-            &input.pane_metas,
-            self.pane_options,
-            input.dnd_overlay,
-            show_sidebar_expand,
-            interaction,
-            theme,
-            anim_phase,
-        );
+        if !terminal_workspace.is_empty() {
+            render_workspace_chrome(
+                &mut draw_list,
+                terminal_workspace,
+                &tiled_panes,
+                &dividers,
+                &floating_panes,
+                &capsules,
+                &input.pane_metas,
+                self.pane_options,
+                input.dnd_overlay,
+                show_sidebar_expand,
+                interaction,
+                theme,
+                anim_phase,
+            );
+        }
+
+        // 2c. Docked right-hand tabbed Viewer Pane
+        let viewer_out = if let Some(vs) = viewer_split {
+            render_viewer(
+                &mut draw_list,
+                vs,
+                &self.viewer,
+                self.focus.current() == &FocusTarget::Viewer,
+                self.pane_options.highlight_active_border,
+                self.pane_options.active_border_opacity,
+                interaction,
+                theme,
+                anim_phase,
+            )
+        } else {
+            ViewerRenderOutput::default()
+        };
 
         // 3. Sidebar or horizontal Tab Bar
         let sidebar_scroll = if let Some(sb_rect) = chrome.sidebar {
@@ -937,6 +1141,9 @@ impl UiTree {
             dividers,
             floating_panes,
             hover_image_slot,
+            viewer_split,
+            viewer_images: viewer_out.images,
+            viewer_metrics: viewer_out.metrics,
             draw_list,
         }
     }
