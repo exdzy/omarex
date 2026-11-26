@@ -1,0 +1,39 @@
+[package]
+name = "omarex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omarex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+bytes.workspace = true
+dirs.workspace = true
+gpu-renderer.workspace = true
+image.workspace = true
+omarchy-theme.workspace = true
+open.workspace = true
+parking_lot.workspace = true
+rex-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tr3x-bridge.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ui-chrome.workspace = true
+uuid.workspace = true
+vt-engine.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
+rustix = { version = "1", features = ["event", "pipe"] }
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-client = "0.31"
+zbus.workspace = true

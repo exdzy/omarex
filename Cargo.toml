@@ -1,0 +1,75 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vt-engine",
+    "crates/rex-proto",
+    "crates/omarchy-theme",
+    "crates/gpu-renderer",
+    "crates/tr3x-bridge",
+    "crates/ui-chrome",
+    "crates/omarex",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal workspace crates
+vt-engine = { path = "crates/vt-engine" }
+rex-proto = { path = "crates/rex-proto" }
+omarchy-theme = { path = "crates/omarchy-theme" }
+gpu-renderer = { path = "crates/gpu-renderer" }
+tr3x-bridge = { path = "crates/tr3x-bridge" }
+ui-chrome = { path = "crates/ui-chrome" }
+
+# Windowing, GPU, Text & Layout
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+cosmic-text = "0.19"
+swash = "0.2"
+etagere = "0.3"
+taffy = "0.16"
+resvg = "0.50"
+tiny-skia = "0.12"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+# Async Networking & Protocol
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+webpki-roots = "1.0"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# Desktop, Theme & Utilities
+notify = "9"
+zbus = { version = "6", default-features = false, features = ["tokio"] }
+nucleo-matcher = "0.3"
+parking_lot = "0.13"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+dirs = "7"
+open = "5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

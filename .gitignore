@@ -1,0 +1,26 @@
+# Rust / Cargo build artifacts
+/target
+**/*.rs.bk
+
+# Profiling / benchmarks / temporary test captures
+*.profraw
+*.profdata
+/tmp/
+*.png
+!docs/**/*.png
+!assets/**/*.png
+
+# Arch makepkg build artifacts
+pkgbuild/pkg/
+pkgbuild/src/
+pkgbuild/*.pkg.tar.*
+
+# Editor & OS metadata
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local development helper scripts
+bin/fix-board

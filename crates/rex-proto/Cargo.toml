@@ -1,0 +1,19 @@
+[package]
+name = "rex-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "fs"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+webpki-roots.workspace = true

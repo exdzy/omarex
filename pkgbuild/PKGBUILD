@@ -1,0 +1,31 @@
+pkgname=omarex
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Fast native Wayland GUI client for Rex and T3 Code on Omarchy'
+arch=('x86_64' 'aarch64')
+url='https://github.com/omarex/omarex'
+license=('MIT')
+options=('!lto')
+depends=('ghostty' 'vulkan-icd-loader' 'wayland' 'libxkbcommon' 'fontconfig')
+optdepends=(
+  'rex: local Rex server daemon'
+  'tr3x: T3 Code thread bridge for Rex'
+)
+source=()
+sha256sums=()
+
+build() {
+  if [ -d "$HOME/.local/share/mise/shims" ]; then
+    export PATH="$HOME/.local/share/mise/shims:$PATH"
+  fi
+  cd "$startdir/.."
+  cargo build --release --locked -p omarex
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 target/release/omarex "$pkgdir/usr/bin/omarex"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$startdir/omarex.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/omarex.svg"
+  install -Dm644 "$startdir/omarex.desktop" "$pkgdir/usr/share/applications/omarex.desktop"
+}

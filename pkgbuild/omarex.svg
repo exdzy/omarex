@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1d1d21"/>
+      <stop offset="100%" stop-color="#0d0d10"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ff9b17"/>
+      <stop offset="100%" stop-color="#d97200"/>
+    </linearGradient>
+    <linearGradient id="pane" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#27272d"/>
+      <stop offset="100%" stop-color="#1a1a1f"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)"/>
+  <rect x="7" y="7" width="114" height="114" rx="27" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="2"/>
+  <rect x="20" y="22" width="52" height="84" rx="14" fill="url(#accent)"/>
+  <path d="M33 48L47 60L33 72" fill="none" stroke="#111113" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M51 74H62" fill="none" stroke="#111113" stroke-width="7.5" stroke-linecap="round"/>
+  <rect x="80" y="22" width="28" height="38" rx="11" fill="url(#pane)" stroke="#ffffff" stroke-opacity="0.14" stroke-width="2"/>
+  <circle cx="94" cy="41" r="6" fill="#ff9b17"/>
+  <rect x="80" y="68" width="28" height="38" rx="11" fill="url(#pane)" stroke="#ffffff" stroke-opacity="0.14" stroke-width="2"/>
+  <path d="M88 87H100" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

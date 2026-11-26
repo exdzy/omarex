@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Omarex
+GenericName=Terminal Multiplexer
+Comment=Fast native Wayland GUI client for Rex and T3 Code on Omarchy
+TryExec=omarex
+Exec=omarex
+Icon=omarex
+Terminal=false
+StartupNotify=true
+StartupWMClass=omarex
+Categories=System;TerminalEmulator;Development;
+Keywords=terminal;rex;tr3x;t3;multiplexer;shell;agent;
+X-TerminalArgExec=-e
+X-TerminalArgTitle=--title=
+X-TerminalArgAppId=--class=
+X-TerminalArgDir=--working-directory=
+X-TerminalArgHold=--wait-after-command

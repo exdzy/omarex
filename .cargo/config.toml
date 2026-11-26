@@ -1,0 +1,6 @@
+[build]
+# Keep incremental builds fast during swarm iteration.
+incremental = true
+
+[net]
+git-fetch-with-cli = true

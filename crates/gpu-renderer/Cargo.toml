@@ -1,0 +1,20 @@
+[package]
+name = "gpu-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+cosmic-text.workspace = true
+etagere.workspace = true
+image.workspace = true
+omarchy-theme.workspace = true
+parking_lot.workspace = true
+resvg.workspace = true
+swash.workspace = true
+thiserror.workspace = true
+tiny-skia.workspace = true
+tracing.workspace = true
+vt-engine.workspace = true
+wgpu.workspace = true
