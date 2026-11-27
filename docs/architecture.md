@@ -8,7 +8,7 @@
 
 `omarex` replaces the buggy, CPU-bound Qt6/QML experience of `Unayung/orex` with a **native Rust + Vulkan (`wgpu`) + `libghostty-vt`** desktop client that mirrors **Rex's own architecture**:
 
-1. **Same VT core as Rex & Ghostty:** Direct C FFI to the system-installed `libghostty-vt.so` (`ghostty 1.4.0-1`), using its two-phase `GhosttyRenderState`, incremental dirty-row + row-identity caching, streaming `GHOSTSNP` snapshot decoder, Kitty graphics placements, and native key/mouse/selection encoders.
+1. **Same VT core as Rex & Ghostty:** Direct C FFI to the system-installed `libghostty-vt.so.1` (Arch `extra/libghostty-vt >= 1.0.2`, `GHOSTTY_VT_1.0` ABI), using its two-phase `GhosttyRenderState`, incremental dirty-row + row-identity caching, streaming `GHOSTSNP` snapshot decoder, Kitty graphics placements, and native key/mouse/selection encoders.
 2. **Same client-server & Lua architecture as Rex:** Thin, blazing-fast native presentation client speaking **Rex Control API rev 24** (`session.bootstrap`, `reconnect_token`, `client.keymap`, `client.action`, `client.key`, `client.reply`, `client_prompt_requested`, `client_perform_requested`) and **Data WS `rex.data.terminal.v1`** with byte-counted stream **`RESUME`**. All Lua config (`~/.config/rex/init.lua`, `tr3x.lua`) executes server-side exactly as in Rex.app.
 3. **Same GPU rendering model as Ghostty/Rex:** Instanced GPU quad + glyph-atlas + Kitty image pipeline via **`wgpu` (Vulkan 1.4)** over native **Wayland (`winit`)**, rendering both terminal grids and Rex-faithful UI chrome in a single unified GPU pass with sub-2ms frame times.
 4. **Methodology from `rust-anything`, `fast-anything`, and `rea`:**
@@ -25,7 +25,7 @@ Direct inspection of `/usr/bin/rex` (50.5 MB Go ELF binary, `0.1.0-preview.25`, 
 | Layer | Official Rex Implementation | `omarex` Equivalent (Omarchy Linux) |
 |---|---|---|
 | **Server & CLI** | **Go** (`go.superlogical.com/rex/...`) + CGO bindings to **`libghostty-vt`** + embedded **Lua** engine (`~/.config/rex/init.lua`, `tr3x.lua`) | Connects unmodified to `/usr/bin/rex` (`unix:///run/user/$UID/rex/server.sock` + remote Tailscale/SSH hosts) |
-| **Terminal Emulation Core** | **`libghostty-vt`** (Zig with stable C ABI): VT parser, scrollback, reflow, `GHOSTSNP` snapshots, Kitty graphics, selection, key/mouse encoders | **Exact same `/usr/lib/libghostty-vt.so`** (`ghostty 1.4.0-1`) via direct zero-overhead Rust C FFI (`crates/vt-engine`) |
+| **Terminal Emulation Core** | **`libghostty-vt`** (Zig with stable C ABI): VT parser, scrollback, reflow, `GHOSTSNP` snapshots, Kitty graphics, selection, key/mouse encoders | **Exact same `/usr/lib/libghostty-vt.so.1`** (`libghostty-vt >= 1.0.2`, `GHOSTTY_VT_1.0` ABI) via direct zero-overhead Rust C FFI (`crates/vt-engine`) |
 | **GPU Terminal Renderer** | `libghostty` GPU renderer (Metal on macOS/iOS, DirectX on Windows, OpenGL/EGL in Ghostty Linux) using instanced cell backgrounds + dynamic glyph atlas + Kitty image layers | **Native Rust `wgpu` (Vulkan 1.4 on NVIDIA RTX 4060 Ti, GLES fallback)** with Ghostty-equivalent 4-pass instanced WGSL pipeline (`crates/gpu-renderer`) |
 | **Native Window & Input** | Swift/AppKit on macOS; native client on Windows; GTK4/Wayland in Ghostty Linux | **`winit` (native Wayland)** + `libxkbcommon` physical/logical keys + Wayland IME + HiDPI fractional scaling |
 | **UI Chrome & Custom UI** | Native SwiftUI/AppKit chrome + native `rex.ui.pick` / `rex.ui.input` palette & drawers | Unified **GPU UI Chrome** (`taffy` flexbox + SDF rounded rects + `cosmic-text` + `resvg` icons) rendered in the same `wgpu` pass (`crates/ui-chrome`) |
@@ -111,27 +111,23 @@ Checked read-only on the target machine:
 - **Display:** `DP-6` (`AOC 25G4S`, `1920x1080`, `vrr: true`, supports **60 Hz up to 300 Hz**).
 - **GPUs & Drivers:** Dual **NVIDIA GeForce RTX 4060 Ti** (`AD106`, 16 GB), `nvidia-open-dkms 615.78.08-1`, `nvidia-utils 615.78.08-1`, `/usr/share/vulkan/icd.d/nvidia_icd.json`, `vulkan-icd-loader 1.4.363.0-1`, `mesa 1:26.2.5-1`, `egl-wayland 4:1.1.24-1`, `egl-wayland2 1.0.2-1`.
 - **Wayland & Font Libraries (all already installed):** `wayland 1.26.0-1`, `wayland-protocols 1.49-1`, `libxkbcommon 1.13.2-1`, `fontconfig 2:2.18.3-2`, `freetype2 2.15.0-1`, `harfbuzz 14.6.0-1`. Default fonts: `JetBrainsMono Nerd Font` (monospace), `Liberation Sans` (sans-serif).
-- **Terminal Core (already installed):** `ghostty 1.4.0-1`:
-  - Shared library: `/usr/lib/libghostty-vt.so` → `libghostty-vt.so.0.1.0`
-  - Headers: `/usr/include/ghostty/vt.h` and `/usr/include/ghostty/vt/*.h` (includes `render.h`, `snapshot.h`, `kitty_graphics.h`, `search.h`, `selection.h`, `key/encoder.h`, `mouse/encoder.h`, `paste.h`, `focus.h`, `osc.h`, `size_report.h`, `terminal.h`).
+- **Terminal Core (already installed):** `libghostty-vt 1.0.2-1` (Arch `extra`, `GHOSTTY_VT_1.0` ABI):
+  - Shared library: `/usr/lib/libghostty-vt.so` → `libghostty-vt.so.1` → `libghostty-vt.so.1.0.2`
+  - Headers: `/usr/include/ghostty/vt.h` and `/usr/include/ghostty/vt/*.h` (includes `render.h`, `snapshot.h`, `kitty_graphics.h`, `search.h`, `selection.h`, `formatter.h`, `key/encoder.h`, `mouse/encoder.h`, `paste.h`, `focus.h`, `osc.h`, `size_report.h`, `terminal.h`, `version.h`).
 - **Live Rex & `tr3x`:** `/usr/bin/rex` (`0.1.0-preview.25`, API rev 24) listening at `unix:///run/user/1000/rex/server.sock`, live `"T3 Code"` session (`session:01a216bc-52f2-72c7-aa9a-e94e1d60b77a`) synced by `~/.local/bin/tr3x` via `~/.config/rex/tr3x.lua`.
 - **Omarchy Theme Path:** `~/.local/state/omarchy/current/theme/colors.toml` (live Omarchy v4 Aether theme format: `mode`, `accent`, `selection`, `background`, `dark_background`, `darker_background`, `lighter_background`, `foreground`, `muted`, ANSI colors `red..bright_magenta`).
 - **Build Tools Present:** `gcc`, `clang`, `cmake`, `ninja`, `pkg-config`, `mise`, `pacman`, `yay`, `omarchy-pkg-add`.
 - **Missing Currently:** `rustc` and `cargo` are NOT yet installed on `PATH` (nor in `~/.cargo`).
 
-### 5.2 Critical Packaging Quirk Discovered (`libghostty-vt.pc`)
+### 5.2 `libghostty-vt` Discovery & ABI Safety (`crates/vt-engine/build.rs`)
 
-> [!WARNING]
-> Arch/Omarchy's `ghostty 1.4.0-1` ships `/usr/share/pkgconfig/libghostty-vt.pc` with a broken build-time staging prefix:
-> ```ini
-> prefix=/src/ghostty/src/ghostty-1.4.0/build/usr
-> ```
-> Running `pkg-config --cflags --libs libghostty-vt` emits non-existent `-I/src/ghostty/...` and `-L/src/ghostty/...` paths.
+> [!NOTE]
+> Arch `extra/libghostty-vt >= 1.0.2` ships a valid `/usr/lib/pkgconfig/libghostty-vt.pc` (`prefix=/usr`) and versioned `GHOSTTY_VT_1.0` symbols (`libghostty-vt.so.1`). Older pre-1.0 `ghostty 1.4.0-1` builds shipped a broken `.pc` staging prefix (`/src/ghostty/...`), so `build.rs` keeps defensive path validation.
 
 **Mandatory rule for `crates/vt-engine/build.rs`:**
 1. Check `GHOSTTY_VT_LIB_DIR` / `GHOSTTY_VT_INCLUDE_DIR` env overrides first.
 2. Probe `/usr/include/ghostty/vt.h` and `/usr/lib/libghostty-vt.so` directly (emitting `cargo:rustc-link-search=native=/usr/lib` and `cargo:rustc-link-lib=dylib=ghostty-vt`), falling back to `pkg-config` only if the prefix directory actually exists on disk.
-3. Also verify C struct/enum layout against `/usr/include/ghostty/vt/*.h` (either via `bindgen` at build time using system `clang` OR hand-verified `#[repr(C)]` bindings cross-checked by a C layout-assertion test in `build.rs` / `cargo test`). Using `bindgen` (since `clang` is already installed!) or compile-time `sizeof`/`offsetof` assertions guarantees zero ABI drift across `ghostty` package updates!
+3. Verify C struct/enum layout and discriminants against live `ghostty_type_json()` in `cargo test` (`abi_layout_and_discriminants_match_type_manifest`), and pin `libghostty-vt>=1.0.2` / `libghostty-vt<2.0` in `pkgbuild/PKGBUILD` so pacman enforces ABI compatibility across system updates.
 
 ### 5.3 Clean Rust Toolchain Setup on Omarchy (Policy-Compliant)
 

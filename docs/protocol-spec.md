@@ -1,7 +1,7 @@
 # `omarex` Protocol, `tr3x` Compatibility & `libghostty-vt` FFI Specification
 
 > **Status**: Complete, live-verified specification for `omarex` (`crates/rex-proto`, `crates/vt-engine`, `crates/tr3x-bridge`).
-> **Target Environment**: Omarchy (Arch Linux `x86_64`) · Rex Server `0.1.0-preview.25` (API rev `24`, min rev `0`) · `tr3x` `0.1.8` · `ghostty` `1.4.0-1` (`libghostty-vt.so.0.1.0`).
+> **Target Environment**: Omarchy (Arch Linux `x86_64`) · Rex Server `0.1.0-preview.25` (API rev `24`, min rev `0`) · `tr3x` `0.1.8` · `libghostty-vt` `1.0.2-1` (`libghostty-vt.so.1.0.2`, `GHOSTTY_VT_1.0` ABI).
 > **Methodology**: Evidence-based static & runtime reverse engineering following [REA (Reverse Engineer Anything)](https://github.com/morluto/rea): live read-only server introspection (`/llms.txt`, `/api/help`, `rex api`), live `/api/control` + `/api/data` binary capture, Go ELF metadata/string inspection of `/usr/bin/rex`, full source audit of `~/.config/rex/tr3x.lua` and `macnason/tr3x`, and direct C header + live `ctypes` ABI verification against `/usr/lib/libghostty-vt.so`.
 
 ---
@@ -14,7 +14,7 @@
 | Local Control/Data Socket | `unix:///run/user/1000/rex/server.sock` | `rex.control.v1`, `rex.data.terminal.v1`, `rex.data.bytes.v1` | Live control WS handshake + `session.bootstrap` + `data.connect` + `/api/data` binary stream capture (`11,508` B) |
 | Auxiliary Listeners (Observed) | `login-server:///run/user/1000/rex/login-server.sock`, built-in Tailscale HTTPS (`https://*.ts.net`) | Peer UID/GID, Tailscale identity, SSH stdio tunnel | Verified via live `server.status`, `hosts.list`, and `/usr/bin/rex` transport code |
 | `tr3x` Sync & Lua Bridge | `~/.local/bin/tr3x`, `~/.config/rex/init.lua`, `~/.config/rex/tr3x.lua` | `tr3x 0.1.8` (syncing 23 live windows in `"T3 Code"` session) | Full read of `tr3x.lua` (524 lines) + upstream `github.com/macnason/tr3x` (`rex.rs`, `actions.rs`, `status.rs`, `scheme.rs`, `paste.rs`, `term.rs`, `link.rs`, `docs/how-it-works.md`) |
-| `libghostty-vt` | `/usr/lib/libghostty-vt.so` (`-> .0 -> .0.1.0`), `/usr/include/ghostty/vt.h` + 30 headers | `ghostty 1.4.0-1` (`0.1.0-dev`), `SIMD=true`, `KITTY_GRAPHICS=true`, `OPTIMIZE=RELEASE_FAST` | End-to-end live decode of captured `11,508` B Rex stream via `ghostty_snapshot_decoder_new_buf` (`GHOSTTY_SUCCESS`, `11,300` B snapshot + `208` B `rex1;` APCs); live `ghostty_build_info()` + `ghostty_type_json()` ABI dump |
+| `libghostty-vt` | `/usr/lib/libghostty-vt.so` (`-> .1 -> .1.0.2`), `/usr/include/ghostty/vt.h` + 33 sub-headers | `libghostty-vt 1.0.2-1` (`GHOSTTY_VT_1.0`), `SIMD=true`, `KITTY_GRAPHICS=true`, `OPTIMIZE=RELEASE_FAST` | End-to-end live decode of captured `11,508` B Rex stream via `ghostty_snapshot_decoder_new` (`GHOSTTY_SUCCESS`, `11,300` B snapshot + `208` B `rex1;` APCs); live `ghostty_build_info()` + `ghostty_type_json()` ABI manifest verification |
 
 ---
 
@@ -813,26 +813,25 @@ When `omarex` passes `servers` + `server` to `client.action` (invoking a Lua act
 
 ---
 
-## 7. `libghostty-vt` C API & FFI Contract on Omarchy (`ghostty 1.4.0-1`)
+## 7. `libghostty-vt` C API & FFI Contract on Omarchy (`libghostty-vt 1.0.2`, `GHOSTTY_VT_1.0`)
 
-### 7.1 Installed Files & CRITICAL Arch Packaging Bug
+### 7.1 Installed Files & Build Discovery
 
-- **Shared library**: `/usr/lib/libghostty-vt.so` -> `libghostty-vt.so.0` -> `/usr/lib/libghostty-vt.so.0.1.0` (`655` exported C symbols).
-- **Umbrella header**: `/usr/include/ghostty/vt.h` (includes all 30 sub-headers under `/usr/include/ghostty/vt/`).
-- **Sub-headers**: `allocator.h`, `build_info.h`, `color.h`, `focus.h`, `formatter.h`, `grid_ref.h`, `io.h`, `key.h`, `key/{encoder,event}.h`, `kitty_graphics.h`, `modes.h`, `mouse.h`, `mouse/{encoder,event}.h`, `osc.h`, `paste.h`, `point.h`, `render.h`, `result.h`, `screen.h`, `search.h`, `selection.h`, `sgr.h`, `snapshot.h`, `style.h`, `sys.h`, `terminal.h`, `types.h`, `wasm.h`.
+- **Shared library**: `/usr/lib/libghostty-vt.so` -> `libghostty-vt.so.1` -> `/usr/lib/libghostty-vt.so.1.0.2` (`209` exported `GHOSTTY_VT_1.0` C symbols).
+- **pkg-config**: `/usr/lib/pkgconfig/libghostty-vt.pc` (`prefix=/usr`, `Version: 1.0.2`).
+- **Umbrella header**: `/usr/include/ghostty/vt.h` (includes all 33 sub-headers under `/usr/include/ghostty/vt/`).
+- **Sub-headers**: `allocator.h`, `build_info.h`, `color.h`, `color_scheme.h`, `device.h`, `focus.h`, `formatter.h`, `grid_ref.h`, `grid_ref_tracked.h`, `io.h`, `key.h`, `key/{encoder,event}.h`, `kitty_graphics.h`, `modes.h`, `mouse.h`, `mouse/{encoder,event}.h`, `osc.h`, `paste.h`, `point.h`, `render.h`, `screen.h`, `search.h`, `selection.h`, `sgr.h`, `size_report.h`, `snapshot.h`, `style.h`, `sys.h`, `terminal.h`, `types.h`, `unicode.h`, `version.h`, `wasm.h`.
 
-> [!CAUTION]
-> **Broken `/usr/share/pkgconfig/libghostty-vt.pc` on Arch/Omarchy**:
-> The installed `.pc` file contains a stale build-root prefix (`prefix=/src/ghostty/src/ghostty-1.4.0/build/usr`), causing `pkg-config --cflags --libs libghostty-vt` to emit non-existent include/lib paths!
-> `crates/vt-engine/build.rs` **MUST** validate that any `pkg-config` prefix actually exists on disk, and otherwise probe `/usr/include/ghostty/vt.h` + `/usr/lib/libghostty-vt.so` directly (with env overrides `GHOSTTY_VT_INCLUDE_DIR` / `GHOSTTY_VT_LIB_DIR`), emitting `cargo:rustc-link-search=native=/usr/lib` and `cargo:rustc-link-lib=dylib=ghostty-vt`.
+> [!NOTE]
+> `crates/vt-engine/build.rs` checks explicit overrides (`GHOSTTY_VT_INCLUDE_DIR` / `GHOSTTY_VT_LIB_DIR`) first, then probes `/usr/include/ghostty/vt.h` + `/usr/lib/libghostty-vt.so` directly before falling back to `pkg-config libghostty-vt` (accepting `pkg-config` paths only if they exist on disk), and `pkgbuild/PKGBUILD` pins `libghostty-vt>=1.0.2` / `libghostty-vt<2.0`.
 
 ### 7.2 Live-Verified Build Info & ABI Manifest
 
-Queried live from `/usr/lib/libghostty-vt.so` via `ghostty_build_info()` and `ghostty_type_json()`:
+Queried live from `/usr/lib/libghostty-vt.so.1` via `ghostty_build_info()` and `ghostty_type_json()`:
 
 - **Target ABI**: `x86_64-linux-gnu`, little-endian, `pointer_size = 8`, `usize_size = 8`, `max_alignment = 16`.
-- **Feature flags**: `SIMD = true`, `KITTY_GRAPHICS = true`, `TMUX_CONTROL_MODE = false`, `OPTIMIZE = 3 (RELEASE_FAST)`, `version = "0.1.0-dev"`.
-- **Versioning pattern**: Every extensible C input/output struct begins with `size_t size;` — callers **MUST** initialize `.size = std::mem::size_of::<T>()` before calling any C function (otherwise `GHOSTTY_INVALID_VALUE` is returned).
+- **Feature flags**: `SIMD = true`, `KITTY_GRAPHICS = true`, `TMUX_CONTROL_MODE = false`, `OPTIMIZE = 3 (RELEASE_FAST)`, `version = "1.0.2"`.
+- **Versioning pattern**: Every extensible C input/output struct begins with `size_t size;` — callers **MUST** initialize `.size = std::mem::size_of::<T>()` before calling any C function (otherwise `GHOSTTY_INVALID_VALUE` is returned). Option/data enums in `GHOSTTY_VT_1.0` reserve discriminant `0` for `*_INVALID`.
 
 #### Exact Packed `GhosttyCell` Layout (`u64`, 8 bytes, align 8)
 Using `GHOSTTY_RENDER_STATE_ROW_DATA_CELLS_RAW` returns a contiguous `const GhosttyCell*` slice for the entire row in **1 FFI call**, allowing zero-FFI cell decoding in Rust:
@@ -968,10 +967,10 @@ GhosttyResult ghostty_render_state_clean(GhosttyRenderState rs);
 | Feature | Exact `libghostty-vt` Symbols | Usage in `omarex` |
 | --- | --- | --- |
 | **Selection Gestures** | `ghostty_selection_gesture_new/free`, `ghostty_selection_gesture_event_new/set/free`, `ghostty_selection_gesture_handle(gesture, term, ev)` | Native single/double/triple-click (cell/word/line/semantic-output), drag, rectangular selection (`Alt+drag`), and edge autoscroll (`AUTOSCROLL_TICK`) matching Ghostty feel. |
-| **Copy Selected Text** | `ghostty_terminal_selection_format_len`, `ghostty_terminal_selection_format` (`unwrap`, `trim`, `emit: PLAIN`) | Extracts unwrapped/trimmed UTF-8 selection for Wayland clipboard. |
+| **Copy Selected Text** | `ghostty_formatter_terminal_new`, `ghostty_formatter_format_buf`, `ghostty_formatter_free` (`unwrap`, `trim`, `emit: PLAIN`, `selection`) | Extracts unwrapped/trimmed UTF-8 selection for Wayland clipboard via the `GHOSTTY_VT_1.0` formatter API. |
 | **Scrollback Search** | `ghostty_search_new/free`, `ghostty_search_set(NEEDLE\|SELECT_NEXT\|SELECT_PREV\|SELECT_SCROLL)`, `ghostty_search_tick`, `ghostty_search_get(STATUS\|TOTAL_MATCHES\|SELECTED_INDEX\|VIEWPORT_MATCHES)` | Incremental non-blocking search across compressed scrollback with live viewport match highlights. |
 | **OSC 8 Hyperlink Lookup** | `ghostty_terminal_grid_ref(term, point, &ref)`, `ghostty_grid_ref_hyperlink_uri(&ref, buf, len, &out_len)` | Resolves hovered cell's hyperlink URI on `Ctrl+hover`/`Ctrl+click`. |
-| **Key / Mouse / Focus / Paste Encoders** | `ghostty_key_encoder_*`, `ghostty_mouse_encoder_*`, `ghostty_focus_encode`, `ghostty_paste_encode` / `ghostty_paste_is_safe` | Used for local PTY testing/benchmarks and validating safe paste (`ghostty_paste_is_safe`); live Rex sessions primarily route through `client.key` and `block.event`. |
+| **Key / Mouse / Focus / Paste Encoders** | `ghostty_key_encoder_set*`, `ghostty_mouse_encoder_set*`, `ghostty_focus_encode`, `ghostty_paste_encode` / `ghostty_paste_is_safe` | Used for local PTY testing/benchmarks and validating safe paste (`ghostty_paste_is_safe`); live Rex sessions primarily route through `client.key` and `block.event`. |
 
 ---
 
@@ -982,7 +981,7 @@ GhosttyResult ghostty_render_state_clean(GhosttyRenderState rs);
   - Data WS (`rex.data.terminal.v1` & `rex.data.bytes.v1`): 17B `HELLO` / 25B `RESUME` / 32B `WELCOME` / 2B `REJECT`, exact consumed-byte counter, `channel_nonce` verification, `1000` clean close vs `1001` resume vs `1013` re-ticket vs `4000` drop.
   - Multi-host transports: `unix://`, `https://` (Tailscale), `ssh://` (`rex __internal dial-stdio`), `hosts.*` + `hosts_changed`.
 - **`crates/vt-engine`**:
-  - `build.rs`: bypass broken `/usr/share/pkgconfig/libghostty-vt.pc` prefix; probe `/usr/include/ghostty/vt.h` + `/usr/lib/libghostty-vt.so` directly.
+  - `build.rs`: honor `GHOSTTY_VT_INCLUDE_DIR`/`GHOSTTY_VT_LIB_DIR`, probe `/usr/include/ghostty/vt.h` + `/usr/lib/libghostty-vt.so`, and validate `pkg-config` fallback paths; track `version.h` for `GHOSTTY_VT_1.0`.
   - Startup: register `GHOSTTY_SYS_OPT_DECODE_PNG` (via `png` crate -> RGBA8).
   - Snapshot streaming: `COMPRESS_HISTORY=true`, `KITTY_IMAGE_STORAGE_LIMIT=128 MiB`, `ready()` -> immediate render -> `next()` until `GHOSTTY_NO_VALUE` -> `SOURCE_OFFSET`.
   - Live stream: `UNKNOWN_SEQUENCE` APC handler verifying `rex1;<channel_nonce>;<json>`, `RENDER_HOLD` (Mode 2026), `WRITE_PTY=NULL`, 2-phase `GhosttyRenderState` with `CELLS_RAW` + `ROW_DATA_ID` + `OVERSCAN` + `IMAGE_ITERATOR`.
