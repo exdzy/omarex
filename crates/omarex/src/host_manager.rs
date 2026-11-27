@@ -14,23 +14,28 @@ use omarchy_theme::{
     ThemeEvent, ThemeRuntimeHandles, start_live_watchers,
 };
 use rex_proto::types::{
-    BlockCloseRequest, BlockEventRequest, BlockInputEvent, ClientActionRequest,
+    BlockCloseRequest, BlockCreateSpec, BlockEventRequest, BlockInputEvent, ClientActionRequest,
     ClientActionResponse, ClientCallRequestedEvent, ClientKeyRequest, ClientKeymapRequest,
     ClientKeymapResponse, ClientListResponse, ClientPerformRequestedEvent, ClientPromptEndedEvent,
-    ClientPromptRequestedEvent, ClientReplyRequest, DataTicketSpec, HostsListResponse, OwnMode,
+    ClientPromptRequestedEvent, ClientReplyRequest, DataConnectRequest, DataTicketSpec,
+    DirEntry as ProtoDirEntry, HostsListResponse, LayoutCreateSpec, ListDirStatus, OwnMode,
     ServerEvent, SessionBootstrapRequest, SessionBootstrapResponse, SessionCreateRequest,
-    SessionDisownBlockRequest, SessionFloatBlockRequest, SessionNewLayerRequest,
-    SessionNewSplitRequest, SessionNewWindowRequest, SessionOwnBlockRequest,
-    SessionResizeLayerRequest, SessionResizePaneRequest, SessionSetLayerStateRequest, SessionView,
-    SessionZoomBlockRequest, TerminalResizeArgs, TerminalSetThemeArgs,
+    SessionDisownBlockRequest, SessionFloatBlockRequest, SessionNewBlockRequest,
+    SessionNewLayerRequest, SessionNewSplitRequest, SessionNewWindowRequest,
+    SessionOwnBlockRequest, SessionResizeLayerRequest, SessionResizePaneRequest,
+    SessionSetLayerStateRequest, SessionSwapBlocksRequest, SessionTransferWindowRequest,
+    SessionView, SessionZoomBlockRequest, TerminalBlobReadArgs, TerminalClipboardReadArgs,
+    TerminalListDirArgs, TerminalListDirResponse, TerminalPortsResponse, TerminalResizeArgs,
+    TerminalSetThemeArgs, TunnelDialOptions,
 };
 use rex_proto::{
-    ControlClient, ControlConfig, ControlNotification, DEFAULT_MAX_DOWNLOAD_BYTES, DataCloseAction,
-    DataWelcome, DownloadResult, FramedChunk, RecoveryOutcome, RexApcFramer, RexControlMessage,
-    RexEndpoint, TerminalDataStream, TerminalStreamChunk, TransferProgress, UploadBatch,
-    UploadResult, download_file, upload_file,
+    BytesDataStream, ControlClient, ControlConfig, ControlNotification, DEFAULT_MAX_DOWNLOAD_BYTES,
+    DataCloseAction, DataWelcome, DownloadResult, FramedChunk, RecoveryOutcome, RexApcFramer,
+    RexControlMessage, RexEndpoint, TerminalDataStream, TerminalStreamChunk, TransferProgress,
+    UploadBatch, UploadResult, download_file, upload_file,
 };
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::net::TcpListener;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::config::SavedHost;
 use crate::workspace::{BlockKey, HydratedBlockMeta};
@@ -189,16 +194,27 @@ pub enum HostCommand {
     NewWindow {
         host_id: String,
         request: SessionNewWindowRequest,
+        origin_window_id: Option<u64>,
     },
     /// Create new session (`session.create`).
     NewSession {
         host_id: String,
         request: SessionCreateRequest,
+        open_in_new_window: bool,
+        origin_window_id: Option<u64>,
+    },
+    /// Transfer an existing window/tab into a fresh attached session for tear-off to a new OS window.
+    TransferTabToNewWindow {
+        host_id: String,
+        source_session_id: String,
+        window_id: String,
+        block_ids: Vec<String>,
     },
     /// Create a dedicated ephemeral session for `-e <cmd>` execution and attach immediately.
     CreateCommandSession {
         host_id: String,
         request: SessionCreateRequest,
+        origin_window_id: Option<u64>,
     },
     /// Destroy a session (`session.destroy`), used to clean up ephemeral `-e` sessions.
     DestroySession { host_id: String, session_id: String },
@@ -250,6 +266,20 @@ pub enum HostCommand {
         direction: String,
         side: String,
         ratio: Option<f64>,
+    },
+    /// Swap two blocks in place (`session.swap_blocks`).
+    SwapBlocks {
+        host_id: String,
+        request: SessionSwapBlocksRequest,
+    },
+    /// Dock a floating block when its window's tiled layer is empty by creating a temporary
+    /// tiled window/anchor, moving the block in, and closing the temporary block.
+    DockFloatingBlock {
+        host_id: String,
+        session_id: String,
+        block_id: String,
+        window_label: Option<String>,
+        before_window_id: Option<String>,
     },
     /// Reorder a window within its session (`session.move_window`).
     MoveWindow {
@@ -324,6 +354,39 @@ pub enum HostCommand {
         session_id: String,
         disown: bool,
     },
+    /// List directory entries on local or remote block (`com.superlogical.terminal.list_dir`).
+    ListDir {
+        key: BlockKey,
+        path: String,
+        prefix: Option<String>,
+        files: bool,
+        limit: u32,
+        request_id: u64,
+    },
+    /// Paginated OSC 52 clipboard read (`com.superlogical.terminal.clipboard_read`).
+    ReadClipboard {
+        key: BlockKey,
+        clipboard_id: u64,
+        expected_bytes: u64,
+    },
+    /// Snapshot listening TCP ports (`com.superlogical.terminal.ports`).
+    ListPorts { key: BlockKey },
+    /// Paginated large `ports_changed` JSON blob read (`com.superlogical.terminal.blob_read`).
+    ReadPortsBlob { key: BlockKey, blob_id: u64 },
+    /// Bind a local loopback listener and open a `com.superlogical.tunnel.dial` forwarder.
+    StartPortTunnel {
+        tunnel_id: u64,
+        key: BlockKey,
+        remote_host: String,
+        remote_port: u16,
+    },
+    /// Tear down a local tunnel listener and close its detached Rex tunnel block.
+    StopPortTunnel {
+        host_id: String,
+        session_id: String,
+        tunnel_block_id: Option<String>,
+        tunnel_id: u64,
+    },
     /// Send an interactive desktop notification via D-Bus (`org.freedesktop.Notifications`).
     SendNotification(NotificationRequest),
     /// Shut down all host connections, data streams, and background tasks cleanly.
@@ -379,6 +442,34 @@ pub enum RuntimeEvent {
         session_id: String,
         view: Box<SessionView>,
         seq: u64,
+        open_in_new_window: bool,
+        origin_window_id: Option<u64>,
+    },
+    /// Emitted immediately before `session.transfer_window` so the controller preserves
+    /// `PaneRuntime` and active tunnels if Rex delivers `BlockClosed` on the source session first.
+    TabTransferStarting {
+        host_id: String,
+        source_session_id: String,
+        target_session_id: String,
+        window_id: String,
+        block_ids: Vec<String>,
+    },
+    /// Window/tab transferred to a newly created & attached target session for multi-window tear-off.
+    TabTransferredToNewWindow {
+        host_id: String,
+        source_session_id: String,
+        target_session_id: String,
+        window_id: String,
+        target_view: Box<SessionView>,
+        source_view: Option<Box<SessionView>>,
+        seq: u64,
+    },
+    /// Emitted if `session.transfer_window` (or post-transfer view fetch) fails after `TabTransferStarting`.
+    TabTransferFailed {
+        host_id: String,
+        source_session_id: String,
+        window_id: String,
+        block_ids: Vec<String>,
     },
     /// New window/tab created by this client inside `session_id` (with fresh view if fetched).
     WindowCreated {
@@ -388,12 +479,14 @@ pub enum RuntimeEvent {
         block_ids: Vec<String>,
         view: Option<Box<SessionView>>,
         seq: u64,
+        origin_window_id: Option<u64>,
     },
     /// Dedicated ephemeral command session created & attached for `-e <cmd>` launches.
     CommandSessionReady {
         host_id: String,
         session_id: String,
         view: Box<SessionView>,
+        origin_window_id: Option<u64>,
     },
     /// Single coalesced batch of initial per-block metadata (`program_status`, `pwd`, `process`)
     /// fetched concurrently off the UI thread.
@@ -478,6 +571,38 @@ pub enum RuntimeEvent {
     ThemeChanged(ThemeEvent),
     /// User clicked a desktop notification or its `"Open"` action button.
     NotificationClicked(NotificationTarget),
+    /// Directory listing result for File/Dir-Picker (`F16`).
+    DirListed {
+        key: BlockKey,
+        request_id: u64,
+        result: Result<TerminalListDirResponse, String>,
+    },
+    /// Chunked OSC 52 remote clipboard read completed (`F18`).
+    ClipboardReadFinished {
+        key: BlockKey,
+        id: u64,
+        result: Result<String, String>,
+    },
+    /// Listening ports snapshot or `blob_read` result (`F19`).
+    PortsListed {
+        key: BlockKey,
+        result: Result<TerminalPortsResponse, String>,
+    },
+    /// Remote port-forward tunnel listener bound and `com.superlogical.tunnel.dial` created (`F19`).
+    TunnelStarted {
+        tunnel_id: u64,
+        key: BlockKey,
+        tunnel_block_id: String,
+        remote_port: u16,
+        local_port: u16,
+    },
+    /// Port-forward tunnel creation failed (`F19`).
+    TunnelFailed {
+        tunnel_id: u64,
+        key: BlockKey,
+        remote_port: u16,
+        error: String,
+    },
 }
 
 /// Payload carried by [`RuntimeEvent::DataStream`].
@@ -891,6 +1016,11 @@ fn should_surface_rpc_error(context: &str, err: &rex_proto::ProtoError) -> bool 
         | "session.move_block"
         | "session.move_window"
         | "session.float_block"
+        | "com.superlogical.terminal.list_dir"
+        | "com.superlogical.terminal.clipboard_read"
+        | "com.superlogical.terminal.ports"
+        | "com.superlogical.terminal.blob_read"
+        | "session.new_block"
         | "client.key"
         | "client.reply" => !err.is_not_found(),
 
@@ -937,6 +1067,11 @@ struct ActiveStream {
     task: tokio::task::JoinHandle<()>,
 }
 
+struct ActiveTunnelTask {
+    host_id: String,
+    cancel_tx: watch::Sender<bool>,
+}
+
 enum InternalMsg {
     HostEstablished {
         host_id: String,
@@ -956,6 +1091,7 @@ async fn run_host_manager(
 ) {
     let mut hosts: HashMap<String, ManagedHost> = HashMap::new();
     let mut streams: HashMap<BlockKey, ActiveStream> = HashMap::new();
+    let mut tunnels: HashMap<u64, ActiveTunnelTask> = HashMap::new();
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
 
     // Optional live Omarchy theme + Hyprland IPC watcher.
@@ -1054,6 +1190,9 @@ async fn run_host_manager(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     HostCommand::Shutdown => {
+                        for (_, tun) in tunnels.drain() {
+                            let _ = tun.cancel_tx.send(true);
+                        }
                         for (_, mut st) in streams.drain() {
                             if let Some(tx) = st.cancel_tx.take() {
                                 let _ = tx.send(());
@@ -1085,6 +1224,14 @@ async fn run_host_manager(
                     }
 
                     HostCommand::RemoveHost { host_id } => {
+                        tunnels.retain(|_, tun| {
+                            if tun.host_id == host_id {
+                                let _ = tun.cancel_tx.send(true);
+                                false
+                            } else {
+                                true
+                            }
+                        });
                         let matching: Vec<BlockKey> = streams
                             .keys()
                             .filter(|k| k.host_id == host_id)
@@ -1404,7 +1551,11 @@ async fn run_host_manager(
                                 .map(|_| ())
                         });
                     }
-                    HostCommand::NewWindow { host_id, request } => {
+                    HostCommand::NewWindow {
+                        host_id,
+                        request,
+                        origin_window_id,
+                    } => {
                         if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
                             let em = emitter.clone();
                             let session_id = request.session_id.clone();
@@ -1423,6 +1574,7 @@ async fn run_host_manager(
                                             block_ids: created.block_ids,
                                             view,
                                             seq,
+                                            origin_window_id,
                                         });
                                     }
                                     Err(err) => {
@@ -1432,7 +1584,12 @@ async fn run_host_manager(
                             });
                         }
                     }
-                    HostCommand::NewSession { host_id, request } => {
+                    HostCommand::NewSession {
+                        host_id,
+                        request,
+                        open_in_new_window,
+                        origin_window_id,
+                    } => {
                         if let Some(host) = hosts.get(&host_id) {
                             let client = host.client.clone();
                             let attach_state = Arc::clone(&host.attach_state);
@@ -1450,6 +1607,8 @@ async fn run_host_manager(
                                                     session_id: created.session_id,
                                                     view: Box::new(view),
                                                     seq: att_seq.max(seq),
+                                                    open_in_new_window,
+                                                    origin_window_id,
                                                 });
                                             }
                                             Ok(None) => {}
@@ -1465,7 +1624,140 @@ async fn run_host_manager(
                             });
                         }
                     }
-                    HostCommand::CreateCommandSession { host_id, request } => {
+                    HostCommand::TransferTabToNewWindow {
+                        host_id,
+                        source_session_id,
+                        window_id,
+                        block_ids: fallback_block_ids,
+                    } => {
+                        if let Some(host) = hosts.get(&host_id) {
+                            let client = host.client.clone();
+                            let attach_state = Arc::clone(&host.attach_state);
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let empty_req = SessionCreateRequest {
+                                    label: None,
+                                    initial_windows: None,
+                                };
+                                match client.session_create(&empty_req).await {
+                                    Ok((created, seq)) => {
+                                        let target_session_id = created.session_id;
+                                        if let Err(err) = attach_state
+                                            .ensure_attached(&client, &target_session_id, false)
+                                            .await
+                                        {
+                                            let _ =
+                                                client.session_destroy(&target_session_id).await;
+                                            emit_rpc_error(&em, host_id, "session.attach", &err);
+                                            return;
+                                        }
+                                        let queried_blocks: Vec<String> = client
+                                            .session_view(&source_session_id)
+                                            .await
+                                            .ok()
+                                            .and_then(|(src_view, _)| {
+                                                src_view
+                                                    .windows
+                                                    .into_iter()
+                                                    .find(|w| {
+                                                        w.window_id.as_deref()
+                                                            == Some(window_id.as_str())
+                                                    })
+                                                    .map(|w| {
+                                                        w.layers
+                                                            .into_iter()
+                                                            .flat_map(|l| l.blocks.into_iter())
+                                                            .filter_map(|b| b.block_id)
+                                                            .collect()
+                                                    })
+                                            })
+                                            .unwrap_or_default();
+                                        let block_ids = if !queried_blocks.is_empty() {
+                                            queried_blocks
+                                        } else {
+                                            fallback_block_ids
+                                        };
+                                        em.emit(RuntimeEvent::TabTransferStarting {
+                                            host_id: host_id.clone(),
+                                            source_session_id: source_session_id.clone(),
+                                            target_session_id: target_session_id.clone(),
+                                            window_id: window_id.clone(),
+                                            block_ids: block_ids.clone(),
+                                        });
+                                        let transfer_req = SessionTransferWindowRequest {
+                                            session_id: source_session_id.clone(),
+                                            window_id: window_id.clone(),
+                                            to_session_id: target_session_id.clone(),
+                                            before_window_id: None,
+                                            focus: Some(true),
+                                        };
+                                        match client.session_transfer_window(&transfer_req).await {
+                                            Ok((_, tseq)) => {
+                                                match client.session_view(&target_session_id).await {
+                                                    Ok((target_view, vseq)) => {
+                                                        let source_view = client
+                                                            .session_view(&source_session_id)
+                                                            .await
+                                                            .ok()
+                                                            .map(|(v, _)| Box::new(v));
+                                                        em.emit(
+                                                            RuntimeEvent::TabTransferredToNewWindow {
+                                                                host_id,
+                                                                source_session_id,
+                                                                target_session_id,
+                                                                window_id,
+                                                                target_view: Box::new(target_view),
+                                                                source_view,
+                                                                seq: vseq.max(tseq).max(seq),
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        em.emit(RuntimeEvent::TabTransferFailed {
+                                                            host_id: host_id.clone(),
+                                                            source_session_id,
+                                                            window_id,
+                                                            block_ids,
+                                                        });
+                                                        emit_rpc_error(
+                                                            &em,
+                                                            host_id,
+                                                            "session.view",
+                                                            &err,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let _ =
+                                                    client.session_destroy(&target_session_id).await;
+                                                em.emit(RuntimeEvent::TabTransferFailed {
+                                                    host_id: host_id.clone(),
+                                                    source_session_id,
+                                                    window_id,
+                                                    block_ids,
+                                                });
+                                                emit_rpc_error(
+                                                    &em,
+                                                    host_id,
+                                                    "session.transfer_window",
+                                                    &err,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        emit_rpc_error(&em, host_id, "session.create", &err);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    HostCommand::CreateCommandSession {
+                        host_id,
+                        request,
+                        origin_window_id,
+                    } => {
                         if let Some(host) = hosts.get(&host_id) {
                             let client = host.client.clone();
                             let attach_state = Arc::clone(&host.attach_state);
@@ -1482,6 +1774,7 @@ async fn run_host_manager(
                                                     host_id,
                                                     session_id: created.session_id,
                                                     view: Box::new(view),
+                                                    origin_window_id,
                                                 });
                                             }
                                             Ok(None) => {}
@@ -1575,6 +1868,88 @@ async fn run_host_manager(
                                 .await
                                 .map(|_| ())
                         });
+                    }
+                    HostCommand::SwapBlocks { host_id, request } => {
+                        dispatch_simple(&hosts, &emitter, host_id, "session.swap_blocks", move |c| async move {
+                            c.session_swap_blocks(&request).await.map(|_| ())
+                        });
+                    }
+                    HostCommand::DockFloatingBlock {
+                        host_id,
+                        session_id,
+                        block_id,
+                        window_label,
+                        before_window_id,
+                    } => {
+                        if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let new_win_req = SessionNewWindowRequest {
+                                    session_id: session_id.clone(),
+                                    window_label,
+                                    layout: Some(LayoutCreateSpec {
+                                        block: Some(BlockCreateSpec {
+                                            flavor: "com.superlogical.terminal.shell".into(),
+                                            label: None,
+                                            options: None,
+                                        }),
+                                        split: None,
+                                    }),
+                                    focus: Some(true),
+                                };
+                                let (created, _) = match client.session_new_window(&new_win_req).await {
+                                    Ok(res) => res,
+                                    Err(err) => {
+                                        emit_rpc_error(&em, host_id, "session.new_window", &err);
+                                        return;
+                                    }
+                                };
+                                let Some(temp_block_id) = created.block_ids.into_iter().next() else {
+                                    em.emit(RuntimeEvent::HostError {
+                                        host_id,
+                                        context: "session.dock_floating_block".to_owned(),
+                                        message: "temporary anchor window returned no block_id".to_owned(),
+                                    });
+                                    return;
+                                };
+                                if let Some(before_id) = before_window_id {
+                                    let _ = client
+                                        .call_raw(
+                                            "session.move_window",
+                                            Some(serde_json::json!({
+                                                "session_id": session_id,
+                                                "window_id": created.window_id,
+                                                "before_window_id": before_id,
+                                            })),
+                                        )
+                                        .await;
+                                }
+                                let move_res = client
+                                    .call_raw(
+                                        "session.move_block",
+                                        Some(serde_json::json!({
+                                            "session_id": session_id,
+                                            "block_id": block_id,
+                                            "anchor_block_id": temp_block_id,
+                                            "direction": "horizontal",
+                                            "side": "after",
+                                            "ratio": 0.5,
+                                        })),
+                                    )
+                                    .await;
+                                // Always close the temporary anchor block so no orphan shell leaks.
+                                let _ = client
+                                    .block_close(&BlockCloseRequest {
+                                        session_id,
+                                        block_id: temp_block_id,
+                                        undoable: Some(false),
+                                    })
+                                    .await;
+                                if let Err(err) = move_res {
+                                    emit_rpc_error(&em, host_id, "session.move_block", &err);
+                                }
+                            });
+                        }
                     }
                     HostCommand::MoveWindow {
                         host_id,
@@ -1792,6 +2167,186 @@ async fn run_host_manager(
                                     .session_disown_block(&SessionDisownBlockRequest {
                                         session_id,
                                         block_ids: None,
+                                    })
+                                    .await;
+                            });
+                        }
+                    }
+
+                    HostCommand::ListDir {
+                        key,
+                        path,
+                        prefix,
+                        files,
+                        limit,
+                        request_id,
+                    } => {
+                        let client_opt = hosts.get(&key.host_id).map(|h| h.client.clone());
+                        let em = emitter.clone();
+                        tokio::spawn(async move {
+                            let res = if let Some(client) = client_opt
+                                && !key.session_id.is_empty()
+                                && !key.block_id.is_empty()
+                            {
+                                let args = TerminalListDirArgs {
+                                    path: (!path.is_empty()).then_some(path.clone()),
+                                    prefix: prefix.clone(),
+                                    files: Some(files),
+                                    limit: Some(limit),
+                                };
+                                match client
+                                    .terminal_list_dir(&key.session_id, &key.block_id, args)
+                                    .await
+                                {
+                                    Ok((resp, _)) => Ok(resp),
+                                    Err(err) => {
+                                        if key.host_id == LOCAL_HOST_ID {
+                                            list_dir_local_fs(&path, prefix.as_deref(), files, limit)
+                                        } else {
+                                            Err(err.to_string())
+                                        }
+                                    }
+                                }
+                            } else if key.host_id == LOCAL_HOST_ID {
+                                list_dir_local_fs(&path, prefix.as_deref(), files, limit)
+                            } else {
+                                Err("host is not connected".to_owned())
+                            };
+                            em.emit(RuntimeEvent::DirListed {
+                                key,
+                                request_id,
+                                result: res,
+                            });
+                        });
+                    }
+
+                    HostCommand::ReadClipboard {
+                        key,
+                        clipboard_id,
+                        expected_bytes,
+                    } => {
+                        if let Some(client) = hosts.get(&key.host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let res = read_clipboard_paginated(
+                                    &client,
+                                    &key.session_id,
+                                    &key.block_id,
+                                    clipboard_id,
+                                    expected_bytes,
+                                )
+                                .await;
+                                em.emit(RuntimeEvent::ClipboardReadFinished {
+                                    key,
+                                    id: clipboard_id,
+                                    result: res,
+                                });
+                            });
+                        }
+                    }
+
+                    HostCommand::ListPorts { key } => {
+                        if let Some(client) = hosts.get(&key.host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let res = match client
+                                    .terminal_ports(&key.session_id, &key.block_id)
+                                    .await
+                                {
+                                    Ok((resp, _)) => {
+                                        if resp.truncated.unwrap_or(false)
+                                            && let Some(blob_id) = resp.id
+                                        {
+                                            read_ports_blob_paginated(
+                                                &client,
+                                                &key.session_id,
+                                                &key.block_id,
+                                                blob_id,
+                                            )
+                                            .await
+                                        } else {
+                                            Ok(resp)
+                                        }
+                                    }
+                                    Err(err) => Err(err.to_string()),
+                                };
+                                em.emit(RuntimeEvent::PortsListed { key, result: res });
+                            });
+                        }
+                    }
+
+                    HostCommand::ReadPortsBlob { key, blob_id } => {
+                        if let Some(client) = hosts.get(&key.host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let res = read_ports_blob_paginated(
+                                    &client,
+                                    &key.session_id,
+                                    &key.block_id,
+                                    blob_id,
+                                )
+                                .await;
+                                em.emit(RuntimeEvent::PortsListed { key, result: res });
+                            });
+                        }
+                    }
+
+                    HostCommand::StartPortTunnel {
+                        tunnel_id,
+                        key,
+                        remote_host,
+                        remote_port,
+                    } => {
+                        if let Some(client) = hosts.get(&key.host_id).map(|h| h.client.clone()) {
+                            let (cancel_tx, cancel_rx) = watch::channel(false);
+                            tunnels.insert(
+                                tunnel_id,
+                                ActiveTunnelTask {
+                                    host_id: key.host_id.clone(),
+                                    cancel_tx,
+                                },
+                            );
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                run_port_tunnel(
+                                    client,
+                                    tunnel_id,
+                                    key,
+                                    remote_host,
+                                    remote_port,
+                                    cancel_rx,
+                                    em,
+                                )
+                                .await;
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::TunnelFailed {
+                                tunnel_id,
+                                key,
+                                remote_port,
+                                error: "host is not connected".to_owned(),
+                            });
+                        }
+                    }
+
+                    HostCommand::StopPortTunnel {
+                        host_id,
+                        session_id,
+                        tunnel_block_id,
+                        tunnel_id,
+                    } => {
+                        if let Some(tun) = tunnels.remove(&tunnel_id) {
+                            let _ = tun.cancel_tx.send(true);
+                        }
+                        if let Some(block_id) = tunnel_block_id
+                            && let Some(client) = hosts.get(&host_id).map(|h| h.client.clone())
+                        {
+                            tokio::spawn(async move {
+                                let _ = client
+                                    .block_close(&BlockCloseRequest {
+                                        session_id,
+                                        block_id,
+                                        undoable: Some(false),
                                     })
                                     .await;
                             });
@@ -2363,6 +2918,313 @@ where
     }
 }
 
+const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PORTS_BLOB_BYTES: usize = 2 * 1024 * 1024;
+
+/// Local filesystem fallback for `com.superlogical.terminal.list_dir` when local Rex block is
+/// offline/headless.
+pub fn list_dir_local_fs(
+    path: &str,
+    prefix: Option<&str>,
+    include_files: bool,
+    limit: u32,
+) -> Result<TerminalListDirResponse, String> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let home_str = home.to_string_lossy().into_owned();
+    let expanded = if path.trim().is_empty() || path == "~" {
+        home.clone()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(path)
+    };
+    let display_path = expanded.to_string_lossy().into_owned();
+    let meta = match std::fs::metadata(&expanded) {
+        Ok(m) => m,
+        Err(err) => {
+            let status = match err.kind() {
+                std::io::ErrorKind::NotFound => ListDirStatus::Missing,
+                std::io::ErrorKind::PermissionDenied => ListDirStatus::Denied,
+                _ => ListDirStatus::Missing,
+            };
+            return Ok(TerminalListDirResponse {
+                status,
+                path: display_path,
+                home: home_str,
+                entries: Vec::new(),
+                truncated: false,
+            });
+        }
+    };
+    if !meta.is_dir() {
+        return Ok(TerminalListDirResponse {
+            status: ListDirStatus::NotDir,
+            path: display_path,
+            home: home_str,
+            entries: Vec::new(),
+            truncated: false,
+        });
+    }
+    let read_dir = match std::fs::read_dir(&expanded) {
+        Ok(rd) => rd,
+        Err(err) => {
+            let status = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                ListDirStatus::Denied
+            } else {
+                ListDirStatus::Missing
+            };
+            return Ok(TerminalListDirResponse {
+                status,
+                path: display_path,
+                home: home_str,
+                entries: Vec::new(),
+                truncated: false,
+            });
+        }
+    };
+
+    let prefix_lower = prefix
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+    let cap = if limit == 0 { 2000 } else { limit as usize };
+
+    let mut entries = Vec::new();
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(pref) = &prefix_lower
+            && !name.to_ascii_lowercase().starts_with(pref)
+        {
+            continue;
+        }
+        let symlink = entry.file_type().is_ok_and(|ft| ft.is_symlink());
+        let is_dir = entry.path().is_dir();
+        if !include_files && !is_dir {
+            continue;
+        }
+        entries.push(ProtoDirEntry {
+            name,
+            file: !is_dir,
+            symlink,
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.file.cmp(&b.file).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
+    });
+    let truncated = entries.len() > cap;
+    entries.truncate(cap);
+    Ok(TerminalListDirResponse {
+        status: ListDirStatus::Ok,
+        path: display_path,
+        home: home_str,
+        entries,
+        truncated,
+    })
+}
+
+async fn read_clipboard_paginated(
+    client: &ControlClient,
+    session_id: &str,
+    block_id: &str,
+    clipboard_id: u64,
+    expected_bytes: u64,
+) -> Result<String, String> {
+    let cap = (expected_bytes as usize).min(MAX_CLIPBOARD_BYTES);
+    let mut out = String::with_capacity(cap.min(256 * 1024));
+    let mut offset = 0u64;
+    for _ in 0..256 {
+        let (resp, _) = client
+            .terminal_clipboard_read(
+                session_id,
+                block_id,
+                TerminalClipboardReadArgs {
+                    id: Some(clipboard_id),
+                    offset: Some(offset),
+                    max_bytes: Some(49_152),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.id != clipboard_id {
+            return Err("clipboard buffer superseded".to_owned());
+        }
+        if out.len().saturating_add(resp.data.len()) > MAX_CLIPBOARD_BYTES {
+            return Err("clipboard payload exceeds 4 MiB limit".to_owned());
+        }
+        offset = offset.saturating_add(resp.data.len() as u64);
+        out.push_str(&resp.data);
+        if resp.eof || resp.data.is_empty() {
+            return Ok(out);
+        }
+    }
+    Err("clipboard read pagination limit exceeded".to_owned())
+}
+
+async fn read_ports_blob_paginated(
+    client: &ControlClient,
+    session_id: &str,
+    block_id: &str,
+    blob_id: u64,
+) -> Result<TerminalPortsResponse, String> {
+    let mut json_buf = String::new();
+    let mut offset = 0u64;
+    for _ in 0..64 {
+        let (resp, _) = client
+            .terminal_blob_read(
+                session_id,
+                block_id,
+                TerminalBlobReadArgs {
+                    id: Some(blob_id),
+                    offset: Some(offset),
+                    max_bytes: Some(49_152),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if json_buf.len().saturating_add(resp.data.len()) > MAX_PORTS_BLOB_BYTES {
+            return Err("ports blob exceeds 2 MiB limit".to_owned());
+        }
+        offset = offset.saturating_add(resp.data.len() as u64);
+        json_buf.push_str(&resp.data);
+        if resp.eof || resp.data.is_empty() {
+            return serde_json::from_str::<TerminalPortsResponse>(&json_buf)
+                .map_err(|e| format!("invalid ports blob JSON: {e}"));
+        }
+    }
+    Err("ports blob pagination limit exceeded".to_owned())
+}
+
+async fn run_port_tunnel(
+    client: ControlClient,
+    tunnel_id: u64,
+    key: BlockKey,
+    remote_host: String,
+    remote_port: u16,
+    mut cancel_rx: watch::Receiver<bool>,
+    emitter: EventEmitter,
+) {
+    let listener = match TcpListener::bind(("127.0.0.1", remote_port)).await {
+        Ok(l) => l,
+        Err(_) => match TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(l) => l,
+            Err(err) => {
+                emitter.emit(RuntimeEvent::TunnelFailed {
+                    tunnel_id,
+                    key,
+                    remote_port,
+                    error: format!("failed to bind local listener: {err}"),
+                });
+                return;
+            }
+        },
+    };
+    let local_port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(err) => {
+            emitter.emit(RuntimeEvent::TunnelFailed {
+                tunnel_id,
+                key,
+                remote_port,
+                error: err.to_string(),
+            });
+            return;
+        }
+    };
+
+    let dial_opts = TunnelDialOptions {
+        host: remote_host,
+        port: remote_port,
+        client_address: Some(format!("127.0.0.1:{local_port}")),
+    };
+    let req = SessionNewBlockRequest {
+        session_id: key.session_id.clone(),
+        flavor: "com.superlogical.tunnel.dial".to_owned(),
+        label: Some(format!("forward :{local_port} -> :{remote_port}")),
+        options: serde_json::to_value(dial_opts).ok(),
+    };
+    let tunnel_block_id = match client.session_new_block(&req).await {
+        Ok((resp, _)) => match resp.block_id {
+            Some(id) if !id.is_empty() => id,
+            _ => {
+                emitter.emit(RuntimeEvent::TunnelFailed {
+                    tunnel_id,
+                    key,
+                    remote_port,
+                    error: "tunnel.dial returned no block_id".to_owned(),
+                });
+                return;
+            }
+        },
+        Err(err) => {
+            emitter.emit(RuntimeEvent::TunnelFailed {
+                tunnel_id,
+                key,
+                remote_port,
+                error: err.to_string(),
+            });
+            return;
+        }
+    };
+
+    emitter.emit(RuntimeEvent::TunnelStarted {
+        tunnel_id,
+        key: key.clone(),
+        tunnel_block_id: tunnel_block_id.clone(),
+        remote_port,
+        local_port,
+    });
+
+    let mut conn_seq = 0u64;
+    loop {
+        if *cancel_rx.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let Ok((tcp, _peer)) = accepted else {
+                    break;
+                };
+                let _ = tcp.set_nodelay(true);
+                conn_seq = conn_seq.saturating_add(1);
+                let data_ref_id = format!("conn:{tunnel_id}:{conn_seq}");
+                let c = client.clone();
+                let sess = key.session_id.clone();
+                let tblk = tunnel_block_id.clone();
+                let conn_cancel = cancel_rx.clone();
+                tokio::spawn(async move {
+                    let Ok((ticket_resp, _)) = c
+                        .data_connect(&DataConnectRequest {
+                            session_id: sess,
+                            block_id: tblk,
+                            data_ref_id,
+                            subprotocol: Some(rex_proto::DATA_BYTES_SUBPROTOCOL.to_owned()),
+                        })
+                        .await
+                    else {
+                        return;
+                    };
+                    let Ok(stream) =
+                        BytesDataStream::connect_with_ticket(c.endpoint(), &ticket_resp.ticket)
+                            .await
+                    else {
+                        return;
+                    };
+                    let _ = stream.bridge_io(tcp, conn_cancel).await;
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -2745,5 +3607,320 @@ mod tests {
         state.clear_all();
         assert!(!state.is_attached("s1"));
         assert!(!state.is_attached("s2"));
+    }
+
+    #[test]
+    fn list_dir_local_fs_handles_dirs_files_symlinks_and_missing_paths() {
+        let base = std::env::temp_dir().join(format!("omarex-listdir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub_dir");
+        let empty = base.join("empty_dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        let file = base.join("notes.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        std::fs::write(base.join(".hidden"), b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sub, base.join("link_to_sub")).unwrap();
+
+        let all = list_dir_local_fs(base.to_str().unwrap(), None, true, 50).unwrap();
+        assert_eq!(all.status, rex_proto::types::ListDirStatus::Ok);
+        assert!(all.entries.iter().any(|e| e.name == "sub_dir" && !e.file));
+        assert!(all.entries.iter().any(|e| e.name == "notes.txt" && e.file));
+        #[cfg(unix)]
+        assert!(
+            all.entries
+                .iter()
+                .any(|e| e.name == "link_to_sub" && !e.file && e.symlink)
+        );
+
+        let dirs_only = list_dir_local_fs(base.to_str().unwrap(), None, false, 50).unwrap();
+        assert_eq!(dirs_only.status, rex_proto::types::ListDirStatus::Ok);
+        assert!(dirs_only.entries.iter().all(|e| !e.file));
+        assert!(!dirs_only.entries.iter().any(|e| e.name == "notes.txt"));
+
+        let prefixed = list_dir_local_fs(base.to_str().unwrap(), Some("."), true, 50).unwrap();
+        assert!(prefixed.entries.iter().any(|e| e.name == ".hidden"));
+
+        let empty_resp = list_dir_local_fs(empty.to_str().unwrap(), None, true, 50).unwrap();
+        assert_eq!(empty_resp.status, rex_proto::types::ListDirStatus::Ok);
+        assert!(empty_resp.entries.is_empty());
+
+        let missing = list_dir_local_fs(
+            base.join("does-not-exist").to_str().unwrap(),
+            None,
+            true,
+            50,
+        )
+        .unwrap();
+        assert_eq!(missing.status, rex_proto::types::ListDirStatus::Missing);
+
+        let not_dir = list_dir_local_fs(file.to_str().unwrap(), None, true, 50).unwrap();
+        assert_eq!(not_dir.status, rex_proto::types::ListDirStatus::NotDir);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn isolated_rex_transfer_tab_preserves_pane_across_block_closed_race() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Instant;
+
+        if !Path::new("/usr/bin/rex").exists() {
+            eprintln!("skipping isolated Rex transfer race test: /usr/bin/rex absent");
+            return;
+        }
+
+        struct IsolatedRexGuard {
+            dir: PathBuf,
+            child: Child,
+        }
+        impl Drop for IsolatedRexGuard {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        let dir = PathBuf::from(format!("/tmp/omx-w2-hm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let sock_path = dir.join("s.sock");
+        let listen_ep = format!("unix://{}", sock_path.display());
+
+        let child = Command::new("/usr/bin/rex")
+            .args([
+                "server",
+                "run",
+                "--listen",
+                &listen_ep,
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--restore=false",
+                "--exit-empty",
+                "--no-fs",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn isolated rex server");
+        let _guard = IsolatedRexGuard {
+            dir: dir.clone(),
+            child,
+        };
+
+        let wait_start = Instant::now();
+        while !sock_path.exists() {
+            assert!(
+                wait_start.elapsed() < Duration::from_secs(5),
+                "isolated rex socket did not appear at {}",
+                sock_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let cfg = HostManagerConfig {
+            local_endpoint: Some(RexEndpoint::Unix(sock_path.clone())),
+            saved_hosts: Vec::new(),
+            preferred_local_session_id: None,
+            client_label: Some("omarex-w2-transfer-test".into()),
+            initial_keymap_request: ClientKeymapRequest::default(),
+            start_theme_watchers: false,
+            start_notifier: false,
+            material: MaterialStyle::Classic,
+            wake_ui: None,
+        };
+        let (mgr, mut events) = HostManager::spawn(cfg);
+
+        let settings = crate::config::UserSettings::default();
+        let theme = omarchy_theme::Theme::default();
+        let mut ctrl =
+            crate::bridge::OmarexController::new(settings, dir.join("settings.json"), theme)
+                .unwrap();
+        ctrl.read_only = false;
+        ctrl.clipboard_enabled = false;
+        ctrl.attach_host_manager(mgr.clone());
+
+        let mut ctx = ctrl.create_window_context(1280, 720, 1.0, None, None);
+
+        // Wait for initial session + ready pane (BootstrapReady -> NewSession -> stream ready).
+        let mut ready_session: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ev = tokio::time::timeout(rem, events.recv())
+                .await
+                .expect("timeout waiting for initial session")
+                .expect("event channel open");
+            let now = Instant::now();
+            let mut contexts = [&mut ctx];
+            ctrl.process_runtime_event_multi(ev, &mut contexts, Some(0), now);
+            if let Some(sk) = ctx.active_session().cloned()
+                && ctrl.pane_store.pane_keys().iter().any(|k| {
+                    k.host_id == sk.host_id
+                        && k.session_id == sk.session_id
+                        && ctrl.pane_store.is_ready(k)
+                })
+            {
+                ready_session = Some(sk.session_id);
+                break;
+            }
+        }
+        let src_sid = ready_session.expect("initial session with ready pane");
+
+        // Create a second tab/window inside `src_sid` so transferring it leaves `src_sid` alive.
+        {
+            let now = Instant::now();
+            ctrl.with_window_context(&mut ctx, |c| {
+                c.dispatch_ui_action(
+                    ui_chrome::UiAction::NewTab {
+                        host_id: Some(LOCAL_HOST_ID.to_owned()),
+                        session_id: Some(src_sid.clone()),
+                    },
+                    now,
+                );
+            });
+        }
+
+        let mut second_tab: Option<(String, String)> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ev = tokio::time::timeout(rem, events.recv())
+                .await
+                .expect("timeout waiting for second tab")
+                .expect("event channel open");
+            let now = Instant::now();
+            if let RuntimeEvent::WindowCreated {
+                session_id,
+                window_id,
+                block_ids,
+                ..
+            } = &ev
+                && session_id == &src_sid
+                && let Some(bid) = block_ids.first()
+            {
+                second_tab = Some((window_id.clone(), bid.clone()));
+            }
+            let mut contexts = [&mut ctx];
+            ctrl.process_runtime_event_multi(ev, &mut contexts, Some(0), now);
+            if let Some((_, ref bid)) = second_tab {
+                let k = BlockKey::new(LOCAL_HOST_ID, &src_sid, bid);
+                if ctrl.pane_store.is_ready(&k) {
+                    break;
+                }
+            }
+        }
+        let (win2_id, bid2) = second_tab.expect("second tab created and ready");
+        let old_key = BlockKey::new(LOCAL_HOST_ID, &src_sid, &bid2);
+        assert!(ctrl.pane_store.contains(&old_key));
+
+        // Tear off `win2_id` into a new window!
+        {
+            let now = Instant::now();
+            ctrl.with_window_context(&mut ctx, |c| {
+                c.dispatch_ui_action(
+                    ui_chrome::UiAction::MoveTabToNewWindow {
+                        window_id: win2_id.clone(),
+                    },
+                    now,
+                );
+            });
+        }
+
+        let mut timeline: Vec<&'static str> = Vec::new();
+        let mut target_sid: Option<String> = None;
+        let mut saw_reopened_stream = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ev = tokio::time::timeout(rem, events.recv())
+                .await
+                .expect("timeout waiting for tab transfer")
+                .expect("event channel open");
+            let now = Instant::now();
+            let check_closed = matches!(
+                &ev,
+                RuntimeEvent::ControlEvent {
+                    event: box_ev,
+                    ..
+                } if matches!(
+                    box_ev.as_ref(),
+                    ServerEvent::SessionEvent {
+                        session_id,
+                        event: rex_proto::types::SessionEvent::BlockClosed { block_id },
+                    } if session_id == &src_sid && block_id == &bid2
+                )
+            );
+            let is_starting = matches!(&ev, RuntimeEvent::TabTransferStarting { .. });
+            let is_transferred = matches!(&ev, RuntimeEvent::TabTransferredToNewWindow { .. });
+            if is_starting {
+                timeline.push("TabTransferStarting");
+            }
+            if check_closed {
+                timeline.push("BlockClosed");
+            }
+            if let RuntimeEvent::TabTransferredToNewWindow {
+                target_session_id, ..
+            } = &ev
+            {
+                timeline.push("TabTransferredToNewWindow");
+                target_sid = Some(target_session_id.clone());
+            }
+            if let RuntimeEvent::DataStream(ds) = &ev
+                && target_sid.as_deref() == Some(ds.session_id.as_str())
+                && ds.block_id == bid2
+                && matches!(
+                    ds.kind,
+                    DataStreamEventKind::Opened { .. }
+                        | DataStreamEventKind::SnapshotComplete { .. }
+                )
+            {
+                saw_reopened_stream = true;
+            }
+
+            let mut contexts = [&mut ctx];
+            ctrl.process_runtime_event_multi(ev, &mut contexts, Some(0), now);
+
+            if check_closed {
+                assert!(
+                    ctrl.pane_store.contains(&old_key),
+                    "PaneRuntime at {old_key:?} must survive source BlockClosed during live transfer!"
+                );
+            }
+            if is_transferred {
+                let dst_sid = target_sid.as_ref().unwrap();
+                let new_key = BlockKey::new(LOCAL_HOST_ID, dst_sid, &bid2);
+                assert!(
+                    ctrl.pane_store.contains(&new_key),
+                    "PaneRuntime must be rekeyed to {new_key:?}"
+                );
+            }
+            if target_sid.is_some() && saw_reopened_stream {
+                break;
+            }
+        }
+
+        assert_eq!(
+            timeline,
+            vec![
+                "TabTransferStarting",
+                "BlockClosed",
+                "TabTransferredToNewWindow"
+            ],
+            "expected live Rex ordering where BlockClosed precedes TabTransferredToNewWindow"
+        );
+        assert!(
+            saw_reopened_stream,
+            "expected reopened data stream on transferred session"
+        );
+        let _ = ctrl.take_pending_new_windows();
+        mgr.shutdown();
     }
 }

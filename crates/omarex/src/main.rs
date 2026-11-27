@@ -1,6 +1,7 @@
 //! `omarex` — fast native Linux GUI client for Superlogical's Rex and `tr3x` on Omarchy.
 
 pub mod app;
+pub mod audio_chime;
 pub mod bridge;
 pub mod config;
 pub mod host_manager;
@@ -10,13 +11,21 @@ pub mod pane_store;
 pub mod wayland_dnd;
 pub mod workspace;
 
+#[cfg(test)]
+pub(crate) fn lock_headless_gpu_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{GuiLaunchOptions, run_gui};
-use crate::bridge::{HeadlessRenderOptions, render_headless_live_png_with_options};
+use crate::bridge::{
+    HeadlessRenderOptions, HeadlessScenario, render_headless_live_png_with_options,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum CliAction {
@@ -81,11 +90,22 @@ fn init_tracing() {
         .try_init();
 }
 
+fn parse_scale_arg(val: &str) -> Result<f32> {
+    let parsed = val
+        .parse::<f32>()
+        .map_err(|_| anyhow::anyhow!("invalid --scale `{val}`"))?;
+    if !parsed.is_finite() {
+        bail!("invalid --scale `{val}`");
+    }
+    Ok(parsed.clamp(0.5, 4.0))
+}
+
 fn parse_cli_args(args: &[String]) -> Result<CliAction> {
     let mut session: Option<String> = None;
     let mut server: Option<String> = None;
     let mut headless_path: Option<PathBuf> = None;
     let mut headless_viewers: Vec<String> = Vec::new();
+    let mut headless_scenario: Option<HeadlessScenario> = None;
     let mut width: u32 = 1440;
     let mut height: u32 = 900;
     let mut scale: f32 = 1.0;
@@ -107,6 +127,9 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
             for item in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 headless_viewers.push(item.to_owned());
             }
+        } else if let Some(val) = arg.strip_prefix("--headless-scenario=") {
+            headless_scenario =
+                Some(HeadlessScenario::parse(val).map_err(|msg| anyhow::anyhow!("{msg}"))?);
         } else if let Some(val) = arg.strip_prefix("--width=") {
             width = val
                 .parse::<u32>()
@@ -118,10 +141,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
                 .map_err(|_| anyhow::anyhow!("invalid --height `{val}`"))?
                 .clamp(240, 8192);
         } else if let Some(val) = arg.strip_prefix("--scale=") {
-            scale = val
-                .parse::<f32>()
-                .map_err(|_| anyhow::anyhow!("invalid --scale `{val}`"))?
-                .clamp(0.5, 4.0);
+            scale = parse_scale_arg(val)?;
         } else if let Some(val) = arg
             .strip_prefix("--class=")
             .or_else(|| arg.strip_prefix("--app-id="))
@@ -161,6 +181,14 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
                         headless_viewers.push(item.to_owned());
                     }
                 }
+                "--headless-scenario" => {
+                    i += 1;
+                    let Some(val) = args.get(i) else {
+                        bail!("missing scenario name for --headless-scenario");
+                    };
+                    headless_scenario =
+                        Some(HeadlessScenario::parse(val).map_err(|msg| anyhow::anyhow!("{msg}"))?);
+                }
                 "--width" => {
                     i += 1;
                     let Some(val) = args.get(i) else {
@@ -186,10 +214,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
                     let Some(val) = args.get(i) else {
                         bail!("missing value for --scale");
                     };
-                    scale = val
-                        .parse::<f32>()
-                        .map_err(|_| anyhow::anyhow!("invalid --scale `{val}`"))?
-                        .clamp(0.5, 4.0);
+                    scale = parse_scale_arg(val)?;
                 }
                 "--light" => {
                     force_light = true;
@@ -259,6 +284,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
                 scale_factor: scale,
                 force_light,
                 viewer_paths: headless_viewers,
+                scenario: headless_scenario,
             },
         })
     } else {
@@ -295,6 +321,7 @@ OPTIONS:
         --wait-after-command, --hold Keep window open after -e command exits
     -e <COMMAND> [ARGS...]          Run command in a clean standalone ephemeral Rex session
         --headless-render <PATH>    Render live session offscreen on Vulkan to PNG path
+        --headless-scenario <NAME>  Render built-in QA scenario (sidebar-dark, sidebar-light, split-panes, floating-pr, copy-mode, syntax-viewer, diagnostics-hud, ports-pill, markdown-viewer, theme-switcher, settings-modal, dnd-split, multi-window)
         --headless-viewer <PATH>    Open file/image/video in right-hand viewer for headless PNG (repeatable)
         --width <PX>                Headless render width in physical pixels (default: 1440)
         --height <PX>               Headless render height in physical pixels (default: 900)
@@ -407,5 +434,60 @@ mod tests {
             CliAction::Version
         );
         assert!(parse_cli_args(&s(&["--bogus-flag"])).is_err());
+    }
+
+    #[test]
+    fn cli_parses_headless_scenario_and_rejects_unknown() {
+        for name in HeadlessScenario::ALL_NAMES {
+            let act = parse_cli_args(&s(&[
+                "--headless-render",
+                "/tmp/s.png",
+                "--headless-scenario",
+                name,
+            ]))
+            .expect("known scenario should parse");
+            match act {
+                CliAction::HeadlessRender { options, .. } => {
+                    assert_eq!(options.scenario.map(HeadlessScenario::as_str), Some(*name));
+                }
+                other => panic!("expected HeadlessRender, got {other:?}"),
+            }
+            let eq_flag = format!("--headless-scenario={name}");
+            let act_eq = parse_cli_args(&s(&["--headless-render=/tmp/s.png", &eq_flag]))
+                .expect("known =scenario should parse");
+            assert!(matches!(act_eq, CliAction::HeadlessRender { .. }));
+        }
+        assert!(
+            parse_cli_args(&s(&[
+                "--headless-render",
+                "/tmp/s.png",
+                "--headless-scenario",
+                "does-not-exist",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_rejects_non_finite_scale_values() {
+        for bad in ["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity", "abc"] {
+            assert!(
+                parse_cli_args(&s(&["--headless-render", "/tmp/s.png", "--scale", bad])).is_err(),
+                "--scale {bad} must fail"
+            );
+            let eq = format!("--scale={bad}");
+            assert!(
+                parse_cli_args(&s(&["--headless-render=/tmp/s.png", &eq])).is_err(),
+                "{eq} must fail"
+            );
+        }
+        let ok = parse_cli_args(&s(&["--headless-render", "/tmp/s.png", "--scale", "10.0"]))
+            .expect("finite scale clamps cleanly");
+        match ok {
+            CliAction::HeadlessRender { options, .. } => {
+                assert!((options.scale_factor - 4.0).abs() < f32::EPSILON);
+            }
+            other => panic!("expected HeadlessRender, got {other:?}"),
+        }
     }
 }

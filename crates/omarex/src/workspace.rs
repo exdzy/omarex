@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use omarchy_theme::{AppearanceMode, ThemePalette};
 use rex_proto::RexEndpoint;
 use rex_proto::types::{
-    BlockEventPayload, OwnMode, ProgramStatusRecord, SessionBootstrapResponse, SessionEvent,
-    SessionSummary, SessionView, TerminalResizeArgs, TerminalSetThemeArgs, ThemeScheme,
+    BlockEventPayload, OwnMode, PortEntry, PortProcessEntry, PortScanStatus, ProgramStatusRecord,
+    SessionBootstrapResponse, SessionEvent, SessionSummary, SessionView, TailscaleStatus,
+    TerminalPortsResponse, TerminalResizeArgs, TerminalSetThemeArgs, ThemeScheme,
 };
 
 /// Adaptive resize coalescing window (snappy single-frame settle while coalescing drags).
@@ -16,9 +17,6 @@ pub const DEFAULT_RESIZE_COALESCE: Duration = Duration::from_millis(16);
 
 /// Upper bound on continuous drag resize deferral so resizing feels live rather than frozen.
 pub const MAX_RESIZE_DEFER: Duration = Duration::from_millis(36);
-
-/// Default bounded warm-session LRU capacity (keeps top N recently visited sessions live!).
-pub const DEFAULT_WARM_SESSION_LIMIT: usize = 4;
 
 /// `true` when a client other than `me` owns the block.
 ///
@@ -112,6 +110,60 @@ pub struct BlockRuntimeState {
     pub last_sent_resize: Option<TerminalResizeArgs>,
     /// Authoritative `(columns, rows)` last reported by Rex via `RexApc::Resize` or `size_changed`.
     pub last_server_size: Option<(u16, u16)>,
+    /// Live listening TCP ports reported by `terminal.ports` / `ports_changed`.
+    pub ports_status: Option<PortScanStatus>,
+    pub listening_ports: Vec<PortEntry>,
+    pub port_processes: HashMap<i64, PortProcessEntry>,
+}
+
+impl BlockRuntimeState {
+    pub fn apply_ports_response(&mut self, resp: TerminalPortsResponse) {
+        self.ports_status = Some(resp.status);
+        let mut ports: Vec<PortEntry> = resp
+            .ports
+            .into_iter()
+            .filter(|p| {
+                p.protocol.eq_ignore_ascii_case("tcp") || p.protocol.eq_ignore_ascii_case("tcp6")
+            })
+            .collect();
+        ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.address.cmp(&b.address)));
+        // Deduplicate same port on multiple wildcard/loopback addresses so header pills stay clean,
+        // preferring 127.0.0.1 / ::1 / 0.0.0.0.
+        ports.dedup_by(|a, b| a.port == b.port);
+        self.listening_ports = ports;
+        self.port_processes.clear();
+        for proc_entry in resp.processes {
+            self.port_processes.insert(proc_entry.pid, proc_entry);
+        }
+    }
+
+    pub fn port_process_label(&self, port: &PortEntry) -> Option<String> {
+        port.pid
+            .and_then(|pid| self.port_processes.get(&pid))
+            .map(|p| p.display_label().to_owned())
+    }
+}
+
+/// Normalizes a listening bind address (`0.0.0.0` / `::`) to a dialable loopback host.
+pub fn normalize_tunnel_host(addr: &str) -> String {
+    let trimmed = addr.trim().trim_start_matches('[').trim_end_matches(']');
+    match trimmed {
+        "" | "0.0.0.0" => "127.0.0.1".to_owned(),
+        "::" => "::1".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// Formats a local browser HTTP URL for `(host, port)`, bracketing IPv6 literals and
+/// RFC 6874-escaping `%` zone delimiters as `%25` without altering raw tunnel dial hosts.
+pub fn format_port_http_url(host: &str, port: u16) -> String {
+    let clean = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if clean.contains(':') {
+        let escaped = clean.replace('%', "%25");
+        format!("http://[{escaped}]:{port}")
+    } else {
+        format!("http://{clean}:{port}")
+    }
 }
 
 /// Pending debounced terminal resize.
@@ -238,6 +290,7 @@ impl SessionEntry {
     }
 
     /// Returns `true` if `view` exists and currently has zero windows (for empty-state UI).
+    #[cfg(test)]
     pub fn is_empty_view(&self) -> bool {
         self.view.as_ref().is_some_and(|v| v.windows.is_empty())
     }
@@ -273,6 +326,9 @@ pub struct HostEntry {
     pub sessions: HashMap<String, SessionEntry>,
     pub keymap_hash: Option<String>,
     pub hosts_registry_hash: Option<String>,
+    pub tailscale_status: Option<TailscaleStatus>,
+    pub dropped_events_count: u64,
+    pub reconnect_count: u64,
 }
 
 impl HostEntry {
@@ -288,6 +344,9 @@ impl HostEntry {
             sessions: HashMap::new(),
             keymap_hash: None,
             hosts_registry_hash: None,
+            tailscale_status: None,
+            dropped_events_count: 0,
+            reconnect_count: 0,
         }
     }
 
@@ -325,6 +384,7 @@ impl HostEntry {
             api_revision,
             resumed: false,
         };
+        self.tailscale_status = boot.server_status.tailscale.clone();
 
         let mut new_order = Vec::with_capacity(boot.attach_all.sessions.len());
         let mut live_ids = HashSet::with_capacity(boot.attach_all.sessions.len());
@@ -475,6 +535,8 @@ pub struct WorkspaceState {
     pub hosts: HashMap<String, HostEntry>,
     pub host_order: Vec<String>,
     pub active_session: Option<SessionKey>,
+    /// Sessions currently displayed in any open OS window (protected from warm-LRU eviction).
+    pub pinned_sessions: HashSet<SessionKey>,
     /// Bounded LRU queue of warm sessions (most-recently-used at back).
     warm_lru: VecDeque<SessionKey>,
     warm_session_limit: usize,
@@ -488,6 +550,7 @@ impl WorkspaceState {
             hosts: HashMap::new(),
             host_order: Vec::new(),
             active_session: None,
+            pinned_sessions: HashSet::new(),
             warm_lru: VecDeque::new(),
             warm_session_limit: warm_session_limit.max(1),
             ownership_policy: OwnershipPolicy::default(),
@@ -530,6 +593,15 @@ impl WorkspaceState {
             .get(&key.block_id)
     }
 
+    pub fn block_mut(&mut self, key: &BlockKey) -> Option<&mut BlockRuntimeState> {
+        self.hosts
+            .get_mut(&key.host_id)?
+            .sessions
+            .get_mut(&key.session_id)?
+            .blocks
+            .get_mut(&key.block_id)
+    }
+
     /// Select a session as active while preserving recently visited sessions in the bounded LRU cache.
     ///
     /// Switching away from `"T3 Code"` and back within the LRU window returns `needs_attach = false`
@@ -541,10 +613,15 @@ impl WorkspaceState {
 
         let mut plan = SessionSwitchPlan::default();
 
-        // Demote previous active session to WarmBackground instead of tearing it down.
+        // Demote previous active session to WarmBackground (unless still pinned by another OS window).
         if let Some(prev) = self.active_session.take() {
+            let prev_pinned = self.pinned_sessions.contains(&prev);
             if let Some(entry) = self.session_mut(&prev) {
-                entry.warmth = SessionWarmth::WarmBackground;
+                entry.warmth = if prev_pinned {
+                    SessionWarmth::Active
+                } else {
+                    SessionWarmth::WarmBackground
+                };
             }
             self.touch_lru(&prev);
             plan.demoted_to_warm = Some(prev);
@@ -563,23 +640,25 @@ impl WorkspaceState {
         self.touch_lru(&target);
         self.active_session = Some(target.clone());
 
-        // Evict only the oldest background sessions exceeding the bounded warm cache limit.
+        // Evict only the oldest background sessions exceeding the bounded warm cache limit,
+        // skipping `target` and any session pinned by another open OS window.
         while self.warm_lru.len() > self.warm_session_limit {
-            if let Some(oldest) = self.warm_lru.front().cloned() {
-                if oldest == target {
-                    // Never evict the currently active session.
-                    break;
+            let Some(evict_idx) = self
+                .warm_lru
+                .iter()
+                .position(|k| k != &target && !self.pinned_sessions.contains(k))
+            else {
+                break;
+            };
+            let oldest = self.warm_lru.remove(evict_idx).expect("valid warm_lru idx");
+            if let Some(entry) = self.session_mut(&oldest) {
+                entry.warmth = SessionWarmth::Cold;
+                for blk in entry.blocks.values_mut() {
+                    blk.snapshot_ready = false;
+                    blk.pending_resize = None;
                 }
-                self.warm_lru.pop_front();
-                if let Some(entry) = self.session_mut(&oldest) {
-                    entry.warmth = SessionWarmth::Cold;
-                    for blk in entry.blocks.values_mut() {
-                        blk.snapshot_ready = false;
-                        blk.pending_resize = None;
-                    }
-                }
-                plan.evicted_sessions.push(oldest);
             }
+            plan.evicted_sessions.push(oldest);
         }
 
         plan
@@ -978,10 +1057,6 @@ impl WorkspaceState {
         removed_sessions
     }
 
-    pub fn warm_session_count(&self) -> usize {
-        self.warm_lru.len()
-    }
-
     fn touch_lru(&mut self, key: &SessionKey) {
         self.warm_lru.retain(|k| k != key);
         self.warm_lru.push_back(key.clone());
@@ -1080,6 +1155,13 @@ fn apply_block_event_to_state(blk: &mut BlockRuntimeState, ev: &BlockEventPayloa
             }
             if let Some(owner_val) = ev.payload.get("owner") {
                 blk.owner = owner_val.as_str().map(str::to_owned);
+            }
+        }
+        "ports_changed" => {
+            if let Ok(resp) = serde_json::from_value::<TerminalPortsResponse>(ev.payload.clone())
+                && !resp.truncated.unwrap_or(false)
+            {
+                blk.apply_ports_response(resp);
             }
         }
         _ => {}
@@ -1524,5 +1606,43 @@ mod tests {
             "s1",
             &SessionEvent::SessionViewChanged { revision: 3 },
         ));
+    }
+
+    #[test]
+    fn ports_accepts_tcp6_and_formats_ipv6_zone_urls_per_rfc6874() {
+        let mut blk = BlockRuntimeState::default();
+        blk.apply_ports_response(TerminalPortsResponse {
+            status: PortScanStatus::Ok,
+            ports: vec![
+                PortEntry {
+                    port: 5353,
+                    address: "0.0.0.0".into(),
+                    protocol: "udp".into(),
+                    first_seen_at: "2026-11-26T20:00:00Z".into(),
+                    pid: None,
+                },
+                PortEntry {
+                    port: 3000,
+                    address: "fe80::1%1".into(),
+                    protocol: "tcp6".into(),
+                    first_seen_at: "2026-11-26T20:00:00Z".into(),
+                    pid: None,
+                },
+            ],
+            processes: Vec::new(),
+            truncated: None,
+            id: None,
+        });
+        assert_eq!(blk.listening_ports.len(), 1);
+        assert_eq!(blk.listening_ports[0].port, 3000);
+        assert_eq!(normalize_tunnel_host("fe80::1%1"), "fe80::1%1");
+        assert_eq!(
+            format_port_http_url(&normalize_tunnel_host("fe80::1%1"), 3000),
+            "http://[fe80::1%251]:3000"
+        );
+        assert_eq!(
+            format_port_http_url(&normalize_tunnel_host("0.0.0.0"), 8080),
+            "http://127.0.0.1:8080"
+        );
     }
 }

@@ -10,28 +10,26 @@
 //! - Every spawned `ffmpeg`/`ffplay`/`pw-cat`/`paplay` child process is strictly tracked, killed,
 //!   and reaped on pause, seek, mute, tab close, and `Drop` (never leaks zombies).
 
-#![allow(dead_code)]
-
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use image::codecs::gif::GifDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use tracing::{debug, warn};
+use ui_chrome::{DiffGutterKind, DiffLineKind, GitDiffHunk, GitDiffLine, GitFileDiff};
 
 /// Unique identifier for an open viewer tab managed by [`MediaViewerBackend`].
 pub type ViewerTabId = u64;
@@ -83,11 +81,15 @@ pub enum MediaKind {
     Image,
     /// Probe metadata, extract first-frame poster, and prepare playback via `ffprobe`/`ffmpeg`.
     Video,
+    /// Probe audio metadata, extract normalized waveform peaks, and prepare audio playback.
+    Audio,
+    /// Probe PDF page count, rasterize target page via `pdftoppm`, and extract text via `pdftotext`.
+    Pdf,
 }
 
 impl MediaKind {
-    /// Classifies a path into [`MediaKind::Image`], [`MediaKind::Video`], or [`MediaKind::Text`]
-    /// based on its extension.
+    /// Classifies a path into [`MediaKind::Image`], [`MediaKind::Video`], [`MediaKind::Audio`],
+    /// [`MediaKind::Pdf`], or [`MediaKind::Text`] based on its extension.
     pub fn from_path(path: &Path) -> Self {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             return Self::Text;
@@ -96,6 +98,8 @@ impl MediaKind {
             "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" => Self::Image,
             "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "ogv" | "flv" | "wmv" | "ts"
             | "mts" => Self::Video,
+            "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus" | "wma" => Self::Audio,
+            "pdf" => Self::Pdf,
             _ => Self::Text,
         }
     }
@@ -134,25 +138,30 @@ pub struct AnimatedFrame {
     pub delay: Duration,
 }
 
+/// Decoded local inline image embedded inside a Markdown file (`![alt](src)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineMarkdownImage {
+    pub src: String,
+    pub width: u32,
+    pub height: u32,
+    pub frame: RgbaFrame,
+}
+
 /// Loaded text/code file content and metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextContent {
     /// Human-readable display path (remote path for remote files, local path otherwise).
     pub display_path: String,
-    /// Local path on disk that was read.
-    pub local_path: PathBuf,
+    /// Local filesystem path if loaded from disk (used for `inotify` watching & relative links).
+    pub local_path: Option<PathBuf>,
     /// Decoded lines (empty if the file is empty; compact hex preview if `is_binary`).
     pub lines: Vec<String>,
     /// Total file size on disk in bytes.
     pub file_size_bytes: u64,
-    /// File modification timestamp (seconds since UNIX epoch), if available.
-    pub modified_unix_secs: Option<u64>,
-    /// `true` when the file exceeded [`MAX_TEXT_FILE_BYTES`] and was capped.
-    pub truncated: bool,
-    /// `true` when binary content was detected in the file header.
-    pub is_binary: bool,
-    /// `true` when invalid UTF-8 sequences were replaced with U+FFFD.
-    pub lossy_utf8: bool,
+    /// Pre-decoded local images referenced via `![alt](src)` in Markdown files.
+    pub inline_images: Vec<InlineMarkdownImage>,
+    /// Git diff/status metadata if the file resides inside a git repository.
+    pub git_diff: Option<GitFileDiff>,
 }
 
 /// Metadata returned for a decoded raster image or SVG.
@@ -162,18 +171,10 @@ pub struct ImageMetadata {
     pub width: u32,
     /// Decoded frame height in pixels (capped at [`MAX_IMAGE_DIMENSION`]).
     pub height: u32,
-    /// Original source width prior to any >8K downscaling.
-    pub original_width: u32,
-    /// Original source height prior to any >8K downscaling.
-    pub original_height: u32,
     /// Human-readable format label (e.g. `"PNG"`, `"JPEG"`, `"WebP"`, `"GIF (Animated)"`, `"SVG"`).
     pub format_label: String,
     /// Source file size in bytes.
     pub file_size_bytes: u64,
-    /// Number of decoded frames (`1` for static images/SVGs, `>1` for animated GIF/WebP).
-    pub frame_count: usize,
-    /// `true` when `frame_count > 1`.
-    pub is_animated: bool,
 }
 
 /// Complete decoded image output (1 frame for static/SVG, N frames for animated GIF/WebP).
@@ -197,7 +198,6 @@ pub struct VideoMetadata {
     pub render_height: u32,
     pub fps: f64,
     pub video_codec: String,
-    pub audio_codec: Option<String>,
     pub has_audio: bool,
     pub file_size_bytes: u64,
 }
@@ -207,42 +207,70 @@ pub struct VideoMetadata {
 pub struct VideoPlaybackState {
     pub playing: bool,
     pub position_secs: f64,
-    pub duration_secs: f64,
     pub muted: bool,
     pub looping: bool,
-    pub ended: bool,
-    pub audio_active: bool,
+}
+
+/// Metadata and 96-bar normalized waveform peaks extracted for an audio file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioMetadata {
+    pub display_path: String,
+    pub local_path: PathBuf,
+    pub duration_secs: f64,
+    pub codec: String,
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u16>,
+    pub bitrate_kbps: Option<u32>,
+    pub file_size_bytes: u64,
+    pub waveform_peaks: Vec<f32>,
+    pub warning_banner: Option<String>,
+}
+
+/// Snapshot of an audio tab's playback transport state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioPlaybackState {
+    pub playing: bool,
+    pub position_secs: f64,
+    pub muted: bool,
+    pub looping: bool,
+}
+
+/// Metadata extracted for a PDF document and current rendered page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfMetadata {
+    pub display_path: String,
+    pub local_path: PathBuf,
+    pub page_count: usize,
+    pub current_page: usize,
+    pub page_width: u32,
+    pub page_height: u32,
+    pub file_size_bytes: u64,
+    pub page_text: Option<String>,
+    pub fallback_notice: Option<String>,
 }
 
 /// Non-blocking events delivered by [`MediaViewerBackend::poll_events`].
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
-    /// A text/code file finished loading.
+    /// A text/code file finished loading (or auto-reloaded via `notify`).
     TextLoaded {
         tab_id: ViewerTabId,
         content: TextContent,
+        is_reload: bool,
     },
     /// A static or animated image/SVG finished decoding (frame 0 ready for immediate GPU upload).
     ImageLoaded {
         tab_id: ViewerTabId,
         texture_key: u64,
         generation: u64,
-        display_path: String,
-        local_path: PathBuf,
         metadata: ImageMetadata,
         frame: RgbaFrame,
-        frame_durations: Vec<Duration>,
-        texture_dirty: bool,
     },
     /// Next frame of an animated GIF/WebP is ready for GPU upload.
     AnimationFrame {
-        tab_id: ViewerTabId,
         texture_key: u64,
         generation: u64,
-        frame_index: usize,
-        frame_count: usize,
         frame: RgbaFrame,
-        texture_dirty: bool,
     },
     /// Video metadata was probed and optional first-frame poster RGBA8 was extracted.
     VideoLoaded {
@@ -252,7 +280,6 @@ pub enum MediaEvent {
         metadata: VideoMetadata,
         poster_frame: Option<RgbaFrame>,
         state: VideoPlaybackState,
-        texture_dirty: bool,
     },
     /// A newly decoded video frame (from playback or seek) is ready for GPU upload.
     VideoFrame {
@@ -262,18 +289,44 @@ pub enum MediaEvent {
         position_secs: f64,
         frame: RgbaFrame,
         state: VideoPlaybackState,
-        texture_dirty: bool,
     },
     /// Video transport state changed (e.g. paused, resumed, muted, looped, or reached EOF).
     VideoStateChanged {
         tab_id: ViewerTabId,
         state: VideoPlaybackState,
     },
+    /// Audio metadata and waveform peaks finished loading.
+    AudioLoaded {
+        tab_id: ViewerTabId,
+        metadata: AudioMetadata,
+        state: AudioPlaybackState,
+    },
+    /// Audio transport state or playhead position updated.
+    AudioStateChanged {
+        tab_id: ViewerTabId,
+        state: AudioPlaybackState,
+    },
+    /// PDF document opened and initial page rendered/extracted.
+    PdfLoaded {
+        tab_id: ViewerTabId,
+        texture_key: u64,
+        generation: u64,
+        metadata: PdfMetadata,
+        page_frame: Option<RgbaFrame>,
+    },
+    /// A different PDF page finished rendering/extracting.
+    PdfPageLoaded {
+        tab_id: ViewerTabId,
+        texture_key: u64,
+        generation: u64,
+        metadata: PdfMetadata,
+        page_frame: Option<RgbaFrame>,
+    },
     /// Loading or decoding failed for `tab_id`.
     LoadError {
         tab_id: ViewerTabId,
-        display_path: String,
         error: String,
+        is_reload: bool,
     },
 }
 
@@ -287,68 +340,6 @@ pub fn viewer_remote_cache_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("omarex")
         .join("viewer-remote")
-}
-
-/// Ensures [`viewer_remote_cache_dir`] exists on disk and returns its path.
-pub fn ensure_viewer_remote_cache_dir() -> io::Result<PathBuf> {
-    let dir = viewer_remote_cache_dir();
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Computes a deterministic, collision-resistant local cache path for a remote file while
-/// preserving its filename and extension.
-pub fn remote_cache_path_for(host_id: &str, remote_path: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    host_id.hash(&mut hasher);
-    0u8.hash(&mut hasher);
-    remote_path.hash(&mut hasher);
-    let key_hash = hasher.finish();
-
-    let raw_name = Path::new(remote_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
-    let sanitized: String = raw_name
-        .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
-        .take(96)
-        .collect();
-    let final_name = if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        "file".to_owned()
-    } else {
-        sanitized
-    };
-
-    viewer_remote_cache_dir().join(format!("{key_hash:016x}_{final_name}"))
-}
-
-/// Atomically writes downloaded remote file bytes into `~/.cache/omarex/viewer-remote/`
-/// and returns the resulting local path.
-pub fn cache_remote_bytes(host_id: &str, remote_path: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    let dir = ensure_viewer_remote_cache_dir()?;
-    let target = remote_cache_path_for(host_id, remote_path);
-    let tmp_name = format!(
-        ".tmp_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp_path = dir.join(tmp_name);
-
-    {
-        let mut f = File::create(&tmp_path)?;
-        f.write_all(bytes)?;
-        f.flush()?;
-    }
-
-    if let Err(err) = fs::rename(&tmp_path, &target) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    Ok(target)
 }
 
 // ============================================================================
@@ -411,11 +402,6 @@ pub fn load_text_file(path: &Path, display_path: Option<&str>) -> Result<TextCon
     }
 
     let file_size_bytes = meta.len();
-    let modified_unix_secs = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
 
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let cap = MAX_TEXT_FILE_BYTES as usize;
@@ -425,39 +411,34 @@ pub fn load_text_file(path: &Path, display_path: Option<&str>) -> Result<TextCon
         .read_to_end(&mut buf)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
-    let truncated = buf.len() as u64 > MAX_TEXT_FILE_BYTES || file_size_bytes > MAX_TEXT_FILE_BYTES;
     if buf.len() > cap {
         buf.truncate(cap);
     }
 
     let is_binary = is_likely_binary(&buf);
-    let (lines, lossy_utf8) = if is_binary {
-        (format_binary_hex_preview(&buf, file_size_bytes), false)
+    let lines = if is_binary {
+        format_binary_hex_preview(&buf, file_size_bytes)
     } else if buf.is_empty() {
-        (Vec::new(), false)
+        Vec::new()
     } else {
-        let (text, lossy) = match std::str::from_utf8(&buf) {
-            Ok(s) => (Cow::Borrowed(s), false),
-            Err(_) => (String::from_utf8_lossy(&buf), true),
+        let text = match std::str::from_utf8(&buf) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => String::from_utf8_lossy(&buf),
         };
-        let split = text
-            .split('\n')
+        text.split('\n')
             .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
-            .collect();
-        (split, lossy)
+            .collect()
     };
 
     Ok(TextContent {
         display_path: display_path
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| path.display().to_string()),
-        local_path: path.to_path_buf(),
+        local_path: Some(path.to_path_buf()),
         lines,
         file_size_bytes,
-        modified_unix_secs,
-        truncated,
-        is_binary,
-        lossy_utf8,
+        inline_images: Vec::new(),
+        git_diff: None,
     })
 }
 
@@ -527,19 +508,15 @@ pub fn decode_image_bytes(
     }
 
     if is_svg_payload(bytes, hint_ext) {
-        let (width, height, rgba, original_width, original_height) =
+        let (width, height, rgba, _original_width, _original_height) =
             gpu_renderer::image_pass::rasterize_svg_rgba8(bytes, MAX_IMAGE_DIMENSION)
                 .map_err(|e| format!("SVG rasterization failed: {e}"))?;
         return Ok(DecodedImage {
             metadata: ImageMetadata {
                 width,
                 height,
-                original_width,
-                original_height,
                 format_label: "SVG".to_owned(),
                 file_size_bytes,
-                frame_count: 1,
-                is_animated: false,
             },
             frames: vec![AnimatedFrame {
                 frame: RgbaFrame {
@@ -581,7 +558,6 @@ fn is_svg_payload(bytes: &[u8], hint_ext: Option<&str>) -> bool {
 fn decode_gif_bytes(bytes: &[u8], file_size_bytes: u64) -> Result<DecodedImage, String> {
     let decoder =
         GifDecoder::new(Cursor::new(bytes)).map_err(|e| format!("GIF decode failed: {e}"))?;
-    let (original_width, original_height) = decoder.dimensions();
     let raw_frames = decoder
         .into_frames()
         .take(MAX_ANIMATED_FRAMES)
@@ -609,16 +585,12 @@ fn decode_gif_bytes(bytes: &[u8], file_size_bytes: u64) -> Result<DecodedImage, 
         metadata: ImageMetadata {
             width: final_w,
             height: final_h,
-            original_width,
-            original_height,
             format_label: if is_animated {
                 "GIF (Animated)".to_owned()
             } else {
                 "GIF".to_owned()
             },
             file_size_bytes,
-            frame_count: frames.len(),
-            is_animated,
         },
         frames,
     })
@@ -627,7 +599,6 @@ fn decode_gif_bytes(bytes: &[u8], file_size_bytes: u64) -> Result<DecodedImage, 
 fn decode_webp_bytes(bytes: &[u8], file_size_bytes: u64) -> Result<DecodedImage, String> {
     let decoder =
         WebPDecoder::new(Cursor::new(bytes)).map_err(|e| format!("WebP decode failed: {e}"))?;
-    let (original_width, original_height) = decoder.dimensions();
 
     if decoder.has_animation() {
         let raw_frames = decoder
@@ -657,16 +628,12 @@ fn decode_webp_bytes(bytes: &[u8], file_size_bytes: u64) -> Result<DecodedImage,
             metadata: ImageMetadata {
                 width: final_w,
                 height: final_h,
-                original_width,
-                original_height,
                 format_label: if is_animated {
                     "WebP (Animated)".to_owned()
                 } else {
                     "WebP".to_owned()
                 },
                 file_size_bytes,
-                frame_count: frames.len(),
-                is_animated,
             },
             frames,
         });
@@ -679,12 +646,8 @@ fn decode_webp_bytes(bytes: &[u8], file_size_bytes: u64) -> Result<DecodedImage,
         metadata: ImageMetadata {
             width: frame.width,
             height: frame.height,
-            original_width,
-            original_height,
             format_label: "WebP".to_owned(),
             file_size_bytes,
-            frame_count: 1,
-            is_animated: false,
         },
         frames: vec![AnimatedFrame {
             frame,
@@ -717,20 +680,14 @@ fn decode_static_raster_bytes(
         img.apply_orientation(orient);
     }
 
-    let original_width = img.width();
-    let original_height = img.height();
     let frame = dynamic_image_to_rgba_frame(img);
 
     Ok(DecodedImage {
         metadata: ImageMetadata {
             width: frame.width,
             height: frame.height,
-            original_width,
-            original_height,
             format_label: format_label_for(effective_format),
             file_size_bytes,
-            frame_count: 1,
-            is_animated: false,
         },
         frames: vec![AnimatedFrame {
             frame,
@@ -791,28 +748,6 @@ fn format_label_for(format: Option<ImageFormat>) -> String {
 // Video Probing, Poster Extraction & Playback Engine (`ffprobe` + `ffmpeg`)
 // ============================================================================
 
-/// Returns `true` if `ffmpeg` is executable on `PATH`.
-pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Returns `true` if `ffprobe` is executable on `PATH`.
-pub fn ffprobe_available() -> bool {
-    Command::new("ffprobe")
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 #[derive(Debug, Deserialize)]
 struct FfprobeOutput {
     #[serde(default)]
@@ -824,6 +759,7 @@ struct FfprobeOutput {
 struct FfprobeFormat {
     duration: Option<String>,
     size: Option<String>,
+    bit_rate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,6 +771,9 @@ struct FfprobeStream {
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     duration: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<u16>,
+    bit_rate: Option<String>,
     tags: Option<FfprobeTags>,
     #[serde(default)]
     side_data_list: Vec<FfprobeSideData>,
@@ -958,9 +897,6 @@ pub fn probe_video_metadata(
 
     let (render_width, render_height) = compute_video_render_dims(width, height);
     let video_codec = format_codec_name(video_stream.codec_name.as_deref().unwrap_or("video"));
-    let audio_codec = audio_stream
-        .and_then(|s| s.codec_name.as_deref())
-        .map(format_codec_name);
 
     Ok(VideoMetadata {
         display_path: display_path
@@ -975,7 +911,6 @@ pub fn probe_video_metadata(
         fps,
         video_codec,
         has_audio: audio_stream.is_some(),
-        audio_codec,
         file_size_bytes,
     })
 }
@@ -1685,6 +1620,1030 @@ fn run_video_playback_loop(
 }
 
 // ============================================================================
+// F10: `notify` (`inotify`) Parent-Directory Watcher Coordinator
+// ============================================================================
+
+const FILE_WATCH_DEBOUNCE: Duration = Duration::from_millis(60);
+
+struct WatchedTabEntry {
+    watched_path: PathBuf,
+    canonical_path: Option<PathBuf>,
+    parent_dir: PathBuf,
+    canonical_parent_dir: Option<PathBuf>,
+    file_name: std::ffi::OsString,
+    canonical_file_name: Option<std::ffi::OsString>,
+    display_path: String,
+    kind: MediaKind,
+    reload_deadline: Option<Instant>,
+}
+
+struct WatchSharedState {
+    tabs: HashMap<ViewerTabId, WatchedTabEntry>,
+    waker: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct FileWatchCoordinator {
+    watcher: Option<RecommendedWatcher>,
+    dir_refcounts: HashMap<PathBuf, usize>,
+    shared: Arc<Mutex<WatchSharedState>>,
+}
+
+impl FileWatchCoordinator {
+    fn new(waker: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        let shared = Arc::new(Mutex::new(WatchSharedState {
+            tabs: HashMap::new(),
+            waker,
+        }));
+        let shared_cb = Arc::clone(&shared);
+        let watcher = notify::recommended_watcher(move |res: notify::Result<NotifyEvent>| {
+            let Ok(event) = res else {
+                return;
+            };
+            if matches!(event.kind, EventKind::Access(_)) || event.paths.is_empty() {
+                return;
+            }
+            let Ok(mut guard) = shared_cb.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            let mut matched_any = false;
+            for entry in guard.tabs.values_mut() {
+                if event_matches_watched_tab(&event.paths, entry) {
+                    entry.reload_deadline = Some(now + FILE_WATCH_DEBOUNCE);
+                    matched_any = true;
+                }
+            }
+            let waker = if matched_any {
+                guard.waker.clone()
+            } else {
+                None
+            };
+            drop(guard);
+            if let Some(wake) = waker {
+                wake();
+            }
+        })
+        .map_err(|e| warn!("failed to initialize notify watcher: {e}"))
+        .ok();
+
+        Self {
+            watcher,
+            dir_refcounts: HashMap::new(),
+            shared,
+        }
+    }
+
+    fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.waker = Some(waker);
+        }
+    }
+
+    fn watch_tab(
+        &mut self,
+        tab_id: ViewerTabId,
+        path: &Path,
+        display_path: String,
+        kind: MediaKind,
+    ) {
+        self.unwatch_tab(tab_id);
+
+        let abs_path = absolutize_path(path);
+        let Some(parent_dir) = abs_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(file_name) = abs_path.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return;
+        };
+
+        let canonical_path = fs::canonicalize(&abs_path).ok().filter(|c| c != &abs_path);
+        let canonical_parent_dir = canonical_path
+            .as_ref()
+            .and_then(|c| c.parent())
+            .map(Path::to_path_buf)
+            .filter(|cp| cp != &parent_dir);
+        let canonical_file_name = canonical_path
+            .as_ref()
+            .and_then(|c| c.file_name())
+            .map(std::ffi::OsStr::to_os_string);
+
+        self.acquire_dir_watch(&parent_dir);
+        if let Some(ref cdir) = canonical_parent_dir {
+            self.acquire_dir_watch(cdir);
+        }
+
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.tabs.insert(
+                tab_id,
+                WatchedTabEntry {
+                    watched_path: abs_path,
+                    canonical_path,
+                    parent_dir,
+                    canonical_parent_dir,
+                    file_name,
+                    canonical_file_name,
+                    display_path,
+                    kind,
+                    reload_deadline: None,
+                },
+            );
+        }
+    }
+
+    fn unwatch_tab(&mut self, tab_id: ViewerTabId) {
+        let removed = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.tabs.remove(&tab_id));
+        if let Some(entry) = removed {
+            self.release_dir_watch(&entry.parent_dir);
+            if let Some(ref cdir) = entry.canonical_parent_dir {
+                self.release_dir_watch(cdir);
+            }
+        }
+    }
+
+    fn unwatch_all(&mut self) {
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.tabs.clear();
+        }
+        let dirs: Vec<PathBuf> = self.dir_refcounts.keys().cloned().collect();
+        if let Some(watcher) = self.watcher.as_mut() {
+            for dir in dirs {
+                let _ = watcher.unwatch(&dir);
+            }
+        }
+        self.dir_refcounts.clear();
+    }
+
+    fn take_due_reloads(&self, now: Instant) -> Vec<(ViewerTabId, PathBuf, String, MediaKind)> {
+        let Ok(mut guard) = self.shared.lock() else {
+            return Vec::new();
+        };
+        let mut due = Vec::new();
+        for (&tab_id, entry) in &mut guard.tabs {
+            if let Some(deadline) = entry.reload_deadline
+                && now >= deadline
+            {
+                entry.reload_deadline = None;
+                due.push((
+                    tab_id,
+                    entry.watched_path.clone(),
+                    entry.display_path.clone(),
+                    entry.kind,
+                ));
+            }
+        }
+        due
+    }
+
+    fn earliest_deadline(&self) -> Option<Instant> {
+        let Ok(guard) = self.shared.lock() else {
+            return None;
+        };
+        guard.tabs.values().filter_map(|e| e.reload_deadline).min()
+    }
+
+    #[cfg(test)]
+    fn watched_dir_count(&self) -> usize {
+        self.dir_refcounts.len()
+    }
+
+    fn acquire_dir_watch(&mut self, dir: &Path) {
+        let count = self.dir_refcounts.entry(dir.to_path_buf()).or_insert(0);
+        if *count == 0
+            && let Some(watcher) = self.watcher.as_mut()
+            && let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive)
+        {
+            debug!("notify watch failed for {}: {e}", dir.display());
+        }
+        *count += 1;
+    }
+
+    fn release_dir_watch(&mut self, dir: &Path) {
+        let Some(count) = self.dir_refcounts.get_mut(dir) else {
+            return;
+        };
+        if *count > 1 {
+            *count -= 1;
+        } else {
+            self.dir_refcounts.remove(dir);
+            if let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.unwatch(dir);
+            }
+        }
+    }
+}
+
+impl Drop for FileWatchCoordinator {
+    fn drop(&mut self) {
+        self.unwatch_all();
+    }
+}
+
+fn absolutize_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn event_matches_watched_tab(paths: &[PathBuf], entry: &WatchedTabEntry) -> bool {
+    paths.iter().any(|ev_path| {
+        if ev_path == &entry.watched_path {
+            return true;
+        }
+        if entry
+            .canonical_path
+            .as_ref()
+            .is_some_and(|cp| ev_path == cp)
+        {
+            return true;
+        }
+        let Some(ev_name) = ev_path.file_name() else {
+            return false;
+        };
+        if ev_name == entry.file_name
+            && ev_path.parent().is_some_and(|p| {
+                p == entry.parent_dir
+                    || fs::canonicalize(p).ok().as_ref() == Some(&entry.parent_dir)
+            })
+        {
+            return true;
+        }
+        entry
+            .canonical_file_name
+            .as_ref()
+            .zip(entry.canonical_parent_dir.as_ref())
+            .is_some_and(|(cn, cd)| {
+                ev_name == cn.as_os_str() && ev_path.parent().is_some_and(|p| p == cd)
+            })
+    })
+}
+
+// ============================================================================
+// F11: Git Status & Unified Diff Parser
+// ============================================================================
+
+/// Computes repository status and unified diff hunks for `path`.
+/// Returns `None` if `path` is not inside a git worktree or is clean/unmodified.
+pub fn compute_git_diff(path: &Path) -> Option<GitFileDiff> {
+    let probe_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let top_out = Command::new("git")
+        .arg("-C")
+        .arg(probe_dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !top_out.status.success() {
+        return None;
+    }
+    let toplevel_str = String::from_utf8_lossy(&top_out.stdout).trim().to_owned();
+    if toplevel_str.is_empty() {
+        return None;
+    }
+    let toplevel = fs::canonicalize(&toplevel_str).unwrap_or_else(|_| PathBuf::from(&toplevel_str));
+    let abs_file = fs::canonicalize(path).unwrap_or_else(|_| absolutize_path(path));
+    let rel_path = abs_file.strip_prefix(&toplevel).ok()?.to_path_buf();
+
+    let status_out = Command::new("git")
+        .arg("-C")
+        .arg(&toplevel)
+        .args(["status", "--porcelain=v1", "--"])
+        .arg(&rel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !status_out.status.success() {
+        return None;
+    }
+    let status_text = String::from_utf8_lossy(&status_out.stdout);
+    let first_line = status_text.lines().find(|l| !l.trim().is_empty())?;
+    let bytes = first_line.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let x = bytes[0] as char;
+    let y = bytes[1] as char;
+    if x == '?' && y == '?' {
+        return Some(GitFileDiff {
+            is_untracked: true,
+            ..GitFileDiff::default()
+        });
+    }
+    if x == '!' && y == '!' {
+        return None;
+    }
+
+    let has_staged = matches!(x, 'M' | 'A' | 'D' | 'R' | 'C');
+    let has_unstaged = matches!(y, 'M' | 'D' | 'A' | 'R' | 'C');
+
+    let mut diff_out = Command::new("git")
+        .arg("-C")
+        .arg(&toplevel)
+        .args(["diff", "HEAD", "-U3", "--no-color", "--"])
+        .arg(&rel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !diff_out.status.success() {
+        // Fresh repo with no commits yet (`HEAD` unresolved): fall back to `--cached`.
+        diff_out = Command::new("git")
+            .arg("-C")
+            .arg(&toplevel)
+            .args(["diff", "--cached", "-U3", "--no-color", "--"])
+            .arg(&rel_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+    }
+
+    let diff_text = String::from_utf8_lossy(&diff_out.stdout);
+    let mut parsed = parse_unified_git_diff(&diff_text, has_staged, has_unstaged);
+
+    // If both staged and unstaged changes exist, tag staged-only working lines distinctly
+    // from unstaged lines when an unstaged diff doesn't touch them.
+    if has_staged
+        && has_unstaged
+        && let Ok(unstaged_out) = Command::new("git")
+            .arg("-C")
+            .arg(&toplevel)
+            .args(["diff", "-U0", "--no-color", "--"])
+            .arg(&rel_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        && unstaged_out.status.success()
+    {
+        let unstaged_text = String::from_utf8_lossy(&unstaged_out.stdout);
+        let unstaged_diff = parse_unified_git_diff(&unstaged_text, false, true);
+        for (&line_no, mark) in &mut parsed.line_marks {
+            if !unstaged_diff.line_marks.contains_key(&line_no) {
+                *mark = match *mark {
+                    DiffGutterKind::UnstagedAdded => DiffGutterKind::StagedAdded,
+                    DiffGutterKind::UnstagedModified => DiffGutterKind::StagedModified,
+                    other => other,
+                };
+            }
+        }
+    }
+
+    Some(parsed)
+}
+
+fn parse_unified_git_diff(diff_text: &str, has_staged: bool, has_unstaged: bool) -> GitFileDiff {
+    let mut result = GitFileDiff {
+        has_staged,
+        has_unstaged,
+        is_untracked: false,
+        added_count: 0,
+        removed_count: 0,
+        line_marks: HashMap::new(),
+        deleted_after_lines: HashSet::new(),
+        hunks: Vec::new(),
+    };
+
+    let mut current_hunk: Option<GitDiffHunk> = None;
+    let mut old_cur = 1usize;
+    let mut new_cur = 1usize;
+    let mut pending_minus_in_block = 0usize;
+    let mut last_new_before_block = 0usize;
+    let staged_only = has_staged && !has_unstaged;
+
+    let flush_block =
+        |pending_minus: &mut usize, last_new_before: usize, result: &mut GitFileDiff| {
+            if *pending_minus > 0 {
+                result.deleted_after_lines.insert(last_new_before);
+                *pending_minus = 0;
+            }
+        };
+
+    for raw_line in diff_text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
+            flush_block(
+                &mut pending_minus_in_block,
+                last_new_before_block,
+                &mut result,
+            );
+            if let Some(h) = current_hunk.take() {
+                result.hunks.push(h);
+            }
+            old_cur = old_start;
+            new_cur = new_start;
+            last_new_before_block = new_start.saturating_sub(1);
+            current_hunk = Some(GitDiffHunk {
+                header: line.to_owned(),
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some(hunk) = current_hunk.as_mut() else {
+            continue;
+        };
+
+        if let Some(rest) = line.strip_prefix('+') {
+            let kind = if pending_minus_in_block > 0 {
+                pending_minus_in_block -= 1;
+                if staged_only {
+                    DiffGutterKind::StagedModified
+                } else {
+                    DiffGutterKind::UnstagedModified
+                }
+            } else if staged_only {
+                DiffGutterKind::StagedAdded
+            } else {
+                DiffGutterKind::UnstagedAdded
+            };
+            result.line_marks.insert(new_cur, kind);
+            result.added_count += 1;
+            hunk.lines.push(GitDiffLine {
+                old_line: None,
+                new_line: Some(new_cur),
+                kind: DiffLineKind::Added,
+                text: rest.to_owned(),
+            });
+            last_new_before_block = new_cur;
+            new_cur += 1;
+        } else if let Some(rest) = line.strip_prefix('-') {
+            if pending_minus_in_block == 0 {
+                last_new_before_block = new_cur.saturating_sub(1);
+            }
+            pending_minus_in_block += 1;
+            result.removed_count += 1;
+            hunk.lines.push(GitDiffLine {
+                old_line: Some(old_cur),
+                new_line: None,
+                kind: DiffLineKind::Removed,
+                text: rest.to_owned(),
+            });
+            old_cur += 1;
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            flush_block(
+                &mut pending_minus_in_block,
+                last_new_before_block,
+                &mut result,
+            );
+            hunk.lines.push(GitDiffLine {
+                old_line: Some(old_cur),
+                new_line: Some(new_cur),
+                kind: DiffLineKind::Context,
+                text: rest.to_owned(),
+            });
+            last_new_before_block = new_cur;
+            old_cur += 1;
+            new_cur += 1;
+        }
+    }
+
+    flush_block(
+        &mut pending_minus_in_block,
+        last_new_before_block,
+        &mut result,
+    );
+    if let Some(h) = current_hunk.take() {
+        result.hunks.push(h);
+    }
+
+    result
+}
+
+fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let end = rest.find(" @@")?;
+    let range_part = &rest[..end];
+    let (old_part, new_part) = range_part.split_once(" +")?;
+    let parse_range = |s: &str| -> Option<(usize, usize)> {
+        if let Some((start_s, count_s)) = s.split_once(',') {
+            Some((start_s.parse().ok()?, count_s.parse().ok()?))
+        } else {
+            Some((s.parse().ok()?, 1))
+        }
+    };
+    let (old_start, old_count) = parse_range(old_part)?;
+    let (new_start, new_count) = parse_range(new_part)?;
+    Some((old_start, old_count, new_start, new_count))
+}
+
+// ============================================================================
+// F13: Inline Markdown Image Extraction
+// ============================================================================
+
+const MAX_INLINE_MD_IMAGES: usize = 16;
+
+fn is_markdown_path(path: &Path, display_path: &str) -> bool {
+    let ext = path
+        .extension()
+        .or_else(|| Path::new(display_path).extension())
+        .and_then(|e| e.to_str());
+    matches!(
+        ext.map(str::to_ascii_lowercase).as_deref(),
+        Some("md" | "markdown")
+    )
+}
+
+fn extract_inline_markdown_images(local_path: &Path, lines: &[String]) -> Vec<InlineMarkdownImage> {
+    let base_dir = local_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut active_fence: Option<(char, usize)> = None;
+
+    for line in lines {
+        let trimmed = line.trim_start();
+        if let Some((f_char, f_len)) = active_fence {
+            if ui_chrome::is_closing_markdown_fence(trimmed, f_char, f_len) {
+                active_fence = None;
+            }
+            continue;
+        }
+        if let Some((f_char, f_len, _)) = ui_chrome::parse_markdown_fence(trimmed) {
+            active_fence = Some((f_char, f_len));
+            continue;
+        }
+
+        for (_alt, cleaned) in ui_chrome::extract_markdown_image_refs(line) {
+            if cleaned.is_empty()
+                || cleaned.starts_with("http://")
+                || cleaned.starts_with("https://")
+                || cleaned.starts_with("data:")
+                || !seen.insert(cleaned.clone())
+            {
+                continue;
+            }
+
+            let candidate = Path::new(&cleaned);
+            let resolved = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                base_dir.join(candidate)
+            };
+
+            if let Ok(mut decoded) = decode_image_file(&resolved)
+                && !decoded.frames.is_empty()
+            {
+                let frame = decoded.frames.remove(0).frame;
+                out.push(InlineMarkdownImage {
+                    src: cleaned,
+                    width: frame.width,
+                    height: frame.height,
+                    frame,
+                });
+                if out.len() >= MAX_INLINE_MD_IMAGES {
+                    return out;
+                }
+            }
+        }
+    }
+
+    out
+}
+
+// ============================================================================
+// F14: Audio Metadata, 96-Bar Waveform Extraction & Playback
+// ============================================================================
+
+const AUDIO_WAVEFORM_BARS: usize = 96;
+const AUDIO_PLAYBACK_WAKEUP_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Probes audio stream metadata via `ffprobe` and extracts 96 normalized RMS waveform peaks.
+pub fn probe_audio_metadata_and_peaks(
+    path: &Path,
+    display_path: Option<&str>,
+) -> Result<AudioMetadata, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    let file_size_bytes = meta.len();
+    if file_size_bytes == 0 {
+        return Err(format!("empty audio file (0 bytes): {}", path.display()));
+    }
+
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run ffprobe: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffprobe failed for audio ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("failed to parse audio ffprobe JSON: {e}"))?;
+
+    let audio_stream = parsed
+        .streams
+        .iter()
+        .find(|s| s.codec_type.as_deref() == Some("audio"))
+        .ok_or_else(|| "no audio stream found in file".to_owned())?;
+
+    let codec = audio_stream
+        .codec_name
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let sample_rate_hz = audio_stream
+        .sample_rate
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok());
+    let channels = audio_stream.channels;
+    let bitrate_kbps = audio_stream
+        .bit_rate
+        .as_deref()
+        .or_else(|| parsed.format.as_ref().and_then(|f| f.bit_rate.as_deref()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|bps| (bps / 1000) as u32)
+        .filter(|&k| k > 0);
+    let duration_secs = parsed
+        .format
+        .as_ref()
+        .and_then(|f| f.duration.as_deref())
+        .or(audio_stream.duration.as_deref())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .unwrap_or(0.0);
+
+    let (waveform_peaks, warning_banner) =
+        match extract_audio_waveform_peaks(path, AUDIO_WAVEFORM_BARS) {
+            Ok(peaks) => (peaks, None),
+            Err(err) => (vec![0.0; AUDIO_WAVEFORM_BARS], Some(err)),
+        };
+
+    Ok(AudioMetadata {
+        display_path: display_path
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| path.display().to_string()),
+        local_path: path.to_path_buf(),
+        duration_secs,
+        codec,
+        sample_rate_hz,
+        channels,
+        bitrate_kbps,
+        file_size_bytes,
+        waveform_peaks,
+        warning_banner,
+    })
+}
+
+fn extract_audio_waveform_peaks(path: &Path, bar_count: usize) -> Result<Vec<f32>, String> {
+    if bar_count == 0 {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to spawn ffmpeg for waveform: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("waveform extraction failed: {}", stderr.trim()));
+    }
+
+    let sample_count = output.stdout.len() / 2;
+    if sample_count == 0 {
+        return Ok(vec![0.0; bar_count]);
+    }
+
+    let mut raw_peaks = Vec::with_capacity(bar_count);
+    let mut max_val = 0.0f32;
+    for bar in 0..bar_count {
+        let start = (bar * sample_count) / bar_count;
+        let end = (((bar + 1) * sample_count) / bar_count)
+            .max(start + 1)
+            .min(sample_count);
+        let mut sum_sq = 0.0f64;
+        for idx in start..end {
+            let b0 = output.stdout[idx * 2];
+            let b1 = output.stdout[idx * 2 + 1];
+            let s = i16::from_le_bytes([b0, b1]) as f64 / 32768.0;
+            sum_sq += s * s;
+        }
+        let rms = (sum_sq / (end - start) as f64).sqrt() as f32;
+        max_val = max_val.max(rms);
+        raw_peaks.push(rms);
+    }
+
+    if max_val > 1e-5 {
+        for p in &mut raw_peaks {
+            *p = (*p / max_val).clamp(0.0, 1.0);
+        }
+    }
+    Ok(raw_peaks)
+}
+
+struct ActiveAudioPlayback {
+    player: Option<AudioPlayer>,
+    started_at: Instant,
+    start_secs: f64,
+}
+
+impl ActiveAudioPlayback {
+    fn start(path: &Path, start_secs: f64, muted: bool) -> Self {
+        let player = if muted {
+            None
+        } else {
+            AudioPlayer::spawn(path, start_secs)
+        };
+        Self {
+            player,
+            started_at: Instant::now(),
+            start_secs,
+        }
+    }
+
+    fn current_position(&self) -> f64 {
+        self.start_secs + self.started_at.elapsed().as_secs_f64()
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut p) = self.player.take() {
+            p.stop();
+        }
+    }
+}
+
+impl Drop for ActiveAudioPlayback {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct AudioTabState {
+    metadata: AudioMetadata,
+    playing: bool,
+    position_secs: f64,
+    muted: bool,
+    looping: bool,
+    ended: bool,
+    playback: Option<ActiveAudioPlayback>,
+}
+
+impl AudioTabState {
+    fn snapshot(&self) -> AudioPlaybackState {
+        AudioPlaybackState {
+            playing: self.playing,
+            position_secs: self.position_secs,
+            muted: self.muted,
+            looping: self.looping,
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(mut active) = self.playback.take() {
+            let pos = active.current_position();
+            self.position_secs = if self.metadata.duration_secs > 0.0 {
+                pos.min(self.metadata.duration_secs)
+            } else {
+                pos
+            };
+            active.stop();
+        }
+        self.playing = false;
+    }
+
+    fn tick(&mut self) -> bool {
+        if !self.playing {
+            return false;
+        }
+        let Some(active) = self.playback.as_ref() else {
+            self.playing = false;
+            return true;
+        };
+        let elapsed_pos = active.current_position();
+        let dur = self.metadata.duration_secs;
+        if dur > 0.0 && elapsed_pos >= dur {
+            if self.looping {
+                self.stop_playback();
+                self.position_secs = 0.0;
+                self.ended = false;
+                self.playing = true;
+                self.playback = Some(ActiveAudioPlayback::start(
+                    &self.metadata.local_path,
+                    0.0,
+                    self.muted,
+                ));
+            } else {
+                self.stop_playback();
+                self.position_secs = dur;
+                self.ended = true;
+            }
+            return true;
+        }
+        let prev = self.position_secs;
+        self.position_secs = elapsed_pos;
+        (self.position_secs - prev).abs() > 1e-4
+    }
+}
+
+impl Drop for AudioTabState {
+    fn drop(&mut self) {
+        self.stop_playback();
+    }
+}
+
+// ============================================================================
+// F14: PDF Probing, Page Rasterization (`pdftoppm`), and Text Fallback (`pdftotext`)
+// ============================================================================
+
+/// Validates `%PDF-` header, probes page count via `pdfinfo`, rasterizes `target_page`
+/// via `pdftoppm`, and extracts page text via `pdftotext`.
+pub fn load_pdf_document_page(
+    path: &Path,
+    display_path: Option<&str>,
+    target_page: usize,
+) -> Result<(PdfMetadata, Option<RgbaFrame>), String> {
+    let meta = fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    let file_size_bytes = meta.len();
+    if file_size_bytes == 0 {
+        return Err(format!("empty PDF file (0 bytes): {}", path.display()));
+    }
+
+    let mut head = [0u8; 1024];
+    let n = File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if !head[..n].windows(5).any(|w| w == b"%PDF-") {
+        return Err(format!(
+            "invalid PDF file (missing %PDF- header): {}",
+            path.display()
+        ));
+    }
+
+    let page_count = probe_pdf_page_count(path)?;
+    let clamped_page = target_page.clamp(1, page_count.max(1));
+    let page_text = extract_pdf_page_text(path, clamped_page);
+
+    match rasterize_pdf_page_png(path, clamped_page) {
+        Ok(frame) => {
+            let metadata = PdfMetadata {
+                display_path: display_path
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| path.display().to_string()),
+                local_path: path.to_path_buf(),
+                page_count,
+                current_page: clamped_page,
+                page_width: frame.width,
+                page_height: frame.height,
+                file_size_bytes,
+                page_text,
+                fallback_notice: None,
+            };
+            Ok((metadata, Some(frame)))
+        }
+        Err(render_err) => {
+            if let Some(text) = page_text.as_ref().filter(|t| !t.trim().is_empty()) {
+                let _ = text;
+                let metadata = PdfMetadata {
+                    display_path: display_path
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| path.display().to_string()),
+                    local_path: path.to_path_buf(),
+                    page_count,
+                    current_page: clamped_page,
+                    page_width: 0,
+                    page_height: 0,
+                    file_size_bytes,
+                    page_text,
+                    fallback_notice: Some(format!(
+                        "PDF page rasterization unavailable ({render_err}); showing extracted text."
+                    )),
+                };
+                Ok((metadata, None))
+            } else {
+                Err(format!(
+                    "failed to render PDF page {clamped_page}: {render_err}"
+                ))
+            }
+        }
+    }
+}
+
+fn probe_pdf_page_count(path: &Path) -> Result<usize, String> {
+    let output = Command::new("pdfinfo")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run pdfinfo: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pdfinfo failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("Pages:")
+            && let Ok(pages) = rest.trim().parse::<usize>()
+        {
+            return Ok(pages.max(1));
+        }
+    }
+    Err("pdfinfo output did not contain page count".to_owned())
+}
+
+fn rasterize_pdf_page_png(path: &Path, page: usize) -> Result<RgbaFrame, String> {
+    let page_str = page.to_string();
+    let output = Command::new("pdftoppm")
+        .args([
+            "-png",
+            "-r",
+            "144",
+            "-f",
+            &page_str,
+            "-l",
+            &page_str,
+            "-singlefile",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run pdftoppm: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pdftoppm failed: {}", stderr.trim()));
+    }
+    if output.stdout.is_empty() {
+        return Err("pdftoppm produced empty PNG output".to_owned());
+    }
+
+    let img = image::load_from_memory_with_format(&output.stdout, ImageFormat::Png)
+        .map_err(|e| format!("failed to decode pdftoppm PNG: {e}"))?;
+    Ok(dynamic_image_to_rgba_frame(img))
+}
+
+fn extract_pdf_page_text(path: &Path, page: usize) -> Option<String> {
+    let page_str = page.to_string();
+    let output = Command::new("pdftotext")
+        .args(["-f", &page_str, "-l", &page_str, "-layout"])
+        .arg(path)
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+struct PdfTabState {
+    display_path: String,
+    local_path: PathBuf,
+    page_count: usize,
+    current_page: usize,
+}
+
+// ============================================================================
 // Internal Backend State & Worker Messages
 // ============================================================================
 
@@ -1693,12 +2652,11 @@ enum WorkerResult {
         tab_id: ViewerTabId,
         epoch: u64,
         content: TextContent,
+        is_reload: bool,
     },
     Image {
         tab_id: ViewerTabId,
         epoch: u64,
-        display_path: String,
-        local_path: PathBuf,
         decoded: DecodedImage,
     },
     Video {
@@ -1713,11 +2671,23 @@ enum WorkerResult {
         position_secs: f64,
         frame: RgbaFrame,
     },
+    Audio {
+        tab_id: ViewerTabId,
+        epoch: u64,
+        metadata: AudioMetadata,
+    },
+    Pdf {
+        tab_id: ViewerTabId,
+        epoch: u64,
+        metadata: PdfMetadata,
+        page_frame: Option<RgbaFrame>,
+        is_page_turn: bool,
+    },
     Error {
         tab_id: ViewerTabId,
         epoch: u64,
-        display_path: String,
         error: String,
+        is_reload: bool,
     },
 }
 
@@ -1743,11 +2713,8 @@ impl VideoTabState {
         VideoPlaybackState {
             playing: self.playing,
             position_secs: self.position_secs,
-            duration_secs: self.metadata.duration_secs,
             muted: self.muted,
             looping: self.looping,
-            ended: self.ended,
-            audio_active: self.audio_active,
         }
     }
 
@@ -1774,6 +2741,8 @@ struct TabEntry {
     generation: u64,
     animation: Option<AnimatedImageState>,
     video: Option<VideoTabState>,
+    audio: Option<AudioTabState>,
+    pdf: Option<PdfTabState>,
 }
 
 impl TabEntry {
@@ -1783,6 +2752,8 @@ impl TabEntry {
             generation: 0,
             animation: None,
             video: None,
+            audio: None,
+            pdf: None,
         }
     }
 
@@ -1796,6 +2767,10 @@ impl TabEntry {
         if let Some(mut v) = self.video.take() {
             v.stop_playback();
         }
+        if let Some(mut a) = self.audio.take() {
+            a.stop_playback();
+        }
+        self.pdf = None;
     }
 }
 
@@ -1812,6 +2787,7 @@ pub struct MediaViewerBackend {
     pending_loads: Arc<AtomicU64>,
     epoch_counter: u64,
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
+    watcher: FileWatchCoordinator,
 }
 
 impl Default for MediaViewerBackend {
@@ -1832,19 +2808,13 @@ impl MediaViewerBackend {
             pending_loads: Arc::new(AtomicU64::new(0)),
             epoch_counter: 0,
             waker: None,
+            watcher: FileWatchCoordinator::new(None),
         }
-    }
-
-    /// Creates a new backend with a callback invoked whenever background work produces data
-    /// (e.g. to wake a sleeping `winit::event_loop::EventLoopProxy`).
-    pub fn with_waker(waker: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let mut backend = Self::new();
-        backend.waker = Some(waker);
-        backend
     }
 
     /// Installs or replaces the wakeup callback for async completions and video frames.
     pub fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.watcher.set_waker(Arc::clone(&waker));
         self.waker = Some(waker);
     }
 
@@ -1855,9 +2825,35 @@ impl MediaViewerBackend {
         path: impl Into<PathBuf>,
         kind: MediaKind,
     ) {
+        self.request_load_local_at(tab_id, path, kind, None);
+    }
+
+    /// Starts an async background load of a local file for `tab_id`, optionally requesting
+    /// an initial 1-based page for PDF documents (`sample.pdf:2`).
+    pub fn request_load_local_at(
+        &mut self,
+        tab_id: ViewerTabId,
+        path: impl Into<PathBuf>,
+        kind: MediaKind,
+        initial_page: Option<usize>,
+    ) {
         let local_path = path.into();
         let display_path = local_path.display().to_string();
-        self.spawn_load_task(tab_id, display_path, local_path, kind);
+        let resolved_kind = kind.resolve(&local_path);
+        if matches!(resolved_kind, MediaKind::Text | MediaKind::Auto) {
+            self.watcher
+                .watch_tab(tab_id, &local_path, display_path.clone(), kind);
+        } else {
+            self.watcher.unwatch_tab(tab_id);
+        }
+        self.spawn_load_task(
+            tab_id,
+            display_path,
+            local_path,
+            kind,
+            initial_page.unwrap_or(1).max(1),
+            false,
+        );
     }
 
     /// Starts an async background load of a remote file already downloaded into `local_cached_path`
@@ -1869,52 +2865,29 @@ impl MediaViewerBackend {
         local_cached_path: impl Into<PathBuf>,
         kind: MediaKind,
     ) {
-        self.spawn_load_task(tab_id, remote_path.into(), local_cached_path.into(), kind);
+        self.watcher.unwatch_tab(tab_id);
+        self.spawn_load_task(
+            tab_id,
+            remote_path.into(),
+            local_cached_path.into(),
+            kind,
+            1,
+            false,
+        );
     }
 
-    /// Writes downloaded remote bytes into `~/.cache/omarex/viewer-remote/` on a background thread
-    /// and immediately loads/decodes the cached file for `tab_id`.
-    pub fn ingest_remote_bytes(
-        &mut self,
-        tab_id: ViewerTabId,
-        host_id: impl Into<String>,
-        remote_path: impl Into<String>,
-        bytes: Vec<u8>,
-        kind: MediaKind,
-    ) {
-        let epoch = self.reset_tab_epoch(tab_id);
-        let host_id = host_id.into();
-        let remote_path = remote_path.into();
-        let tx = self.tx.clone();
-        let pending = Arc::clone(&self.pending_loads);
-        let waker = self.waker.clone();
-        pending.fetch_add(1, Ordering::SeqCst);
-
-        let _ = thread::Builder::new()
-            .name("omarex-media-remote".to_owned())
-            .spawn(move || {
-                let res = match cache_remote_bytes(&host_id, &remote_path, &bytes) {
-                    Ok(local_path) => execute_load(tab_id, epoch, remote_path, local_path, kind),
-                    Err(err) => WorkerResult::Error {
-                        tab_id,
-                        epoch,
-                        display_path: remote_path,
-                        error: format!("failed to cache remote file: {err}"),
-                    },
-                };
-                pending.fetch_sub(1, Ordering::SeqCst);
-                let _ = tx.send(res);
-                if let Some(wake) = waker {
-                    wake();
-                }
-            });
-    }
-
-    /// Drains all completed background loads, newly due animated image frames, and newly decoded
-    /// video frames without blocking the caller.
+    /// Drains all completed background loads, newly due animated image frames, debounced
+    /// `inotify` reloads, audio playhead updates, and newly decoded video frames without blocking.
     pub fn poll_events(&mut self) -> Vec<MediaEvent> {
         let mut out = std::mem::take(&mut self.pending_events);
         let now = Instant::now();
+
+        // 0. Trigger any debounced live auto-reloads from `notify` parent-dir watches.
+        for (tab_id, path, display_path, kind) in self.watcher.take_due_reloads(now) {
+            if self.tabs.contains_key(&tab_id) {
+                self.spawn_load_task(tab_id, display_path, path, kind, 1, true);
+            }
+        }
 
         // 1. Drain completed background worker jobs.
         while let Ok(msg) = self.rx.try_recv() {
@@ -1923,22 +2896,23 @@ impl MediaViewerBackend {
                     tab_id,
                     epoch,
                     content,
+                    is_reload,
                 } => {
                     if self.tab_matches_epoch(tab_id, epoch) {
-                        out.push(MediaEvent::TextLoaded { tab_id, content });
+                        out.push(MediaEvent::TextLoaded {
+                            tab_id,
+                            content,
+                            is_reload,
+                        });
                     }
                 }
                 WorkerResult::Image {
                     tab_id,
                     epoch,
-                    display_path,
-                    local_path,
                     mut decoded,
                 } => {
                     if let Some(entry) = self.tab_mut_if_epoch(tab_id, epoch) {
                         let generation = entry.next_generation();
-                        let frame_durations: Vec<Duration> =
-                            decoded.frames.iter().map(|f| f.delay).collect();
                         let initial_frame = if decoded.frames.len() > 1 {
                             let first = decoded.frames[0].frame.clone();
                             let first_delay = decoded.frames[0].delay;
@@ -1956,12 +2930,8 @@ impl MediaViewerBackend {
                             tab_id,
                             texture_key: texture_key_for_tab(tab_id),
                             generation,
-                            display_path,
-                            local_path,
                             metadata: decoded.metadata,
                             frame: initial_frame,
-                            frame_durations,
-                            texture_dirty: true,
                         });
                     }
                 }
@@ -1972,8 +2942,7 @@ impl MediaViewerBackend {
                     poster_frame,
                 } => {
                     if let Some(entry) = self.tab_mut_if_epoch(tab_id, epoch) {
-                        let texture_dirty = poster_frame.is_some();
-                        let generation = if texture_dirty {
+                        let generation = if poster_frame.is_some() {
                             entry.next_generation()
                         } else {
                             entry.generation
@@ -1998,7 +2967,6 @@ impl MediaViewerBackend {
                             metadata,
                             poster_frame,
                             state,
-                            texture_dirty,
                         });
                     }
                 }
@@ -2022,23 +2990,84 @@ impl MediaViewerBackend {
                                     position_secs,
                                     frame,
                                     state,
-                                    texture_dirty: true,
                                 });
                             }
+                        }
+                    }
+                }
+                WorkerResult::Audio {
+                    tab_id,
+                    epoch,
+                    metadata,
+                } => {
+                    if let Some(entry) = self.tab_mut_if_epoch(tab_id, epoch) {
+                        let audio_state = AudioTabState {
+                            metadata: metadata.clone(),
+                            playing: false,
+                            position_secs: 0.0,
+                            muted: false,
+                            looping: false,
+                            ended: false,
+                            playback: None,
+                        };
+                        let state = audio_state.snapshot();
+                        entry.audio = Some(audio_state);
+                        out.push(MediaEvent::AudioLoaded {
+                            tab_id,
+                            metadata,
+                            state,
+                        });
+                    }
+                }
+                WorkerResult::Pdf {
+                    tab_id,
+                    epoch,
+                    metadata,
+                    page_frame,
+                    is_page_turn,
+                } => {
+                    if let Some(entry) = self.tab_mut_if_epoch(tab_id, epoch) {
+                        let generation = if page_frame.is_some() {
+                            entry.next_generation()
+                        } else {
+                            entry.generation
+                        };
+                        entry.pdf = Some(PdfTabState {
+                            display_path: metadata.display_path.clone(),
+                            local_path: metadata.local_path.clone(),
+                            page_count: metadata.page_count,
+                            current_page: metadata.current_page,
+                        });
+                        if is_page_turn {
+                            out.push(MediaEvent::PdfPageLoaded {
+                                tab_id,
+                                texture_key: texture_key_for_tab(tab_id),
+                                generation,
+                                metadata,
+                                page_frame,
+                            });
+                        } else {
+                            out.push(MediaEvent::PdfLoaded {
+                                tab_id,
+                                texture_key: texture_key_for_tab(tab_id),
+                                generation,
+                                metadata,
+                                page_frame,
+                            });
                         }
                     }
                 }
                 WorkerResult::Error {
                     tab_id,
                     epoch,
-                    display_path,
                     error,
+                    is_reload,
                 } => {
                     if self.tab_matches_epoch(tab_id, epoch) {
                         out.push(MediaEvent::LoadError {
                             tab_id,
-                            display_path,
                             error,
+                            is_reload,
                         });
                     }
                 }
@@ -2047,7 +3076,7 @@ impl MediaViewerBackend {
 
         // 2. Advance animated GIF/WebP frames whose presentation deadline has elapsed.
         for (&tab_id, entry) in &mut self.tabs {
-            let mut next_frame: Option<(usize, usize, RgbaFrame)> = None;
+            let mut next_frame: Option<RgbaFrame> = None;
             if let Some(anim) = entry.animation.as_mut()
                 && now >= anim.next_frame_at
                 && anim.frames.len() > 1
@@ -2055,23 +3084,20 @@ impl MediaViewerBackend {
                 anim.current_index = (anim.current_index + 1) % anim.frames.len();
                 let current = &anim.frames[anim.current_index];
                 anim.next_frame_at = now + current.delay;
-                next_frame = Some((anim.current_index, anim.frames.len(), current.frame.clone()));
+                next_frame = Some(current.frame.clone());
             }
-            if let Some((frame_index, frame_count, frame)) = next_frame {
+            if let Some(frame) = next_frame {
                 let generation = entry.next_generation();
                 out.push(MediaEvent::AnimationFrame {
-                    tab_id,
                     texture_key: texture_key_for_tab(tab_id),
                     generation,
-                    frame_index,
-                    frame_count,
                     frame,
-                    texture_dirty: true,
                 });
             }
         }
 
-        // 3. Drain latest video frames & EOF/state changes from active playback slots.
+        // 3. Drain latest video frames & EOF/state changes from active playback slots,
+        // and advance active audio playheads.
         for (&tab_id, entry) in &mut self.tabs {
             let mut emit_frame: Option<(RgbaFrame, f64, VideoPlaybackState)> = None;
             let mut emit_state_change: Option<VideoPlaybackState> = None;
@@ -2117,11 +3143,19 @@ impl MediaViewerBackend {
                     position_secs,
                     frame,
                     state,
-                    texture_dirty: true,
                 });
             }
             if let Some(state) = emit_state_change {
                 out.push(MediaEvent::VideoStateChanged { tab_id, state });
+            }
+
+            if let Some(audio) = entry.audio.as_mut()
+                && audio.tick()
+            {
+                out.push(MediaEvent::AudioStateChanged {
+                    tab_id,
+                    state: audio.snapshot(),
+                });
             }
         }
 
@@ -2192,8 +3226,6 @@ impl MediaViewerBackend {
     }
 
     /// Seeks video playback for `tab_id` to `position_secs`.
-    /// - If currently playing, seamlessly restarts streaming `ffmpeg` + audio from `position_secs`.
-    /// - If paused, asynchronously extracts a single RGBA8 preview frame at `position_secs`.
     pub fn video_seek(&mut self, tab_id: ViewerTabId, position_secs: f64) -> bool {
         let Some(entry) = self.tabs.get_mut(&tab_id) else {
             return false;
@@ -2225,7 +3257,6 @@ impl MediaViewerBackend {
             video.playing = true;
             video.playback = Some(playback);
         } else {
-            // Decode a single preview frame in the background so scrubbing while paused updates live.
             let path = video.metadata.local_path.clone();
             let rw = video.metadata.render_width;
             let rh = video.metadata.render_height;
@@ -2311,22 +3342,214 @@ impl MediaViewerBackend {
             .map(VideoTabState::snapshot)
     }
 
-    /// Closes `tab_id`, stopping any active video playback / animation and reaping child processes.
+    /// Starts or resumes audio playback for `tab_id`. Restarts from `0.0` if previously ended.
+    pub fn audio_play(&mut self, tab_id: ViewerTabId) -> bool {
+        let Some(entry) = self.tabs.get_mut(&tab_id) else {
+            return false;
+        };
+        let Some(audio) = entry.audio.as_mut() else {
+            return false;
+        };
+        if audio.playing {
+            return true;
+        }
+        if audio.ended {
+            audio.position_secs = 0.0;
+            audio.ended = false;
+        }
+        audio.playback = Some(ActiveAudioPlayback::start(
+            &audio.metadata.local_path,
+            audio.position_secs,
+            audio.muted,
+        ));
+        audio.playing = true;
+        let state = audio.snapshot();
+        self.pending_events
+            .push(MediaEvent::AudioStateChanged { tab_id, state });
+        true
+    }
+
+    /// Pauses audio playback for `tab_id`, immediately reaping any spawned player child.
+    pub fn audio_pause(&mut self, tab_id: ViewerTabId) -> bool {
+        let Some(entry) = self.tabs.get_mut(&tab_id) else {
+            return false;
+        };
+        let Some(audio) = entry.audio.as_mut() else {
+            return false;
+        };
+        if !audio.playing && audio.playback.is_none() {
+            return true;
+        }
+        audio.stop_playback();
+        let state = audio.snapshot();
+        self.pending_events
+            .push(MediaEvent::AudioStateChanged { tab_id, state });
+        true
+    }
+
+    /// Toggles audio playback between playing and paused for `tab_id`.
+    pub fn audio_toggle_play(&mut self, tab_id: ViewerTabId) -> bool {
+        let is_playing = self
+            .tabs
+            .get(&tab_id)
+            .and_then(|e| e.audio.as_ref())
+            .is_some_and(|a| a.playing);
+        if is_playing {
+            self.audio_pause(tab_id)
+        } else {
+            self.audio_play(tab_id)
+        }
+    }
+
+    /// Seeks audio playback for `tab_id` to `position_secs`.
+    pub fn audio_seek(&mut self, tab_id: ViewerTabId, position_secs: f64) -> bool {
+        let Some(entry) = self.tabs.get_mut(&tab_id) else {
+            return false;
+        };
+        let Some(audio) = entry.audio.as_mut() else {
+            return false;
+        };
+        let clamped = if audio.metadata.duration_secs > 0.0 {
+            position_secs.clamp(0.0, audio.metadata.duration_secs)
+        } else {
+            position_secs.max(0.0)
+        };
+        let was_playing = audio.playing;
+        audio.stop_playback();
+        audio.position_secs = clamped;
+        audio.ended = false;
+        if was_playing {
+            audio.playback = Some(ActiveAudioPlayback::start(
+                &audio.metadata.local_path,
+                clamped,
+                audio.muted,
+            ));
+            audio.playing = true;
+        }
+        let state = audio.snapshot();
+        self.pending_events
+            .push(MediaEvent::AudioStateChanged { tab_id, state });
+        true
+    }
+
+    /// Mutes or unmutes audio playback for `tab_id`.
+    pub fn audio_set_muted(&mut self, tab_id: ViewerTabId, muted: bool) -> bool {
+        let Some(entry) = self.tabs.get_mut(&tab_id) else {
+            return false;
+        };
+        let Some(audio) = entry.audio.as_mut() else {
+            return false;
+        };
+        audio.muted = muted;
+        if audio.playing {
+            let pos = audio
+                .playback
+                .as_ref()
+                .map_or(audio.position_secs, ActiveAudioPlayback::current_position);
+            audio.stop_playback();
+            audio.position_secs = pos;
+            audio.playback = Some(ActiveAudioPlayback::start(
+                &audio.metadata.local_path,
+                pos,
+                muted,
+            ));
+            audio.playing = true;
+        }
+        let state = audio.snapshot();
+        self.pending_events
+            .push(MediaEvent::AudioStateChanged { tab_id, state });
+        true
+    }
+
+    /// Enables or disables looping for audio tab `tab_id`.
+    pub fn audio_set_loop(&mut self, tab_id: ViewerTabId, looping: bool) -> bool {
+        let Some(entry) = self.tabs.get_mut(&tab_id) else {
+            return false;
+        };
+        let Some(audio) = entry.audio.as_mut() else {
+            return false;
+        };
+        audio.looping = looping;
+        let state = audio.snapshot();
+        self.pending_events
+            .push(MediaEvent::AudioStateChanged { tab_id, state });
+        true
+    }
+
+    /// Returns the current [`AudioPlaybackState`] snapshot for `tab_id`, if loaded.
+    pub fn audio_state(&self, tab_id: ViewerTabId) -> Option<AudioPlaybackState> {
+        self.tabs
+            .get(&tab_id)
+            .and_then(|e| e.audio.as_ref())
+            .map(AudioTabState::snapshot)
+    }
+
+    /// Asynchronously renders and extracts `page` (1-based) for an open PDF tab.
+    pub fn pdf_goto_page(&mut self, tab_id: ViewerTabId, page: usize) -> bool {
+        let Some(entry) = self.tabs.get_mut(&tab_id) else {
+            return false;
+        };
+        let Some(pdf) = entry.pdf.as_mut() else {
+            return false;
+        };
+        let target = page.clamp(1, pdf.page_count.max(1));
+        if target == pdf.current_page {
+            return false;
+        }
+        pdf.current_page = target;
+        let path = pdf.local_path.clone();
+        let display_path = pdf.display_path.clone();
+        let epoch = entry.epoch;
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending_loads);
+        let waker = self.waker.clone();
+        pending.fetch_add(1, Ordering::SeqCst);
+
+        let _ = thread::Builder::new()
+            .name("omarex-pdf-page".to_owned())
+            .spawn(move || {
+                let res = match load_pdf_document_page(&path, Some(&display_path), target) {
+                    Ok((metadata, page_frame)) => WorkerResult::Pdf {
+                        tab_id,
+                        epoch,
+                        metadata,
+                        page_frame,
+                        is_page_turn: true,
+                    },
+                    Err(error) => WorkerResult::Error {
+                        tab_id,
+                        epoch,
+                        error,
+                        is_reload: false,
+                    },
+                };
+                pending.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(res);
+                if let Some(wake) = waker {
+                    wake();
+                }
+            });
+        true
+    }
+
+    /// Closes `tab_id`, stopping any active video/audio playback, animation, and `notify` watch.
     pub fn close_tab(&mut self, tab_id: ViewerTabId) {
+        self.watcher.unwatch_tab(tab_id);
         if let Some(mut entry) = self.tabs.remove(&tab_id) {
             entry.stop_media();
         }
     }
 
-    /// Closes all tabs and stops all active media workers/processes.
+    /// Closes all tabs and stops all active media workers, processes, and `notify` watches.
     pub fn close_all(&mut self) {
+        self.watcher.unwatch_all();
         for (_, mut entry) in self.tabs.drain() {
             entry.stop_media();
         }
     }
 
     /// Returns the earliest [`Instant`] at which the `winit` event loop should wake up to display
-    /// the next animated image or video frame (or collect pending async loads).
+    /// the next animated image, video frame, audio playhead tick, debounced reload, or pending load.
     /// Returns `None` when completely idle so `winit` can sleep with 0% CPU usage.
     pub fn next_wakeup_instant(&self) -> Option<Instant> {
         let mut earliest: Option<Instant> = None;
@@ -2339,6 +3562,13 @@ impl MediaViewerBackend {
             earliest = Some(Instant::now() + PENDING_LOAD_WAKEUP_INTERVAL);
         }
 
+        if let Some(reload_at) = self.watcher.earliest_deadline() {
+            earliest = Some(match earliest {
+                Some(prev) => prev.min(reload_at),
+                None => reload_at,
+            });
+        }
+
         for entry in self.tabs.values() {
             if let Some(anim) = entry.animation.as_ref()
                 && anim.frames.len() > 1
@@ -2346,6 +3576,15 @@ impl MediaViewerBackend {
                 earliest = Some(match earliest {
                     Some(prev) => prev.min(anim.next_frame_at),
                     None => anim.next_frame_at,
+                });
+            }
+            if let Some(audio) = entry.audio.as_ref()
+                && audio.playing
+            {
+                let due = Instant::now() + AUDIO_PLAYBACK_WAKEUP_INTERVAL;
+                earliest = Some(match earliest {
+                    Some(prev) => prev.min(due),
+                    None => due,
                 });
             }
             if let Some(video) = entry.video.as_ref()
@@ -2368,17 +3607,26 @@ impl MediaViewerBackend {
         earliest
     }
 
-    /// Returns `true` if any tab has active video playback or an animated image running.
+    /// Returns `true` if any tab has active video/audio playback or an animated image running.
+    #[cfg(test)]
     pub fn has_active_playback(&self) -> bool {
         self.tabs.values().any(|entry| {
             entry.animation.as_ref().is_some_and(|a| a.frames.len() > 1)
                 || entry.video.as_ref().is_some_and(|v| v.playing)
+                || entry.audio.as_ref().is_some_and(|a| a.playing)
         })
     }
 
     /// Returns the number of tracked tabs currently open in the backend.
+    #[cfg(test)]
     pub fn active_tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    /// Returns the number of distinct parent directories actively watched via `notify`.
+    #[cfg(test)]
+    pub fn watched_dir_count(&self) -> usize {
+        self.watcher.watched_dir_count()
     }
 
     fn reset_tab_epoch(&mut self, tab_id: ViewerTabId) -> u64 {
@@ -2408,6 +3656,8 @@ impl MediaViewerBackend {
         display_path: String,
         local_path: PathBuf,
         kind: MediaKind,
+        initial_page: usize,
+        is_reload: bool,
     ) {
         let epoch = self.reset_tab_epoch(tab_id);
         let tx = self.tx.clone();
@@ -2418,7 +3668,15 @@ impl MediaViewerBackend {
         let _ = thread::Builder::new()
             .name("omarex-media-load".to_owned())
             .spawn(move || {
-                let res = execute_load(tab_id, epoch, display_path, local_path, kind);
+                let res = execute_load(
+                    tab_id,
+                    epoch,
+                    display_path,
+                    local_path,
+                    kind,
+                    initial_page,
+                    is_reload,
+                );
                 pending.fetch_sub(1, Ordering::SeqCst);
                 let _ = tx.send(res);
                 if let Some(wake) = waker {
@@ -2440,36 +3698,44 @@ fn execute_load(
     display_path: String,
     local_path: PathBuf,
     kind: MediaKind,
+    initial_page: usize,
+    is_reload: bool,
 ) -> WorkerResult {
     let resolved = kind.resolve(&local_path);
     match resolved {
         MediaKind::Text | MediaKind::Auto => match load_text_file(&local_path, Some(&display_path))
         {
-            Ok(content) => WorkerResult::Text {
-                tab_id,
-                epoch,
-                content,
-            },
+            Ok(mut content) => {
+                if is_markdown_path(&local_path, &display_path) {
+                    content.inline_images =
+                        extract_inline_markdown_images(&local_path, &content.lines);
+                }
+                content.git_diff = compute_git_diff(&local_path);
+                WorkerResult::Text {
+                    tab_id,
+                    epoch,
+                    content,
+                    is_reload,
+                }
+            }
             Err(error) => WorkerResult::Error {
                 tab_id,
                 epoch,
-                display_path,
                 error,
+                is_reload,
             },
         },
         MediaKind::Image => match decode_image_file(&local_path) {
             Ok(decoded) => WorkerResult::Image {
                 tab_id,
                 epoch,
-                display_path,
-                local_path,
                 decoded,
             },
             Err(error) => WorkerResult::Error {
                 tab_id,
                 epoch,
-                display_path,
                 error,
+                is_reload,
             },
         },
         MediaKind::Video => match probe_video_metadata(&local_path, Some(&display_path)) {
@@ -2491,10 +3757,42 @@ fn execute_load(
             Err(error) => WorkerResult::Error {
                 tab_id,
                 epoch,
-                display_path,
                 error,
+                is_reload,
             },
         },
+        MediaKind::Audio => {
+            match probe_audio_metadata_and_peaks(&local_path, Some(&display_path)) {
+                Ok(metadata) => WorkerResult::Audio {
+                    tab_id,
+                    epoch,
+                    metadata,
+                },
+                Err(error) => WorkerResult::Error {
+                    tab_id,
+                    epoch,
+                    error,
+                    is_reload,
+                },
+            }
+        }
+        MediaKind::Pdf => {
+            match load_pdf_document_page(&local_path, Some(&display_path), initial_page) {
+                Ok((metadata, page_frame)) => WorkerResult::Pdf {
+                    tab_id,
+                    epoch,
+                    metadata,
+                    page_frame,
+                    is_page_turn: false,
+                },
+                Err(error) => WorkerResult::Error {
+                    tab_id,
+                    epoch,
+                    error,
+                    is_reload,
+                },
+            }
+        }
     }
 }
 
@@ -2546,6 +3844,26 @@ mod tests {
         None
     }
 
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn ffprobe_available() -> bool {
+        Command::new("ffprobe")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     #[test]
     fn text_loader_handles_utf8_crlf_and_lossy_fallback() {
         let tmp = TempDirGuard::new("text");
@@ -2557,13 +3875,10 @@ mod tests {
         .unwrap();
 
         let loaded = load_text_file(&utf8_path, None).expect("load utf8 text");
-        assert!(!loaded.is_binary);
-        assert!(!loaded.lossy_utf8);
-        assert!(!loaded.truncated);
         assert_eq!(loaded.lines.len(), 3);
         assert_eq!(loaded.lines[0], "fn main() {");
         assert_eq!(loaded.lines[1], "    println!(\"Grüße 🚀\");");
-        assert!(loaded.modified_unix_secs.is_some());
+        assert_eq!(loaded.lines[2], "}");
 
         // Single invalid UTF-8 byte in an otherwise valid text file -> lossy UTF-8, NOT binary.
         let lossy_path = tmp.path.join("latin1.txt");
@@ -2572,9 +3887,8 @@ mod tests {
         raw.extend_from_slice(b" end\n");
         fs::write(&lossy_path, &raw).unwrap();
 
+        assert!(!is_likely_binary(&raw));
         let lossy = load_text_file(&lossy_path, None).expect("load lossy text");
-        assert!(!lossy.is_binary);
-        assert!(lossy.lossy_utf8);
         assert!(lossy.lines[1].contains('\u{FFFD}'));
     }
 
@@ -2592,7 +3906,6 @@ mod tests {
         ));
 
         let loaded = load_text_file(&bin_path, None).expect("load binary");
-        assert!(loaded.is_binary);
         assert!(!loaded.lines.is_empty());
         assert!(loaded.lines[0].contains("Binary file"));
         assert!(loaded.lines[1].contains("7f 45 4c 46"));
@@ -2612,8 +3925,7 @@ mod tests {
         assert_eq!(decoded_png.metadata.width, 16);
         assert_eq!(decoded_png.metadata.height, 10);
         assert_eq!(decoded_png.metadata.format_label, "PNG");
-        assert_eq!(decoded_png.metadata.frame_count, 1);
-        assert!(!decoded_png.metadata.is_animated);
+        assert_eq!(decoded_png.frames.len(), 1);
         let idx = ((4 * 16) + 3) * 4;
         assert_eq!(
             &decoded_png.frames[0].frame.rgba[idx..idx + 4],
@@ -2657,8 +3969,7 @@ mod tests {
         }
 
         let decoded_gif = decode_image_file(&gif_path).expect("decode gif");
-        assert_eq!(decoded_gif.metadata.frame_count, 2);
-        assert!(decoded_gif.metadata.is_animated);
+        assert_eq!(decoded_gif.frames.len(), 2);
         assert_eq!(decoded_gif.metadata.format_label, "GIF (Animated)");
         assert_eq!(decoded_gif.frames[0].delay, Duration::from_millis(60));
         assert_eq!(decoded_gif.frames[1].delay, Duration::from_millis(120));
@@ -2674,7 +3985,7 @@ mod tests {
         assert_eq!(decoded.metadata.width, 64);
         assert_eq!(decoded.metadata.height, 32);
         assert_eq!(decoded.metadata.format_label, "SVG");
-        assert_eq!(decoded.metadata.frame_count, 1);
+        assert_eq!(decoded.frames.len(), 1);
         assert_eq!(decoded.frames[0].frame.rgba.len(), 64 * 32 * 4);
         // Center pixel should be #22aa44ff.
         let center = ((16 * 64) + 32) * 4;
@@ -2685,21 +3996,26 @@ mod tests {
     }
 
     #[test]
-    fn backend_async_load_and_remote_bytes_ingestion_work() {
+    fn backend_async_load_and_remote_file_ingestion_work() {
         let tmp = TempDirGuard::new("backend");
         let txt_path = tmp.path.join("hello.md");
         fs::write(&txt_path, "# Title\nBody line").unwrap();
 
         let wake_count = Arc::new(AtomicUsize::new(0));
         let wake_clone = Arc::clone(&wake_count);
-        let mut backend = MediaViewerBackend::with_waker(Arc::new(move || {
+        let mut backend = MediaViewerBackend::new();
+        backend.set_waker(Arc::new(move || {
             wake_clone.fetch_add(1, Ordering::SeqCst);
         }));
 
         backend.request_load_local(1, &txt_path, MediaKind::Auto);
         let ev = wait_for_event(&mut backend, Duration::from_secs(3)).expect("text event");
         match ev {
-            MediaEvent::TextLoaded { tab_id, content } => {
+            MediaEvent::TextLoaded {
+                tab_id,
+                content,
+                is_reload: false,
+            } => {
                 assert_eq!(tab_id, 1);
                 assert_eq!(content.lines, vec!["# Title", "Body line"]);
             }
@@ -2707,33 +4023,34 @@ mod tests {
         }
         assert!(wake_count.load(Ordering::SeqCst) >= 1);
 
-        // Remote bytes ingestion caches into ~/.cache/omarex/viewer-remote/ and preserves display_path.
+        // Remote file ingestion decodes a downloaded file while preserving display_path context.
         let svg_bytes =
-            br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="6" fill="red"/></svg>"#
-                .to_vec();
-        backend.ingest_remote_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="6" fill="red"/></svg>"#;
+        let cached_svg = tmp.path.join("remote_icon.svg");
+        fs::write(&cached_svg, svg_bytes).unwrap();
+        assert!(
+            viewer_remote_cache_dir()
+                .to_string_lossy()
+                .contains("viewer-remote")
+        );
+        backend.ingest_remote_file(
             2,
-            "mac-mini",
             "/Users/mike/Pictures/icon.svg",
-            svg_bytes,
+            &cached_svg,
             MediaKind::Image,
         );
         let ev2 = wait_for_event(&mut backend, Duration::from_secs(3)).expect("remote image");
         match ev2 {
             MediaEvent::ImageLoaded {
                 tab_id,
-                display_path,
-                local_path,
                 metadata,
-                texture_dirty,
+                frame,
                 ..
             } => {
                 assert_eq!(tab_id, 2);
-                assert_eq!(display_path, "/Users/mike/Pictures/icon.svg");
-                assert!(local_path.starts_with(viewer_remote_cache_dir()));
                 assert_eq!(metadata.format_label, "SVG");
-                assert!(texture_dirty);
-                let _ = fs::remove_file(&local_path);
+                assert_eq!(frame.width, 16);
+                assert_eq!(frame.height, 16);
             }
             other => panic!("expected ImageLoaded, got {other:?}"),
         }
@@ -2802,12 +4119,10 @@ mod tests {
             MediaEvent::VideoLoaded {
                 tab_id,
                 poster_frame,
-                texture_dirty,
                 metadata,
                 ..
             } => {
                 assert_eq!(tab_id, 42);
-                assert!(texture_dirty);
                 assert_eq!(metadata.width, 64);
                 let poster = poster_frame.expect("first-frame poster RGBA");
                 assert_eq!(poster.width, 64);
@@ -2831,15 +4146,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(4);
         while Instant::now() < deadline {
             for ev in backend.poll_events() {
-                if let MediaEvent::VideoFrame {
-                    tab_id,
-                    frame,
-                    texture_dirty,
-                    ..
-                } = ev
-                {
+                if let MediaEvent::VideoFrame { tab_id, frame, .. } = ev {
                     assert_eq!(tab_id, 42);
-                    assert!(texture_dirty);
                     assert_eq!(frame.rgba.len(), 64 * 48 * 4);
                     got_video_frame = true;
                 }
@@ -2917,19 +4225,19 @@ mod tests {
         backend.request_load_local(7, &gif_path, MediaKind::Image);
 
         let loaded = wait_for_event(&mut backend, Duration::from_secs(3)).expect("gif loaded");
-        match loaded {
+        let loaded_gen = match loaded {
             MediaEvent::ImageLoaded {
                 tab_id,
+                generation,
                 metadata,
-                frame_durations,
                 ..
             } => {
                 assert_eq!(tab_id, 7);
-                assert!(metadata.is_animated);
-                assert_eq!(frame_durations.len(), 2);
+                assert_eq!(metadata.format_label, "GIF (Animated)");
+                generation
             }
             other => panic!("expected ImageLoaded, got {other:?}"),
-        }
+        };
 
         assert!(backend.has_active_playback());
         assert!(backend.next_wakeup_instant().is_some());
@@ -2939,17 +4247,15 @@ mod tests {
         while Instant::now() < deadline {
             for ev in backend.poll_events() {
                 if let MediaEvent::AnimationFrame {
-                    tab_id,
-                    frame_index,
-                    frame_count,
-                    texture_dirty,
-                    ..
+                    texture_key,
+                    generation,
+                    frame,
                 } = ev
                 {
-                    assert_eq!(tab_id, 7);
-                    assert_eq!(frame_index, 1);
-                    assert_eq!(frame_count, 2);
-                    assert!(texture_dirty);
+                    assert_eq!(texture_key, texture_key_for_tab(7));
+                    assert!(generation > loaded_gen);
+                    assert_eq!(frame.width, 4);
+                    assert_eq!(frame.height, 4);
                     saw_next_frame = true;
                 }
             }
@@ -3039,5 +4345,419 @@ mod tests {
             other => panic!("expected VideoLoaded, got {other:?}"),
         }
         backend.close_tab(99);
+    }
+
+    fn build_two_page_test_pdf() -> Vec<u8> {
+        // Minimal valid 2-page PDF with distinct visual content on Page 1 (large black block)
+        // vs Page 2 (small right-side rectangle) so `pdftoppm` renders visibly distinct PNGs.
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+
+        let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+        let obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>\nendobj\n";
+        let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n";
+        let stream1 = b"0 0 0 rg 10 10 180 80 re f\n";
+        let obj4 = format!(
+            "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+            stream1.len(),
+            std::str::from_utf8(stream1).unwrap()
+        );
+        let obj5 = b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 6 0 R >>\nendobj\n";
+        let stream2 = b"0.2 0.2 0.2 rg 20 120 140 60 re f\n";
+        let obj6 = format!(
+            "6 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+            stream2.len(),
+            std::str::from_utf8(stream2).unwrap()
+        );
+
+        let objects: [&[u8]; 6] = [obj1, obj2, obj3, obj4.as_bytes(), obj5, obj6.as_bytes()];
+        for o in objects {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(o);
+        }
+        let xref_pos = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn f10_notify_watches_in_place_atomic_rename_symlink_and_unwatches_cleanly() {
+        let tmp = TempDirGuard::new("notify_reload");
+        let file_a = tmp.path.join("watched.rs");
+        fs::write(&file_a, "fn v1() {}").unwrap();
+
+        let target_dir = tmp.path.join("real_dir");
+        fs::create_dir_all(&target_dir).unwrap();
+        let real_target = target_dir.join("target.txt");
+        fs::write(&real_target, "sym v1").unwrap();
+        let link_path = tmp.path.join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &link_path).unwrap();
+
+        let mut backend = MediaViewerBackend::new();
+        backend.request_load_local(1, &file_a, MediaKind::Text);
+        match wait_for_event(&mut backend, Duration::from_secs(3)).expect("initial load") {
+            MediaEvent::TextLoaded {
+                content, is_reload, ..
+            } => {
+                assert!(!is_reload);
+                assert_eq!(content.lines, vec!["fn v1() {}"]);
+            }
+            other => panic!("expected TextLoaded, got {other:?}"),
+        }
+        assert_eq!(backend.watched_dir_count(), 1);
+
+        // 1. In-place modification triggers debounced `is_reload == true`.
+        fs::write(&file_a, "fn v2() {}").unwrap();
+        let ev1 = wait_for_event(&mut backend, Duration::from_secs(3)).expect("in-place reload");
+        match ev1 {
+            MediaEvent::TextLoaded {
+                content, is_reload, ..
+            } => {
+                assert!(is_reload);
+                assert_eq!(content.lines, vec!["fn v2() {}"]);
+            }
+            other => panic!("expected reload TextLoaded, got {other:?}"),
+        }
+
+        // 2. Atomic write-temp + rename (`sed -i` / `vim` pattern) triggers reload.
+        let tmp_write = tmp.path.join("watched.rs.tmp");
+        fs::write(&tmp_write, "fn v3() {}").unwrap();
+        fs::rename(&tmp_write, &file_a).unwrap();
+        let ev2 = wait_for_event(&mut backend, Duration::from_secs(3)).expect("rename reload");
+        match ev2 {
+            MediaEvent::TextLoaded {
+                content, is_reload, ..
+            } => {
+                assert!(is_reload);
+                assert_eq!(content.lines, vec!["fn v3() {}"]);
+            }
+            other => panic!("expected rename reload TextLoaded, got {other:?}"),
+        }
+
+        // 3. Symlink watches target parent dir too and reloads when target edits.
+        #[cfg(unix)]
+        {
+            backend.request_load_local(2, &link_path, MediaKind::Text);
+            let _ = wait_for_event(&mut backend, Duration::from_secs(3)).expect("symlink load");
+            assert_eq!(backend.watched_dir_count(), 2);
+            fs::write(&real_target, "sym v2").unwrap();
+            let ev3 = wait_for_event(&mut backend, Duration::from_secs(3)).expect("symlink reload");
+            match ev3 {
+                MediaEvent::TextLoaded {
+                    tab_id,
+                    content,
+                    is_reload,
+                } => {
+                    assert_eq!(tab_id, 2);
+                    assert!(is_reload);
+                    assert_eq!(content.lines, vec!["sym v2"]);
+                }
+                other => panic!("expected symlink reload, got {other:?}"),
+            }
+            backend.close_tab(2);
+            assert_eq!(backend.watched_dir_count(), 1);
+        }
+
+        backend.close_tab(1);
+        assert_eq!(backend.watched_dir_count(), 0);
+    }
+
+    #[test]
+    fn f11_compute_git_diff_handles_staged_unstaged_untracked_and_non_git() {
+        let non_git = TempDirGuard::new("non_git_diff");
+        let plain_file = non_git.path.join("plain.rs");
+        fs::write(&plain_file, "fn main() {}\n").unwrap();
+        assert!(compute_git_diff(&plain_file).is_none());
+
+        let repo = TempDirGuard::new("git_diff");
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo.path)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test User"]);
+
+        let tracked = repo.path.join("lib.rs");
+        fs::write(&tracked, "line1\nline2\nline3\n").unwrap();
+        run_git(&["add", "lib.rs"]);
+        run_git(&["commit", "-m", "initial"]);
+
+        // Clean tracked file -> None.
+        assert!(compute_git_diff(&tracked).is_none());
+
+        // Untracked file -> `is_untracked == true` with ZERO spurious diff hunks!
+        let untracked = repo.path.join("scratch.rs");
+        fs::write(&untracked, "fn new_untracked() {}\n").unwrap();
+        let u_diff = compute_git_diff(&untracked).expect("untracked git status");
+        assert!(u_diff.is_untracked);
+        assert!(u_diff.hunks.is_empty());
+
+        // Unstaged modification.
+        fs::write(&tracked, "line1\nline2_edited\nline3\nline4_added\n").unwrap();
+        let m_diff = compute_git_diff(&tracked).expect("unstaged diff");
+        assert!(!m_diff.is_untracked);
+        assert!(m_diff.has_unstaged);
+        assert!(!m_diff.hunks.is_empty());
+        assert_eq!(
+            m_diff.line_marks.get(&2),
+            Some(&DiffGutterKind::UnstagedModified)
+        );
+        assert_eq!(
+            m_diff.line_marks.get(&4),
+            Some(&DiffGutterKind::UnstagedAdded)
+        );
+
+        // Staged modification.
+        run_git(&["add", "lib.rs"]);
+        let s_diff = compute_git_diff(&tracked).expect("staged diff");
+        assert!(s_diff.has_staged);
+        assert!(!s_diff.has_unstaged);
+        assert_eq!(
+            s_diff.line_marks.get(&2),
+            Some(&DiffGutterKind::StagedModified)
+        );
+    }
+
+    #[test]
+    fn f13_markdown_loader_extracts_inline_local_images() {
+        let tmp = TempDirGuard::new("md_inline_img");
+        let img_path = tmp.path.join("diagram.png");
+        let img = RgbaImage::from_pixel(24, 12, Rgba([40, 180, 90, 255]));
+        DynamicImage::ImageRgba8(img)
+            .save_with_format(&img_path, ImageFormat::Png)
+            .unwrap();
+
+        let md_path = tmp.path.join("notes.md");
+        fs::write(
+            &md_path,
+            "# Notes\n\n![Diag](diagram.png)\n![Miss](nope.png)\n",
+        )
+        .unwrap();
+
+        let mut backend = MediaViewerBackend::new();
+        backend.request_load_local(10, &md_path, MediaKind::Text);
+        match wait_for_event(&mut backend, Duration::from_secs(3)).expect("md load") {
+            MediaEvent::TextLoaded { content, .. } => {
+                assert_eq!(content.inline_images.len(), 1);
+                assert_eq!(content.inline_images[0].src, "diagram.png");
+                assert_eq!(content.inline_images[0].width, 24);
+                assert_eq!(content.inline_images[0].height, 12);
+            }
+            other => panic!("expected TextLoaded, got {other:?}"),
+        }
+        backend.close_tab(10);
+    }
+
+    #[test]
+    fn f14_audio_probe_96_peaks_and_empty_corrupt_safety() {
+        let tmp = TempDirGuard::new("audio_probe");
+        let empty_wav = tmp.path.join("empty.wav");
+        fs::write(&empty_wav, b"").unwrap();
+        let err_empty = probe_audio_metadata_and_peaks(&empty_wav, None).unwrap_err();
+        assert!(err_empty.contains("empty"));
+
+        let corrupt_wav = tmp.path.join("corrupt.wav");
+        fs::write(&corrupt_wav, b"NOT_A_WAV_FILE").unwrap();
+        assert!(probe_audio_metadata_and_peaks(&corrupt_wav, None).is_err());
+
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        let wav_path = tmp.path.join("tone.wav");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.4",
+            ])
+            .arg(&wav_path)
+            .status()
+            .expect("generate wav");
+        assert!(status.success());
+
+        let mut backend = MediaViewerBackend::new();
+        backend.request_load_local(20, &wav_path, MediaKind::Audio);
+        match wait_for_event(&mut backend, Duration::from_secs(5)).expect("audio loaded") {
+            MediaEvent::AudioLoaded {
+                tab_id,
+                metadata,
+                state,
+            } => {
+                assert_eq!(tab_id, 20);
+                assert_eq!(metadata.waveform_peaks.len(), 96);
+                assert!(metadata.waveform_peaks.iter().any(|&p| p > 0.1));
+                assert!(metadata.duration_secs > 0.2);
+                assert!(!state.playing);
+            }
+            other => panic!("expected AudioLoaded, got {other:?}"),
+        }
+        backend.close_tab(20);
+    }
+
+    #[test]
+    fn f14_pdf_2_page_distinct_pixels_and_empty_corrupt_safety() {
+        let tmp = TempDirGuard::new("pdf_probe");
+        let empty_pdf = tmp.path.join("empty.pdf");
+        fs::write(&empty_pdf, b"").unwrap();
+        assert!(load_pdf_document_page(&empty_pdf, None, 1).is_err());
+
+        let corrupt_pdf = tmp.path.join("corrupt.pdf");
+        fs::write(&corrupt_pdf, b"plain text pretending to be pdf").unwrap();
+        let err = load_pdf_document_page(&corrupt_pdf, None, 1).unwrap_err();
+        assert!(err.contains("%PDF-"));
+
+        if Command::new("pdfinfo").arg("-v").output().is_err()
+            || Command::new("pdftoppm").arg("-v").output().is_err()
+        {
+            return;
+        }
+
+        let pdf_path = tmp.path.join("sample.pdf");
+        fs::write(&pdf_path, build_two_page_test_pdf()).unwrap();
+
+        let mut backend = MediaViewerBackend::new();
+        backend.request_load_local_at(30, &pdf_path, MediaKind::Pdf, Some(2));
+        let frame2 = match wait_for_event(&mut backend, Duration::from_secs(5)).expect("pdf p2") {
+            MediaEvent::PdfLoaded {
+                tab_id,
+                metadata,
+                page_frame,
+                ..
+            } => {
+                assert_eq!(tab_id, 30);
+                assert_eq!(metadata.page_count, 2);
+                assert_eq!(metadata.current_page, 2);
+                page_frame.expect("rasterized page 2 frame")
+            }
+            other => panic!("expected PdfLoaded, got {other:?}"),
+        };
+
+        assert!(backend.pdf_goto_page(30, 1));
+        let frame1 = match wait_for_event(&mut backend, Duration::from_secs(5)).expect("pdf p1") {
+            MediaEvent::PdfPageLoaded {
+                metadata,
+                page_frame,
+                ..
+            } => {
+                assert_eq!(metadata.current_page, 1);
+                page_frame.expect("rasterized page 1 frame")
+            }
+            other => panic!("expected PdfPageLoaded, got {other:?}"),
+        };
+        assert_ne!(frame1.rgba, frame2.rgba);
+        backend.close_tab(30);
+    }
+
+    #[test]
+    fn f13_markdown_loader_handles_titles_parens_tildes_and_lists() {
+        let tmp = TempDirGuard::new("md_inline_r2");
+        for name in ["img(1).png", "titled.png", "inlist.png", "inquote.png"] {
+            let p = tmp.path.join(name);
+            let img = RgbaImage::from_pixel(16, 12, Rgba([40, 140, 220, 255]));
+            DynamicImage::ImageRgba8(img)
+                .save_with_format(&p, ImageFormat::Png)
+                .unwrap();
+        }
+        let md_path = tmp.path.join("r2.md");
+        fs::write(
+            &md_path,
+            "\
+![Paren](img(1).png)
+![Titled](titled.png \"Blue Title\")
+- List item with ![InList](inlist.png)
+> Quote with ![InQuote](inquote.png)
+
+~~~md
+![Ignored](img(1).png)
+~~~
+",
+        )
+        .unwrap();
+
+        let mut backend = MediaViewerBackend::new();
+        backend.request_load_local(11, &md_path, MediaKind::Text);
+        match wait_for_event(&mut backend, Duration::from_secs(3)).expect("md r2 load") {
+            MediaEvent::TextLoaded { content, .. } => {
+                let srcs: Vec<&str> = content
+                    .inline_images
+                    .iter()
+                    .map(|i| i.src.as_str())
+                    .collect();
+                assert_eq!(
+                    srcs,
+                    vec!["img(1).png", "titled.png", "inlist.png", "inquote.png"]
+                );
+            }
+            other => panic!("expected TextLoaded, got {other:?}"),
+        }
+        backend.close_tab(11);
+    }
+
+    #[test]
+    fn f10_delete_recreate_gap_emits_reload_error_and_recovers() {
+        let tmp = TempDirGuard::new("notify_delete_recreate");
+        let file_p = tmp.path.join("ephemeral.rs");
+        fs::write(&file_p, "fn original() {}").unwrap();
+
+        let mut backend = MediaViewerBackend::new();
+        backend.request_load_local(42, &file_p, MediaKind::Text);
+        match wait_for_event(&mut backend, Duration::from_secs(3)).expect("initial load") {
+            MediaEvent::TextLoaded { is_reload, .. } => assert!(!is_reload),
+            other => panic!("expected TextLoaded, got {other:?}"),
+        }
+
+        // Delete file and wait past the 60ms debounce so a reload LoadError fires.
+        fs::remove_file(&file_p).unwrap();
+        match wait_for_event(&mut backend, Duration::from_secs(3)).expect("reload error on delete")
+        {
+            MediaEvent::LoadError {
+                tab_id, is_reload, ..
+            } => {
+                assert_eq!(tab_id, 42);
+                assert!(is_reload);
+            }
+            other => panic!("expected LoadError(is_reload=true), got {other:?}"),
+        }
+
+        // Recreate file: watch remains active and delivers TextLoaded { is_reload: true }.
+        fs::write(&file_p, "fn recreated() {}").unwrap();
+        match wait_for_event(&mut backend, Duration::from_secs(3)).expect("reload after recreate") {
+            MediaEvent::TextLoaded {
+                tab_id,
+                content,
+                is_reload,
+            } => {
+                assert_eq!(tab_id, 42);
+                assert!(is_reload);
+                assert_eq!(content.lines, vec!["fn recreated() {}"]);
+            }
+            other => panic!("expected TextLoaded after recreate, got {other:?}"),
+        }
+        backend.close_tab(42);
     }
 }

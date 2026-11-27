@@ -68,12 +68,20 @@ fn default_translucent_alpha() -> f32 {
     0.90
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl WindowMaterial {
     pub fn to_theme_material(self) -> MaterialStyle {
         match self {
             Self::Classic => MaterialStyle::Classic,
             Self::Translucent { alpha } => MaterialStyle::Translucent {
-                alpha: alpha.clamp(0.5, 1.0),
+                alpha: if alpha.is_finite() {
+                    alpha.clamp(0.5, 1.0)
+                } else {
+                    default_translucent_alpha()
+                },
             },
         }
     }
@@ -109,6 +117,18 @@ pub struct UserSettings {
     pub fade_inactive_panes: bool,
     /// Adapt corner rounding to Hyprland's live `decoration:rounding`.
     pub adaptive_rounding: bool,
+    /// Tint the pane header with sampled fullscreen TUI program background colors.
+    #[serde(default = "default_true")]
+    pub program_color_header: bool,
+    /// Optional pinned Omarchy/built-in theme name (`None` or `"omarchy-live"` tracks live Omarchy).
+    #[serde(default)]
+    pub theme_name: Option<String>,
+    /// Subtle PipeWire micro-chimes on OSC 7501 `Blocked`/`Done` transitions.
+    #[serde(default = "default_true")]
+    pub chime_enabled: bool,
+    /// Desktop notifications for unfocused OSC 7501 / OSC 9/777 events.
+    #[serde(default = "default_true")]
+    pub desktop_notifications: bool,
     /// Surface material (`classic` vs `translucent`).
     pub material: WindowMaterial,
     /// Terminal font family (defaults to Omarchy's `JetBrainsMono Nerd Font`).
@@ -143,6 +163,10 @@ impl Default for UserSettings {
             highlight_active_border: true,
             fade_inactive_panes: false,
             adaptive_rounding: true,
+            program_color_header: true,
+            theme_name: None,
+            chime_enabled: true,
+            desktop_notifications: true,
             material: WindowMaterial::Classic,
             font_family: "JetBrainsMono Nerd Font".to_owned(),
             font_size_pt: 11.0,
@@ -169,11 +193,23 @@ impl UserSettings {
 
     /// Clamps numeric settings to safe runtime bounds.
     pub fn sanitize(&mut self) {
-        self.sidebar_width_px = self.sidebar_width_px.clamp(180.0, 380.0);
-        self.font_size_pt = self.font_size_pt.clamp(7.0, 36.0);
+        self.sidebar_width_px = if self.sidebar_width_px.is_finite() {
+            self.sidebar_width_px.clamp(180.0, 380.0)
+        } else {
+            248.0
+        };
+        self.font_size_pt = if self.font_size_pt.is_finite() {
+            self.font_size_pt.clamp(7.0, 36.0)
+        } else {
+            11.0
+        };
         self.warm_session_cache_limit = self.warm_session_cache_limit.clamp(1, 16);
         if let WindowMaterial::Translucent { alpha } = &mut self.material {
-            *alpha = alpha.clamp(0.5, 1.0);
+            *alpha = if alpha.is_finite() {
+                alpha.clamp(0.5, 1.0)
+            } else {
+                default_translucent_alpha()
+            };
         }
         if self.font_family.trim().is_empty() {
             self.font_family = "JetBrainsMono Nerd Font".to_owned();
@@ -268,6 +304,22 @@ impl UserSettings {
         }
     }
 
+    /// Sets notification mute state explicitly for `(host_id, session_id)`.
+    pub fn set_session_muted(&mut self, host_id: &str, session_id: &str, muted: bool) {
+        let key = format!("{host_id}/{session_id}");
+        if muted {
+            self.muted_sessions.insert(key);
+        } else {
+            self.muted_sessions.remove(&key);
+        }
+    }
+
+    /// Returns whether the entire session `(host_id, session_id)` is muted.
+    pub fn is_session_muted(&self, host_id: &str, session_id: &str) -> bool {
+        self.muted_sessions
+            .contains(&format!("{host_id}/{session_id}"))
+    }
+
     /// Toggle notification mute for `(host_id, block_id)`. Returns `true` if now muted.
     pub fn toggle_mute_block(&mut self, host_id: &str, block_id: &str) -> bool {
         let key = format!("{host_id}/{block_id}");
@@ -279,19 +331,38 @@ impl UserSettings {
         }
     }
 
+    /// Sets notification mute state explicitly for `(host_id, block_id)`.
+    pub fn set_block_muted(&mut self, host_id: &str, block_id: &str, muted: bool) {
+        let key = format!("{host_id}/{block_id}");
+        if muted {
+            self.muted_blocks.insert(key);
+        } else {
+            self.muted_blocks.remove(&key);
+        }
+    }
+
     pub fn is_muted(&self, host_id: &str, session_id: &str, block_id: &str) -> bool {
-        self.muted_sessions
-            .contains(&format!("{host_id}/{session_id}"))
+        self.is_session_muted(host_id, session_id)
             || self.muted_blocks.contains(&format!("{host_id}/{block_id}"))
     }
 
     pub fn increase_font(&mut self) -> f32 {
-        self.font_size_pt = (self.font_size_pt + 1.0).clamp(7.0, 36.0);
+        let base = if self.font_size_pt.is_finite() {
+            self.font_size_pt
+        } else {
+            11.0
+        };
+        self.font_size_pt = (base + 1.0).clamp(7.0, 36.0);
         self.font_size_pt
     }
 
     pub fn decrease_font(&mut self) -> f32 {
-        self.font_size_pt = (self.font_size_pt - 1.0).clamp(7.0, 36.0);
+        let base = if self.font_size_pt.is_finite() {
+            self.font_size_pt
+        } else {
+            11.0
+        };
+        self.font_size_pt = (base - 1.0).clamp(7.0, 36.0);
         self.font_size_pt
     }
 
@@ -320,6 +391,16 @@ mod tests {
         let path = temp_settings_path("roundtrip");
         let missing = UserSettings::load_from(&path).expect("missing file yields defaults");
         assert_eq!(missing, UserSettings::default());
+        assert!(missing.chime_enabled);
+        assert!(missing.desktop_notifications);
+        assert_eq!(missing.theme_name, None);
+
+        // Legacy JSON missing new M4 fields must deserialize with safe defaults.
+        let legacy: UserSettings =
+            serde_json::from_str(r#"{"font_size_pt": 13.0}"#).expect("legacy json");
+        assert!(legacy.chime_enabled);
+        assert!(legacy.desktop_notifications);
+        assert_eq!(legacy.theme_name, None);
         assert_eq!(missing.pane_header_mode, SavedPaneHeaderMode::Always);
 
         let mut cfg = UserSettings {
@@ -372,5 +453,47 @@ mod tests {
         assert!(loaded.is_muted("local", "session:1", "block:99"));
 
         let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn sanitize_resets_non_finite_float_fields_to_safe_defaults() {
+        let mut cfg = UserSettings {
+            sidebar_width_px: f32::NAN,
+            font_size_pt: f32::INFINITY,
+            material: WindowMaterial::Translucent {
+                alpha: f32::NEG_INFINITY,
+            },
+            ..UserSettings::default()
+        };
+        cfg.sanitize();
+        assert!(cfg.sidebar_width_px.is_finite());
+        assert!((cfg.sidebar_width_px - 248.0).abs() < f32::EPSILON);
+        assert!(cfg.font_size_pt.is_finite());
+        assert!((cfg.font_size_pt - 11.0).abs() < f32::EPSILON);
+        assert_eq!(
+            cfg.material,
+            WindowMaterial::Translucent {
+                alpha: default_translucent_alpha()
+            }
+        );
+
+        let mut inf_cfg = UserSettings {
+            sidebar_width_px: f32::NEG_INFINITY,
+            font_size_pt: f32::NAN,
+            material: WindowMaterial::Translucent { alpha: f32::NAN },
+            ..UserSettings::default()
+        };
+        assert_eq!(
+            inf_cfg.material.to_theme_material(),
+            MaterialStyle::Translucent {
+                alpha: default_translucent_alpha()
+            }
+        );
+        inf_cfg.sanitize();
+        assert!((inf_cfg.sidebar_width_px - 248.0).abs() < f32::EPSILON);
+        assert!((inf_cfg.font_size_pt - 11.0).abs() < f32::EPSILON);
+        assert!((inf_cfg.increase_font() - 12.0).abs() < f32::EPSILON);
+        inf_cfg.font_size_pt = f32::NAN;
+        assert!((inf_cfg.decrease_font() - 10.0).abs() < f32::EPSILON);
     }
 }

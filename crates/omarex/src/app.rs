@@ -14,13 +14,13 @@
 //!   Omarchy `Ctrl+Alt+*` `tr3x` aliases, `Ctrl+Shift+*` chrome, `Alt+1..9`, and
 //!   `Ctrl+Insert` / `Shift+Insert`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use gpu_renderer::{GpuConfig, GpuRenderer, PresentModePreference};
-use omarchy_theme::{Theme, ThemePalette};
+use gpu_renderer::{GpuConfig, GpuShared, PresentModePreference, SurfaceRenderer};
 use rex_proto::RexEndpoint;
 use tokio::sync::mpsc;
 use tr3x_bridge::Modifiers;
@@ -40,13 +40,14 @@ use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::bridge::{
-    CommandLaunchSpec, CursorHint, KeyInputEvent, OmarexController, PointerButton,
-    register_all_ui_icons,
+    CommandLaunchSpec, CursorHint, KeyInputEvent, OmarexController, PendingNewWindow,
+    PointerButton, WindowContext, register_all_ui_icons,
 };
 use crate::config::UserSettings;
 use crate::host_manager::{HostCommand, HostManager, RuntimeEvent};
 #[cfg(target_os = "linux")]
 use crate::wayland_dnd::{WaylandDndEvent, WaylandDndHandle, WaylandDropPayload};
+use crate::workspace::{BlockKey, SessionKey};
 
 /// Custom event loop wakeup signal pushed by [`HostManager`]'s `wake_ui` callback or native
 /// Wayland drag-and-drop listener.
@@ -54,7 +55,10 @@ use crate::wayland_dnd::{WaylandDndEvent, WaylandDndHandle, WaylandDropPayload};
 pub enum AppWakeEvent {
     RuntimeEventReady,
     #[cfg(target_os = "linux")]
-    WaylandDnd(WaylandDndEvent),
+    WaylandDnd {
+        window_id: WindowId,
+        event: WaylandDndEvent,
+    },
 }
 
 /// Interactive GUI launch options parsed from CLI arguments (including `xdg-terminal-exec`).
@@ -84,16 +88,7 @@ pub fn run_gui(opts: GuiLaunchOptions) -> Result<()> {
 
     let settings_path = UserSettings::default_path();
     let settings = UserSettings::load_or_default();
-    let mut theme = Theme::load_live();
-    if opts.force_light {
-        theme = Theme::from_parts(
-            ThemePalette::default_light(),
-            theme.rounding,
-            settings.material.to_theme_material(),
-        );
-    } else {
-        theme.material = settings.material.to_theme_material();
-    }
+    let theme = crate::bridge::resolve_startup_theme(&settings, opts.force_light);
 
     let mut controller = OmarexController::new(settings, settings_path, theme)
         .context("failed to initialize OmarexController")?;
@@ -145,17 +140,14 @@ pub fn run_gui(opts: GuiLaunchOptions) -> Result<()> {
         event_rx,
         proxy,
         controller,
-        window: None,
-        renderer: None,
-        #[cfg(target_os = "linux")]
-        wayland_dnd: None,
+        gpu_shared: None,
+        windows: HashMap::new(),
+        primary_window_id: None,
+        focused_window_id: None,
         app_id,
         pinned_title,
+        initial_title,
         modifiers: ModifiersState::empty(),
-        pointer_logical: (0.0, 0.0),
-        last_cursor: CursorHint::Default,
-        last_window_title: initial_title,
-        pending_drops: Vec::new(),
         started_at: Instant::now(),
         fatal_error: None,
         shutting_down: false,
@@ -173,190 +165,197 @@ pub fn run_gui(opts: GuiLaunchOptions) -> Result<()> {
     Ok(())
 }
 
+/// Per-OS-window state.
+///
+/// CRITICAL field drop order on Wayland/Vulkan:
+/// 1. `wayland_dnd` (joins foreign-display DnD thread holding display/surface pointers)
+/// 2. `surface` (destroys `VkSurfaceKHR` BEFORE `wl_surface` / `Window`!)
+/// 3. `context` (per-window UI/media state)
+/// 4. `window` (destroys underlying Wayland/X11 `Window` last)
+struct WindowState {
+    #[cfg(target_os = "linux")]
+    wayland_dnd: Option<WaylandDndHandle>,
+    surface: SurfaceRenderer,
+    context: WindowContext,
+    window: Arc<Window>,
+    last_cursor: CursorHint,
+    last_window_title: String,
+    pending_drops: Vec<PathBuf>,
+    pointer_logical: (f32, f32),
+}
+
 struct OmarexApp {
     tokio_rt: tokio::runtime::Runtime,
     host_manager: HostManager,
     event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     proxy: EventLoopProxy<AppWakeEvent>,
     controller: OmarexController,
-    window: Option<Arc<Window>>,
-    renderer: Option<GpuRenderer>,
-    #[cfg(target_os = "linux")]
-    wayland_dnd: Option<WaylandDndHandle>,
+    gpu_shared: Option<Arc<GpuShared>>,
+    windows: HashMap<WindowId, WindowState>,
+    primary_window_id: Option<WindowId>,
+    focused_window_id: Option<WindowId>,
     app_id: String,
     pinned_title: Option<String>,
+    initial_title: String,
     modifiers: ModifiersState,
-    pointer_logical: (f32, f32),
-    last_cursor: CursorHint,
-    last_window_title: String,
-    pending_drops: Vec<PathBuf>,
     started_at: Instant,
     fatal_error: Option<anyhow::Error>,
     shutting_down: bool,
 }
 
 impl OmarexApp {
+    fn sync_pinned_sessions(&mut self) {
+        let pinned: HashSet<SessionKey> = self
+            .windows
+            .values()
+            .filter_map(|w| w.context.active_session().cloned())
+            .collect();
+        self.controller.set_pinned_sessions(pinned);
+    }
+
+    fn target_window_id(&self) -> Option<WindowId> {
+        self.focused_window_id
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| {
+                self.primary_window_id
+                    .filter(|id| self.windows.contains_key(id))
+            })
+            .or_else(|| self.windows.keys().next().copied())
+    }
+
     fn drain_runtime_events(&mut self, now: Instant) -> bool {
+        self.sync_pinned_sessions();
+        let target_wid = self.target_window_id();
         let mut drained = false;
         while let Ok(ev) = self.event_rx.try_recv() {
-            self.controller.process_runtime_event(ev, now);
+            if self.windows.is_empty() {
+                self.controller.process_runtime_event(ev, now);
+            } else {
+                let pairs: Vec<(WindowId, &mut WindowContext)> = self
+                    .windows
+                    .iter_mut()
+                    .map(|(&wid, w)| (wid, &mut w.context))
+                    .collect();
+                let preferred_idx =
+                    target_wid.and_then(|tw| pairs.iter().position(|(wid, _)| *wid == tw));
+                let mut contexts: Vec<&mut WindowContext> =
+                    pairs.into_iter().map(|(_, ctx)| ctx).collect();
+                self.controller
+                    .process_runtime_event_multi(ev, &mut contexts, preferred_idx, now);
+            }
             drained = true;
         }
+        self.sync_pinned_sessions();
         drained
     }
 
-    fn flush_pending_drops(&mut self) {
-        if !self.pending_drops.is_empty() {
-            let paths = std::mem::take(&mut self.pending_drops);
+    fn process_window_close_requests(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let closing_wids: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter_map(|(&wid, win)| win.context.is_close_requested().then_some(wid))
+            .collect();
+        for wid in closing_wids {
+            if self.windows.len() > 1 {
+                if let Some(win) = self.windows.get_mut(&wid) {
+                    let _ = win.context.take_close_requested();
+                }
+                self.close_secondary_window(wid);
+            } else {
+                self.shutdown_gracefully();
+                event_loop.exit();
+                return true;
+            }
+        }
+        if self.controller.should_exit() {
+            self.shutdown_gracefully();
+            event_loop.exit();
+            return true;
+        }
+        false
+    }
+
+    fn flush_pending_drops_for(&mut self, window_id: WindowId) {
+        let Some(win) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if !win.pending_drops.is_empty() {
+            let paths = std::mem::take(&mut win.pending_drops);
+            let pos = win.pointer_logical;
             self.controller
-                .handle_file_drop_at(&paths, Some(self.pointer_logical));
+                .with_window_context(&mut win.context, |ctrl| {
+                    ctrl.handle_file_drop_at(&paths, Some(pos));
+                });
         }
     }
 
-    fn sync_cursor_and_title(&mut self) {
-        let Some(window) = &self.window else {
+    fn sync_cursor_and_title_for(&mut self, window_id: WindowId) {
+        let Some(win) = self.windows.get_mut(&window_id) else {
             return;
         };
+        let pinned_title = self.pinned_title.clone();
+        let (hint, desired_title) = self
+            .controller
+            .with_window_context(&mut win.context, |ctrl| {
+                let hint = ctrl.cursor_hint();
+                let desired_title = if let Some(pinned) = &pinned_title {
+                    pinned.clone()
+                } else {
+                    ctrl.active_session_key()
+                        .and_then(|sk| ctrl.workspace.session(sk))
+                        .filter(|s| !s.label.is_empty())
+                        .map(|s| format!("omarex — {}", s.label))
+                        .unwrap_or_else(|| "omarex".to_owned())
+                };
+                (hint, desired_title)
+            });
 
-        let hint = self.controller.cursor_hint();
-        if hint != self.last_cursor {
-            window.set_cursor(cursor_hint_to_winit(hint));
-            self.last_cursor = hint;
+        if hint != win.last_cursor {
+            win.window.set_cursor(cursor_hint_to_winit(hint));
+            win.last_cursor = hint;
         }
+        if desired_title != win.last_window_title {
+            win.window.set_title(&desired_title);
+            win.last_window_title = desired_title;
+        }
+    }
 
-        let desired_title = if let Some(pinned) = &self.pinned_title {
+    fn spawn_pending_windows(&mut self, event_loop: &ActiveEventLoop) {
+        let pending = self.controller.take_pending_new_windows();
+        for req in pending {
+            let (session, focused_block) = match req {
+                PendingNewWindow::Session {
+                    session,
+                    focused_block,
+                } => (Some(session), focused_block),
+                PendingNewWindow::Offline => (None, None),
+            };
+            let _ = self.create_os_window(event_loop, session, focused_block);
+        }
+    }
+
+    fn create_os_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        initial_session: Option<SessionKey>,
+        focused_block: Option<String>,
+    ) -> Option<WindowId> {
+        let transparent = self.controller.has_translucent_material();
+        let initial_title = if let Some(pinned) = &self.pinned_title {
             pinned.clone()
-        } else {
+        } else if let Some(sk) = &initial_session {
             self.controller
-                .active_session_key()
-                .and_then(|sk| self.controller.workspace.session(sk))
+                .workspace
+                .session(sk)
                 .filter(|s| !s.label.is_empty())
                 .map(|s| format!("omarex — {}", s.label))
-                .unwrap_or_else(|| "omarex".to_owned())
-        };
-        if desired_title != self.last_window_title {
-            window.set_title(&desired_title);
-            self.last_window_title = desired_title;
-        }
-    }
-
-    fn shutdown_gracefully(&mut self) {
-        if self.shutting_down {
-            return;
-        }
-        self.shutting_down = true;
-        #[cfg(target_os = "linux")]
-        {
-            // Stop the foreign-display Wayland DnD thread before the `winit` window/display drops.
-            self.wayland_dnd = None;
-        }
-        if let Some(sk) = self.controller.ephemeral_session().cloned() {
-            let _ = self.host_manager.send(HostCommand::DestroySession {
-                host_id: sk.host_id,
-                session_id: sk.session_id,
-            });
-            self.tokio_rt.block_on(async {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-            });
-        } else if !self.controller.read_only
-            && let Some(sk) = self.controller.active_session_key().cloned()
-        {
-            // Release block ownership cleanly right before closing so any remaining tiled
-            // `omarex` window immediately receives `block_owner_changed` and expands to full width.
-            let _ = self.host_manager.send(HostCommand::DisownBlock {
-                host_id: sk.host_id,
-                session_id: sk.session_id,
-                block_ids: None,
-            });
-            self.tokio_rt.block_on(async {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            });
-        }
-        self.host_manager.shutdown();
-        // Give WS close frames (status 1000) a short window to flush cleanly.
-        self.tokio_rt.block_on(async {
-            tokio::time::sleep(Duration::from_millis(45)).await;
-        });
-    }
-
-    fn sync_window_dimensions(&mut self) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-        let phys = window.inner_size();
-        if phys.width == 0 || phys.height == 0 {
-            return;
-        }
-        let scale = (window.scale_factor() as f32).max(0.5);
-        if let Some(renderer) = self.renderer.as_mut()
-            && (renderer.context().surface_size() != Some((phys.width, phys.height))
-                || (renderer.context().scale_factor() - scale).abs() > f32::EPSILON)
-        {
-            renderer.resize(phys.width, phys.height, scale);
-        }
-        let expected_w = (phys.width as f32 / scale).max(1.0);
-        let expected_h = (phys.height as f32 / scale).max(1.0);
-        let (cur_w, cur_h) = self.controller.viewport_logical();
-        if (cur_w - expected_w).abs() > 0.5
-            || (cur_h - expected_h).abs() > 0.5
-            || (self.controller.scale_factor() - scale).abs() > f32::EPSILON
-        {
-            self.controller.set_viewport(phys.width, phys.height, scale);
-        }
-    }
-
-    fn render_now(&mut self) {
-        let now = Instant::now();
-        self.drain_runtime_events(now);
-        self.flush_pending_drops();
-        self.sync_window_dimensions();
-
-        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
-            return;
+                .unwrap_or_else(|| self.initial_title.clone())
+        } else {
+            self.initial_title.clone()
         };
 
-        let frame = match self.controller.render_frame(renderer, now) {
-            Ok(frame) => frame,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to build composite frame");
-                return;
-            }
-        };
-
-        window.pre_present_notify();
-        match renderer.render_to_surface(&frame) {
-            Ok(Some(_stats)) => {}
-            Ok(None) => {
-                // Surface was lost/outdated and auto-reconfigured; schedule one immediate repaint.
-                self.controller.mark_needs_redraw();
-                window.request_redraw();
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "surface render failed");
-                self.controller.mark_needs_redraw();
-            }
-        }
-        self.sync_cursor_and_title();
-    }
-}
-
-impl ApplicationHandler<AppWakeEvent> for OmarexApp {
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            let now = Instant::now();
-            self.drain_runtime_events(now);
-            let _ = self.controller.tick(now);
-        }
-    }
-
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
-        let transparent = self.controller.has_translucent_material();
         let mut attrs = WindowAttributes::default()
-            .with_title(self.last_window_title.clone())
+            .with_title(initial_title.clone())
             .with_inner_size(LogicalSize::new(1440.0_f64, 900.0_f64))
             .with_min_inner_size(LogicalSize::new(480.0_f64, 320.0_f64))
             .with_decorations(false)
@@ -371,9 +370,13 @@ impl ApplicationHandler<AppWakeEvent> for OmarexApp {
         let window = match event_loop.create_window(attrs) {
             Ok(win) => Arc::new(win),
             Err(err) => {
-                self.fatal_error = Some(anyhow::anyhow!("failed to create window: {err}"));
-                event_loop.exit();
-                return;
+                if self.windows.is_empty() {
+                    self.fatal_error = Some(anyhow::anyhow!("failed to create window: {err}"));
+                    event_loop.exit();
+                } else {
+                    tracing::error!(error = %err, "failed to create secondary OS window");
+                }
+                return None;
             }
         };
         window.set_decorations(false);
@@ -389,121 +392,381 @@ impl ApplicationHandler<AppWakeEvent> for OmarexApp {
             transparent_surface: transparent,
             ..Default::default()
         };
-        let mut renderer =
-            match GpuRenderer::new_with_surface(Arc::clone(&window), width, height, scale, gpu_cfg)
-            {
-                Ok(r) => r,
+
+        let surface = if let Some(shared) = &self.gpu_shared {
+            match shared.create_surface_renderer(
+                Arc::clone(&window),
+                width,
+                height,
+                scale,
+                &gpu_cfg,
+            ) {
+                Ok(sr) => sr,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to create secondary SurfaceRenderer");
+                    return None;
+                }
+            }
+        } else {
+            let (shared, sr) = match GpuShared::new_with_initial_surface(
+                Arc::clone(&window),
+                width,
+                height,
+                scale,
+                &gpu_cfg,
+            ) {
+                Ok(res) => res,
                 Err(err) => {
                     self.fatal_error =
                         Some(anyhow::anyhow!("failed to initialize GPU renderer: {err}"));
                     event_loop.exit();
-                    return;
+                    return None;
                 }
             };
+            let icon_count = {
+                let mut atlas = shared.atlas();
+                register_all_ui_icons(&mut atlas)
+            };
+            tracing::info!(
+                adapter = %shared.adapter_summary().name,
+                backend = ?shared.adapter_summary().backend,
+                width,
+                height,
+                scale,
+                transparent,
+                icons = icon_count,
+                "omarex shared GPU & initial window surface ready"
+            );
+            self.gpu_shared = Some(shared);
+            sr
+        };
 
-        let icon_count = register_all_ui_icons(renderer.atlas_mut());
-        tracing::info!(
-            adapter = %renderer.adapter_summary().name,
-            backend = ?renderer.adapter_summary().backend,
+        let context = self.controller.create_window_context(
             width,
             height,
             scale,
-            transparent,
-            icons = icon_count,
-            "omarex window surface ready"
+            initial_session,
+            focused_block,
         );
+        let window_id = window.id();
 
-        self.controller.set_viewport(width, height, scale);
         #[cfg(target_os = "linux")]
-        {
+        let wayland_dnd = {
             let dnd_proxy = self.proxy.clone();
-            self.wayland_dnd = WaylandDndHandle::attach(window.as_ref(), move |ev| {
-                let _ = dnd_proxy.send_event(AppWakeEvent::WaylandDnd(ev));
-            });
+            WaylandDndHandle::attach(window.as_ref(), move |ev| {
+                let _ = dnd_proxy.send_event(AppWakeEvent::WaylandDnd {
+                    window_id,
+                    event: ev,
+                });
+            })
+        };
+
+        self.windows.insert(
+            window_id,
+            WindowState {
+                #[cfg(target_os = "linux")]
+                wayland_dnd,
+                surface,
+                context,
+                window: Arc::clone(&window),
+                last_cursor: CursorHint::Default,
+                last_window_title: initial_title,
+                pending_drops: Vec::new(),
+                pointer_logical: (0.0, 0.0),
+            },
+        );
+        if self.primary_window_id.is_none() {
+            self.primary_window_id = Some(window_id);
         }
-        self.window = Some(Arc::clone(&window));
-        self.renderer = Some(renderer);
+        self.focused_window_id = Some(window_id);
+        self.sync_pinned_sessions();
         window.request_redraw();
+        Some(window_id)
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppWakeEvent) {
+    fn close_secondary_window(&mut self, window_id: WindowId) {
+        let Some(closed) = self.windows.remove(&window_id) else {
+            return;
+        };
+        let remaining_visible: HashSet<BlockKey> = self
+            .windows
+            .values()
+            .flat_map(|w| w.context.visible_pane_keys().iter().cloned())
+            .collect();
+        self.controller
+            .on_secondary_window_closed(&closed.context, &remaining_visible);
+        drop(closed);
+        if self.primary_window_id == Some(window_id) {
+            self.primary_window_id = self.windows.keys().next().copied();
+        }
+        if self.focused_window_id == Some(window_id) {
+            self.focused_window_id = self.primary_window_id;
+        }
+        self.sync_pinned_sessions();
+    }
+
+    fn shutdown_gracefully(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        #[cfg(target_os = "linux")]
+        for win in self.windows.values_mut() {
+            // Stop foreign-display Wayland DnD threads before `winit` windows/surfaces drop.
+            win.wayland_dnd = None;
+        }
+        let ephemeral_sessions: HashSet<SessionKey> = self
+            .windows
+            .values()
+            .filter_map(|w| w.context.ephemeral_session().cloned())
+            .chain(self.controller.ephemeral_session().cloned())
+            .collect();
+        if !ephemeral_sessions.is_empty() {
+            for sk in ephemeral_sessions {
+                let _ = self.host_manager.send(HostCommand::DestroySession {
+                    host_id: sk.host_id,
+                    session_id: sk.session_id,
+                });
+            }
+            self.tokio_rt.block_on(async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            });
+        } else if !self.controller.read_only {
+            let active_sessions: HashSet<SessionKey> = self
+                .windows
+                .values()
+                .filter_map(|w| w.context.active_session().cloned())
+                .collect();
+            for sk in active_sessions {
+                let _ = self.host_manager.send(HostCommand::DisownBlock {
+                    host_id: sk.host_id,
+                    session_id: sk.session_id,
+                    block_ids: None,
+                });
+            }
+            self.tokio_rt.block_on(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            });
+        }
+        // Drop all WindowStates (`wayland_dnd -> surface -> context -> window`) cleanly before
+        // shutting down `HostManager` and `GpuShared`.
+        self.windows.clear();
+        self.host_manager.shutdown();
+        // Give WS close frames (status 1000) a short window to flush cleanly.
+        self.tokio_rt.block_on(async {
+            tokio::time::sleep(Duration::from_millis(45)).await;
+        });
+    }
+
+    fn sync_window_dimensions_for(&mut self, window_id: WindowId) {
+        let Some(win) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let phys = win.window.inner_size();
+        if phys.width == 0 || phys.height == 0 {
+            return;
+        }
+        let scale = (win.window.scale_factor() as f32).max(0.5);
+        if win.surface.surface_size() != (phys.width, phys.height)
+            || (win.surface.scale_factor() - scale).abs() > f32::EPSILON
+        {
+            win.surface.resize(phys.width, phys.height, scale);
+        }
+        let expected_w = (phys.width as f32 / scale).max(1.0);
+        let expected_h = (phys.height as f32 / scale).max(1.0);
+        self.controller
+            .with_window_context(&mut win.context, |ctrl| {
+                let (cur_w, cur_h) = ctrl.viewport_logical();
+                if (cur_w - expected_w).abs() > 0.5
+                    || (cur_h - expected_h).abs() > 0.5
+                    || (ctrl.scale_factor() - scale).abs() > f32::EPSILON
+                {
+                    ctrl.set_viewport(phys.width, phys.height, scale);
+                }
+            });
+    }
+
+    fn render_now_for(&mut self, window_id: WindowId) {
+        let now = Instant::now();
+        self.drain_runtime_events(now);
+        self.flush_pending_drops_for(window_id);
+        self.sync_window_dimensions_for(window_id);
+
+        let Some(shared) = self.gpu_shared.clone() else {
+            return;
+        };
+        let Some(win) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+
+        let frame = match self
+            .controller
+            .with_window_context(&mut win.context, |ctrl| {
+                ctrl.render_frame_shared(&shared, now)
+            }) {
+            Ok(frame) => frame,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to build composite frame");
+                return;
+            }
+        };
+
+        win.window.pre_present_notify();
+        match win.surface.render_to_surface(&frame) {
+            Ok(Some(stats)) => {
+                self.controller.record_frame_stats(&stats);
+            }
+            Ok(None) => {
+                win.context.mark_needs_redraw();
+                win.window.request_redraw();
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "surface render failed");
+                win.context.mark_needs_redraw();
+            }
+        }
+        self.sync_cursor_and_title_for(window_id);
+    }
+}
+
+impl ApplicationHandler<AppWakeEvent> for OmarexApp {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            let now = Instant::now();
+            self.drain_runtime_events(now);
+            let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+            for wid in wids {
+                if let Some(win) = self.windows.get_mut(&wid) {
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            let _ = ctrl.tick(now);
+                        });
+                }
+            }
+        }
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.windows.is_empty() {
+            return;
+        }
+        let initial_session = self.controller.active_session_key().cloned();
+        let _ = self.create_os_window(event_loop, initial_session, None);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppWakeEvent) {
         let now = Instant::now();
         match event {
             AppWakeEvent::RuntimeEventReady => {
                 self.drain_runtime_events(now);
-                let _ = self.controller.tick(now);
+                if self.process_window_close_requests(event_loop) {
+                    return;
+                }
+                let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+                for wid in wids {
+                    if let Some(win) = self.windows.get_mut(&wid) {
+                        self.controller
+                            .with_window_context(&mut win.context, |ctrl| {
+                                let _ = ctrl.tick(now);
+                            });
+                    }
+                }
+                self.spawn_pending_windows(event_loop);
             }
             #[cfg(target_os = "linux")]
-            AppWakeEvent::WaylandDnd(dnd_ev) => match dnd_ev {
-                WaylandDndEvent::Hover { x, y, .. } => {
-                    self.pointer_logical = (x, y);
-                    self.controller.handle_file_hover(x, y);
-                }
-                WaylandDndEvent::Leave => {
-                    self.controller.handle_file_hover_cancelled();
-                }
-                WaylandDndEvent::Drop { x, y, payload } => {
-                    self.pointer_logical = (x, y);
-                    match payload {
-                        WaylandDropPayload::Files(paths) => {
-                            self.controller.handle_file_drop_at(&paths, Some((x, y)));
-                        }
-                        WaylandDropPayload::Text(text) => {
+            AppWakeEvent::WaylandDnd { window_id, event } => {
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    match event {
+                        WaylandDndEvent::Hover { x, y, .. } => {
+                            win.pointer_logical = (x, y);
                             self.controller
-                                .handle_text_drop_at(&text, Some((x, y)), now);
+                                .with_window_context(&mut win.context, |ctrl| {
+                                    ctrl.handle_file_hover(x, y);
+                                });
+                        }
+                        WaylandDndEvent::Leave => {
+                            self.controller
+                                .with_window_context(&mut win.context, |ctrl| {
+                                    ctrl.handle_file_hover_cancelled();
+                                });
+                        }
+                        WaylandDndEvent::Drop { x, y, payload } => {
+                            win.pointer_logical = (x, y);
+                            self.controller
+                                .with_window_context(&mut win.context, |ctrl| match payload {
+                                    WaylandDropPayload::Files(paths) => {
+                                        ctrl.handle_file_drop_at(&paths, Some((x, y)));
+                                    }
+                                    WaylandDropPayload::Text(text) => {
+                                        ctrl.handle_text_drop_at(&text, Some((x, y)), now);
+                                    }
+                                });
                         }
                     }
                 }
-            },
+            }
         }
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         let now = Instant::now();
         match event {
             WindowEvent::CloseRequested => {
-                self.shutdown_gracefully();
-                event_loop.exit();
+                if self.windows.len() > 1 {
+                    self.close_secondary_window(window_id);
+                } else {
+                    self.shutdown_gracefully();
+                    event_loop.exit();
+                }
             }
 
             WindowEvent::Resized(phys) => {
-                if phys.width > 0 && phys.height > 0 {
-                    let scale = self
-                        .window
-                        .as_ref()
-                        .map_or(1.0, |w| (w.scale_factor() as f32).max(0.5));
-                    if let Some(renderer) = self.renderer.as_mut() {
-                        renderer.resize(phys.width, phys.height, scale);
-                    }
-                    self.controller.set_viewport(phys.width, phys.height, scale);
-                    self.controller.on_viewport_resized(now);
-                    // Paint immediately so Hyprland composites the resized surface with zero stale frame.
-                    self.render_now();
+                if phys.width > 0
+                    && phys.height > 0
+                    && let Some(win) = self.windows.get_mut(&window_id)
+                {
+                    let scale = (win.window.scale_factor() as f32).max(0.5);
+                    win.surface.resize(phys.width, phys.height, scale);
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.set_viewport(phys.width, phys.height, scale);
+                            ctrl.on_viewport_resized(now);
+                        });
+                    self.render_now_for(window_id);
                 }
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let scale = (scale_factor as f32).max(0.5);
-                if let Some(win) = &self.window {
-                    let phys = win.inner_size();
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    let phys = win.window.inner_size();
                     let w = phys.width.max(1);
                     let h = phys.height.max(1);
-                    if let Some(renderer) = self.renderer.as_mut() {
-                        renderer.resize(w, h, scale);
-                    }
-                    self.controller.set_viewport(w, h, scale);
-                    self.controller.on_viewport_resized(now);
-                    self.render_now();
+                    win.surface.resize(w, h, scale);
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.set_viewport(w, h, scale);
+                            ctrl.on_viewport_resized(now);
+                        });
+                    self.render_now_for(window_id);
                 }
             }
 
             WindowEvent::Focused(gained) => {
-                self.controller.handle_window_focus(gained, now);
+                if gained {
+                    self.focused_window_id = Some(window_id);
+                }
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_window_focus(gained, now);
+                        });
+                }
             }
 
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -518,97 +781,131 @@ impl ApplicationHandler<AppWakeEvent> for OmarexApp {
                 if is_synthetic {
                     return;
                 }
-                if let Some(input) = translate_winit_key_event(&key_ev, self.modifiers) {
-                    self.controller.handle_key(&input, now);
+                if let Some(input) = translate_winit_key_event(&key_ev, self.modifiers)
+                    && let Some(win) = self.windows.get_mut(&window_id)
+                {
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_key(&input, now);
+                        });
+                    self.sync_pinned_sessions();
+                    self.spawn_pending_windows(event_loop);
                 }
             }
 
-            WindowEvent::Ime(ime) => match ime {
-                Ime::Enabled => {}
-                Ime::Preedit(text, range) => {
-                    let preedit = if text.is_empty() {
-                        None
-                    } else {
-                        Some((text, range.map(|(s, e)| s..e)))
-                    };
-                    self.controller.handle_ime(preedit, None, now);
+            WindowEvent::Ime(ime) => {
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| match ime {
+                            Ime::Enabled => {}
+                            Ime::Preedit(text, range) => {
+                                let preedit = if text.is_empty() {
+                                    None
+                                } else {
+                                    Some((text, range.map(|(s, e)| s..e)))
+                                };
+                                ctrl.handle_ime(preedit, None, now);
+                            }
+                            Ime::Commit(text) => {
+                                ctrl.handle_ime(None, Some(text), now);
+                            }
+                            Ime::Disabled => {
+                                ctrl.handle_ime(None, None, now);
+                            }
+                        });
                 }
-                Ime::Commit(text) => {
-                    self.controller.handle_ime(None, Some(text), now);
-                }
-                Ime::Disabled => {
-                    self.controller.handle_ime(None, None, now);
-                }
-            },
+            }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let scale = self.controller.scale_factor().max(0.5);
-                let px = position.x as f32 / scale;
-                let py = position.y as f32 / scale;
-                self.pointer_logical = (px, py);
-                self.controller.handle_pointer_move(
-                    px,
-                    py,
-                    winit_mods_to_bridge(self.modifiers),
-                    now,
-                );
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    let scale = win.context.scale_factor().max(0.5);
+                    let px = position.x as f32 / scale;
+                    let py = position.y as f32 / scale;
+                    win.pointer_logical = (px, py);
+                    let mods = winit_mods_to_bridge(self.modifiers);
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_pointer_move(px, py, mods, now);
+                        });
+                }
             }
 
             WindowEvent::CursorLeft { .. } => {
-                self.controller.handle_pointer_leave();
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_pointer_leave();
+                        });
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(btn) = winit_mouse_button(button) else {
                     return;
                 };
-                let (px, py) = self.pointer_logical;
                 let mods = winit_mods_to_bridge(self.modifiers);
-                match state {
-                    ElementState::Pressed => {
-                        let time_ns = self.started_at.elapsed().as_nanos() as u64;
-                        self.controller
-                            .handle_pointer_down(px, py, btn, mods, time_ns, now);
-                    }
-                    ElementState::Released => {
-                        self.controller.handle_pointer_up(px, py, btn, mods);
-                    }
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    let (px, py) = win.pointer_logical;
+                    let time_ns = self.started_at.elapsed().as_nanos() as u64;
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| match state {
+                            ElementState::Pressed => {
+                                ctrl.handle_pointer_down(px, py, btn, mods, time_ns, now);
+                            }
+                            ElementState::Released => {
+                                ctrl.handle_pointer_up(px, py, btn, mods);
+                            }
+                        });
+                    self.sync_pinned_sessions();
+                    self.spawn_pending_windows(event_loop);
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let scale = self.controller.scale_factor().max(0.5);
-                let (dx_px, dy_px) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x * 54.0, y * 54.0),
-                    MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
-                        (x as f32 / scale, y as f32 / scale)
-                    }
-                };
-                let (px, py) = self.pointer_logical;
-                self.controller.handle_pointer_wheel(
-                    px,
-                    py,
-                    dx_px,
-                    dy_px,
-                    winit_mods_to_bridge(self.modifiers),
-                );
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    let scale = win.context.scale_factor().max(0.5);
+                    let (dx_px, dy_px) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (x * 54.0, y * 54.0),
+                        MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
+                            (x as f32 / scale, y as f32 / scale)
+                        }
+                    };
+                    let (px, py) = win.pointer_logical;
+                    let mods = winit_mods_to_bridge(self.modifiers);
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_pointer_wheel(px, py, dx_px, dy_px, mods);
+                        });
+                }
             }
 
             WindowEvent::HoveredFile(_) => {
-                let (px, py) = self.pointer_logical;
-                self.controller.handle_file_hover(px, py);
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    let (px, py) = win.pointer_logical;
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_file_hover(px, py);
+                        });
+                }
             }
 
             WindowEvent::HoveredFileCancelled => {
-                self.controller.handle_file_hover_cancelled();
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    self.controller
+                        .with_window_context(&mut win.context, |ctrl| {
+                            ctrl.handle_file_hover_cancelled();
+                        });
+                }
             }
 
             WindowEvent::DroppedFile(path) => {
-                self.pending_drops.push(path);
+                if let Some(win) = self.windows.get_mut(&window_id) {
+                    win.pending_drops.push(path);
+                }
             }
 
             WindowEvent::RedrawRequested => {
-                self.render_now();
+                self.render_now_for(window_id);
             }
 
             _ => {}
@@ -618,25 +915,52 @@ impl ApplicationHandler<AppWakeEvent> for OmarexApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         self.drain_runtime_events(now);
-        self.flush_pending_drops();
-        let _ = self.controller.tick(now);
-        self.sync_cursor_and_title();
+        if self.process_window_close_requests(event_loop) {
+            return;
+        }
+        self.spawn_pending_windows(event_loop);
 
-        if self.controller.should_exit() {
-            self.shutdown_gracefully();
-            event_loop.exit();
+        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in &wids {
+            self.flush_pending_drops_for(*wid);
+            if let Some(win) = self.windows.get_mut(wid) {
+                self.controller
+                    .with_window_context(&mut win.context, |ctrl| {
+                        let _ = ctrl.tick(now);
+                    });
+            }
+            self.sync_cursor_and_title_for(*wid);
+        }
+
+        if self.process_window_close_requests(event_loop) {
             return;
         }
 
-        if self.controller.needs_redraw() {
-            if let Some(window) = &self.window {
-                window.request_redraw();
+        let mut any_redraw = false;
+        let mut earliest_deadline: Option<Instant> = None;
+        for wid in &wids {
+            if let Some(win) = self.windows.get_mut(wid) {
+                let (needs, due) = self
+                    .controller
+                    .with_window_context(&mut win.context, |ctrl| {
+                        (ctrl.needs_redraw(), ctrl.next_wakeup_deadline(now))
+                    });
+                if needs {
+                    win.window.request_redraw();
+                    any_redraw = true;
+                }
+                if let Some(d) = due {
+                    earliest_deadline = Some(earliest_deadline.map_or(d, |prev| prev.min(d)));
+                }
             }
+        }
+
+        if any_redraw {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
 
-        match self.controller.next_wakeup_deadline(now) {
+        match earliest_deadline {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }

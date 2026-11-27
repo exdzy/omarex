@@ -18,7 +18,7 @@ use bytes::Bytes;
 use gpu_renderer::{
     CellMetrics, ClipRect, Color, DrawList, GlyphAtlas, GpuRenderer, ImageLayer, ImagePixelFormat,
     ImageTextureCache, ImageUpload, KittyPlacement as GpuKittyPlacement, Rect, RenderError,
-    TerminalBuildStats, TerminalPaneCache, TerminalViewport,
+    TerminalBuildStats, TerminalCursor, TerminalPaneCache, TerminalViewport,
 };
 use omarchy_theme::{AppearanceMode, ThemePalette};
 use rex_proto::types::{TerminalResizeArgs, ThemeScheme};
@@ -26,10 +26,10 @@ use rex_proto::{DataCloseAction, RexControlMessage};
 use vt_engine::{
     BackgroundStep, ColorScheme, KeyEncoder, KeyEventInput, KittyImageLayer, KittyKeyboardFlags,
     KittyPlacement as VtKittyPlacement, MouseAction, MouseEncoder, MouseEventInput, MouseGeometry,
-    MouseTrackingMode, Overscan, RenderState, RexControlApc, Rgb as VtRgb, ScrollViewport,
-    Scrollbar, SearchScroll, SearchStatus, SelectionAutoscroll, SelectionGeometry,
-    SelectionGesture, SnapshotDecoder, SnapshotFeedStatus, Terminal, TerminalConfig, TerminalEvent,
-    TerminalSearch, TerminalTheme, UpdateSnapshot, ViewportMatch, VtError,
+    MouseTrackingMode, Overscan, RenderState, RexControlApc, Rgb as VtRgb, ScreenPoint,
+    ScrollViewport, Scrollbar, SearchScroll, SearchStatus, SelectionGeometry, SelectionGesture,
+    SelectionMode, SnapshotDecoder, SnapshotFeedStatus, Terminal, TerminalConfig, TerminalEvent,
+    TerminalSearch, TerminalTheme, UpdateSnapshot, ViewportMatch, VtError, WordMotion,
 };
 
 use crate::host_manager::{DataStreamEvent, DataStreamEventKind, LOCAL_HOST_ID};
@@ -270,6 +270,8 @@ pub struct PaneRenderResult {
     pub scrollbar: Scrollbar,
     pub viewport_active: bool,
     pub scroll_offset_y: f32,
+    /// `true` when sampled `program_bg` changed on this render pass.
+    pub program_bg_changed: bool,
 }
 
 /// Summary returned by [`PaneStore::search_query`].
@@ -296,6 +298,11 @@ pub struct PaneRuntime {
     search: Option<TerminalSearch>,
     search_query: String,
     scroll_accum_px: f32,
+    scroll_velocity_px_per_sec: f32,
+    scroll_cell_height_px: f32,
+    unread_output_while_scrolled_up: bool,
+    program_bg: Option<vt_engine::Rgb>,
+    program_bg_dirty: bool,
     dirty: bool,
     snapshot_complete: bool,
     has_rendered_once: bool,
@@ -343,6 +350,11 @@ impl PaneRuntime {
             search: None,
             search_query: String::new(),
             scroll_accum_px: 0.0,
+            scroll_velocity_px_per_sec: 0.0,
+            scroll_cell_height_px: 19.0,
+            unread_output_while_scrolled_up: false,
+            program_bg: None,
+            program_bg_dirty: true,
             dirty: false,
             snapshot_complete: false,
             has_rendered_once: false,
@@ -378,6 +390,11 @@ impl PaneRuntime {
             search: None,
             search_query: String::new(),
             scroll_accum_px: 0.0,
+            scroll_velocity_px_per_sec: 0.0,
+            scroll_cell_height_px: 19.0,
+            unread_output_while_scrolled_up: false,
+            program_bg: None,
+            program_bg_dirty: true,
             dirty: true,
             snapshot_complete: true,
             has_rendered_once: false,
@@ -401,6 +418,10 @@ impl PaneRuntime {
         self.search = None;
         self.search_query.clear();
         self.scroll_accum_px = 0.0;
+        self.scroll_velocity_px_per_sec = 0.0;
+        self.unread_output_while_scrolled_up = false;
+        self.program_bg = None;
+        self.program_bg_dirty = true;
         self.dirty = false;
         self.snapshot_complete = false;
         self.has_rendered_once = false;
@@ -434,11 +455,6 @@ impl PaneRuntime {
     }
 
     #[inline]
-    pub fn is_snapshot_complete(&self) -> bool {
-        self.snapshot_complete && self.decoder.is_none()
-    }
-
-    #[inline]
     pub fn scroll_offset_y(&self) -> f32 {
         self.scroll_accum_px
     }
@@ -461,11 +477,6 @@ impl PaneRuntime {
     #[inline]
     pub fn cached_row_count(&self) -> usize {
         self.pane_cache.cached_row_count()
-    }
-
-    #[inline]
-    pub fn active_search_query(&self) -> Option<&str> {
-        self.search.as_ref().map(|_| self.search_query.as_str())
     }
 }
 
@@ -510,19 +521,6 @@ impl PaneStore {
         Ok(store)
     }
 
-    /// Directly inserts a pre-constructed [`Terminal`] (handy for local previews or unit tests).
-    pub fn insert_terminal(
-        &mut self,
-        key: BlockKey,
-        terminal: Terminal,
-    ) -> Result<(), PaneStoreError> {
-        let uid = self.alloc_pane_uid();
-        let _ = terminal.set_theme(&self.active_theme);
-        let runtime = PaneRuntime::from_terminal(uid, key.clone(), terminal)?;
-        self.panes.insert(key, runtime);
-        Ok(())
-    }
-
     #[inline]
     pub fn len(&self) -> usize {
         self.panes.len()
@@ -541,6 +539,18 @@ impl PaneStore {
     #[inline]
     pub fn get(&self, key: &BlockKey) -> Option<&PaneRuntime> {
         self.panes.get(key)
+    }
+
+    /// Moves a live [`PaneRuntime`] (keeping terminal, scrollback, `pane_uid`, and render cache
+    /// intact) from `old_key` to `new_key` after `session.transfer_window`.
+    pub fn rekey_block(&mut self, old_key: &BlockKey, new_key: BlockKey) -> bool {
+        let Some(mut pane) = self.panes.remove(old_key) else {
+            return false;
+        };
+        pane.key = new_key.clone();
+        pane.dirty = true;
+        self.panes.insert(new_key, pane);
+        true
     }
 
     #[inline]
@@ -564,32 +574,6 @@ impl PaneStore {
         keys.into_iter().any(|k| self.is_dirty(k))
     }
 
-    /// Immediately resizes a ready pane's local VT grid, clears its cached GPU rows and fractional
-    /// scroll offset, and marks it dirty for instant tear-free repaint.
-    pub fn resize_local(
-        &mut self,
-        key: &BlockKey,
-        cols: u16,
-        rows: u16,
-        cell_w_px: u32,
-        cell_h_px: u32,
-    ) -> bool {
-        let Some(pane) = self.panes.get_mut(key) else {
-            return false;
-        };
-        let Some(term) = pane.terminal.as_ref() else {
-            return false;
-        };
-        if term.resize(cols, rows, cell_w_px, cell_h_px).is_ok() {
-            pane.scroll_accum_px = 0.0;
-            pane.pane_cache.clear();
-            pane.dirty = true;
-            true
-        } else {
-            false
-        }
-    }
-
     /// Returns `true` if any pane still has an active progressive `GHOSTSNP` background decoder.
     pub fn has_pending_snapshots(&self) -> bool {
         self.panes.values().any(|p| p.decoder.is_some())
@@ -610,6 +594,47 @@ impl PaneStore {
         self.panes.get(key).map_or(0.0, |p| p.scroll_accum_px)
     }
 
+    /// Returns `true` if `key` received new PTY output while scrolled up into scrollback.
+    pub fn has_unread_output(&self, key: &BlockKey) -> bool {
+        self.panes
+            .get(key)
+            .is_some_and(|p| p.unread_output_while_scrolled_up)
+    }
+
+    /// Returns `true` if `key` is currently scrolled up above the live bottom row.
+    pub fn is_scrolled_up(&self, key: &BlockKey) -> bool {
+        let Some(term) = self.panes.get(key).and_then(|p| p.terminal.as_ref()) else {
+            return false;
+        };
+        let Ok(sb) = term.scrollbar() else {
+            return false;
+        };
+        sb.total > sb.len && sb.offset.saturating_add(sb.len) < sb.total
+    }
+
+    /// Returns the last sampled fullscreen TUI background color for `key`, if any.
+    pub fn program_bg(&self, key: &BlockKey) -> Option<vt_engine::Rgb> {
+        self.panes.get(key).and_then(|p| p.program_bg)
+    }
+
+    /// Ensures `program_bg` is up-to-date for `key` before `build_ui_frame_input` (e.g. frame 1
+    /// in `--headless-render`) without disturbing `pane.render_state` dirty-row tracking.
+    pub fn refresh_program_bg(&mut self, key: &BlockKey) -> Option<vt_engine::Rgb> {
+        let pane = self.panes.get_mut(key)?;
+        if pane.program_bg_dirty
+            && let Some(term) = pane.terminal.as_ref()
+            && let Ok(mut scratch_rs) = RenderState::new()
+            && scratch_rs.begin_update(term, Overscan::default()).is_ok()
+            && scratch_rs.end_update().is_ok()
+        {
+            if let Ok(bg) = scratch_rs.sample_program_bg(term.is_alternate_screen()) {
+                pane.program_bg = bg;
+            }
+            pane.program_bg_dirty = false;
+        }
+        pane.program_bg
+    }
+
     /// Returns the live Kitty keyboard flags of a ready pane.
     pub fn kitty_keyboard_flags(&self, key: &BlockKey) -> Option<KittyKeyboardFlags> {
         self.panes
@@ -628,15 +653,6 @@ impl PaneStore {
             .as_ref()?
             .mouse_tracking_mode()
             .ok()
-    }
-
-    /// Returns an iterator of keys currently marked dirty.
-    pub fn dirty_keys(&self) -> Vec<BlockKey> {
-        self.panes
-            .iter()
-            .filter(|&(_, p)| p.dirty)
-            .map(|(k, _)| k.clone())
-            .collect()
     }
 
     /// Returns all currently tracked pane keys.
@@ -730,6 +746,7 @@ impl PaneStore {
 
                     pane.selection_gesture = Some(SelectionGesture::new(&terminal)?);
                     pane.terminal = Some(terminal);
+                    pane.program_bg_dirty = true;
                     pane.dirty = true;
                     outcome.dirty = true;
                     outcome.became_ready = true;
@@ -813,6 +830,8 @@ impl PaneStore {
                     let events = term.drain_events();
                     sync_terminal_events_to_workspace(&key, &events, workspace, pane);
                     outcome.terminal_events.extend(events);
+                    update_unread_on_write(pane, !bytes.is_empty());
+                    pane.program_bg_dirty = true;
                     pane.dirty = true;
                     outcome.dirty = true;
                 } else {
@@ -829,6 +848,7 @@ impl PaneStore {
                         cols, rows, owner, ..
                     } => {
                         pane.scroll_accum_px = 0.0;
+                        pane.scroll_velocity_px_per_sec = 0.0;
                         pane.pane_cache.clear();
                         workspace.note_server_resize(&key, *cols, *rows, owner.clone());
                     }
@@ -844,7 +864,10 @@ impl PaneStore {
                             blk.exited_code = Some(*exit_code);
                         }
                     }
-                    RexControlApc::Theme { .. } | RexControlApc::Unknown { .. } => {}
+                    RexControlApc::Theme { .. } => {
+                        pane.program_bg_dirty = true;
+                    }
+                    RexControlApc::Unknown { .. } => {}
                 }
 
                 if let Some(term) = pane.terminal.as_ref() {
@@ -986,6 +1009,19 @@ impl PaneStore {
         renderer: &mut GpuRenderer,
         draw_list: &mut DrawList,
     ) -> Result<Option<PaneRenderResult>, PaneStoreError> {
+        self.render_pane_with_cursor_override(key, viewport, overscan, renderer, draw_list, None)
+    }
+
+    /// Same as [`Self::render_pane`], allowing an optional Copy Mode cursor override.
+    pub fn render_pane_with_cursor_override(
+        &mut self,
+        key: &BlockKey,
+        viewport: &TerminalViewport,
+        overscan: Overscan,
+        renderer: &mut GpuRenderer,
+        draw_list: &mut DrawList,
+        cursor_override: Option<TerminalCursor>,
+    ) -> Result<Option<PaneRenderResult>, PaneStoreError> {
         let Some(pane) = self.panes.get_mut(key) else {
             return Ok(None);
         };
@@ -994,6 +1030,7 @@ impl PaneStore {
         };
 
         let held = term.is_render_held();
+        let mut program_bg_changed = false;
         if !held || !pane.has_rendered_once {
             // Phase 1: microsecond terminal lock.
             let snap = pane.render_state.begin_update(&term, overscan)?;
@@ -1001,17 +1038,32 @@ impl PaneStore {
             pane.render_state.end_update()?;
             pane.last_update_snapshot = snap;
             pane.has_rendered_once = true;
+            if let Ok(new_pbg) = pane
+                .render_state
+                .sample_program_bg(term.is_alternate_screen())
+            {
+                if new_pbg != pane.program_bg {
+                    pane.program_bg = new_pbg;
+                    program_bg_changed = true;
+                }
+                pane.program_bg_dirty = false;
+            }
         }
 
         // `wgpu::Queue` is an inexpensive `Arc`-backed handle; clone it to pass alongside `atlas_mut`.
         let queue = renderer.queue().clone();
-        let stats = pane.pane_cache.build_from_vt_render_state(
-            &mut pane.render_state,
-            viewport,
-            renderer.atlas_mut(),
-            &queue,
-            draw_list,
-        )?;
+        let stats = {
+            let mut atlas = renderer.atlas_mut();
+            pane.pane_cache
+                .build_from_vt_render_state_with_cursor_override(
+                    &mut pane.render_state,
+                    viewport,
+                    &mut atlas,
+                    &queue,
+                    draw_list,
+                    cursor_override,
+                )?
+        };
 
         let (kitty_placements, kitty_uploads) =
             emit_kitty_placements_with_renderer(pane, &term, viewport, renderer, draw_list)?;
@@ -1029,6 +1081,7 @@ impl PaneStore {
             scrollbar: pane.last_update_snapshot.scrollbar,
             viewport_active: pane.last_update_snapshot.viewport_active,
             scroll_offset_y: viewport.scroll_offset_y,
+            program_bg_changed,
         }))
     }
 
@@ -1045,6 +1098,33 @@ impl PaneStore {
         image_cache: &mut ImageTextureCache,
         draw_list: &mut DrawList,
     ) -> Result<Option<PaneRenderResult>, PaneStoreError> {
+        self.render_pane_parts_with_cursor_override(
+            key,
+            viewport,
+            overscan,
+            device,
+            queue,
+            atlas,
+            image_cache,
+            draw_list,
+            None,
+        )
+    }
+
+    /// Lower-level variant of [`Self::render_pane_parts`] with an optional Copy Mode cursor override.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_pane_parts_with_cursor_override(
+        &mut self,
+        key: &BlockKey,
+        viewport: &TerminalViewport,
+        overscan: Overscan,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &mut GlyphAtlas,
+        image_cache: &mut ImageTextureCache,
+        draw_list: &mut DrawList,
+        cursor_override: Option<TerminalCursor>,
+    ) -> Result<Option<PaneRenderResult>, PaneStoreError> {
         let Some(pane) = self.panes.get_mut(key) else {
             return Ok(None);
         };
@@ -1053,20 +1133,34 @@ impl PaneStore {
         };
 
         let held = term.is_render_held();
+        let mut program_bg_changed = false;
         if !held || !pane.has_rendered_once {
             let snap = pane.render_state.begin_update(&term, overscan)?;
             pane.render_state.end_update()?;
             pane.last_update_snapshot = snap;
             pane.has_rendered_once = true;
+            if let Ok(new_pbg) = pane
+                .render_state
+                .sample_program_bg(term.is_alternate_screen())
+            {
+                if new_pbg != pane.program_bg {
+                    pane.program_bg = new_pbg;
+                    program_bg_changed = true;
+                }
+                pane.program_bg_dirty = false;
+            }
         }
 
-        let stats = pane.pane_cache.build_from_vt_render_state(
-            &mut pane.render_state,
-            viewport,
-            atlas,
-            queue,
-            draw_list,
-        )?;
+        let stats = pane
+            .pane_cache
+            .build_from_vt_render_state_with_cursor_override(
+                &mut pane.render_state,
+                viewport,
+                atlas,
+                queue,
+                draw_list,
+                cursor_override,
+            )?;
 
         let (kitty_placements, kitty_uploads) = emit_kitty_placements_with_parts(
             pane,
@@ -1091,6 +1185,7 @@ impl PaneStore {
             scrollbar: pane.last_update_snapshot.scrollbar,
             viewport_active: pane.last_update_snapshot.viewport_active,
             scroll_offset_y: viewport.scroll_offset_y,
+            program_bg_changed,
         }))
     }
 
@@ -1126,6 +1221,7 @@ impl PaneStore {
         let mut mode_2031_reports = Vec::new();
         for (key, pane) in &mut self.panes {
             pane.pane_cache.clear();
+            pane.program_bg_dirty = true;
             let Some(term) = pane.terminal.as_ref() else {
                 continue;
             };
@@ -1171,32 +1267,6 @@ impl PaneStore {
             .panes
             .keys()
             .filter(|k| k.host_id == host_id && k.session_id == session_id)
-            .cloned()
-            .collect();
-        let mut evicted_uids = Vec::with_capacity(keys.len());
-        for key in &keys {
-            if let Some(pane) = self.panes.remove(key) {
-                evicted_uids.push(u64::from(pane.pane_uid));
-            }
-        }
-        if let Some(cache) = image_cache
-            && !evicted_uids.is_empty()
-        {
-            cache.retain(|id| !evicted_uids.contains(&(id >> 32)));
-        }
-        evicted_uids.len()
-    }
-
-    /// Evicts all panes belonging to `host_id` and releases their Kitty GPU textures.
-    pub fn evict_host(
-        &mut self,
-        host_id: &str,
-        image_cache: Option<&mut ImageTextureCache>,
-    ) -> usize {
-        let keys: Vec<BlockKey> = self
-            .panes
-            .keys()
-            .filter(|k| k.host_id == host_id)
             .cloned()
             .collect();
         let mut evicted_uids = Vec::with_capacity(keys.len());
@@ -1354,30 +1424,6 @@ impl PaneStore {
         Ok(())
     }
 
-    /// Advances selection while dragging past pane edges.
-    #[allow(clippy::too_many_arguments)]
-    pub fn selection_autoscroll_tick(
-        &mut self,
-        key: &BlockKey,
-        col: u16,
-        row: u32,
-        px_x: f64,
-        px_y: f64,
-        geometry: SelectionGeometry,
-        rectangle: bool,
-    ) -> Result<(bool, SelectionAutoscroll), PaneStoreError> {
-        let pane = self.ready_pane_mut(key)?;
-        let Some(gesture) = pane.selection_gesture.as_mut() else {
-            return Err(PaneStoreError::PaneNotReady(key.clone()));
-        };
-        let changed = gesture.autoscroll_tick(col, row, px_x, px_y, geometry, rectangle)?;
-        let dir = gesture.autoscroll_direction()?;
-        if changed {
-            pane.dirty = true;
-        }
-        Ok((changed, dir))
-    }
-
     /// Selects all text in the active screen and scrollback.
     pub fn select_all(&mut self, key: &BlockKey) -> Result<bool, PaneStoreError> {
         let pane = self.ready_pane_mut(key)?;
@@ -1411,6 +1457,31 @@ impl PaneStore {
     ) -> Result<Option<String>, PaneStoreError> {
         let term = self.ready_terminal(key)?;
         Ok(vt_engine::selection_text(term, unwrap, trim)?)
+    }
+
+    /// Computes logical-pixel bounding rectangles for each viewport row in the active selection.
+    pub fn selection_viewport_rects(
+        &self,
+        key: &BlockKey,
+        content_rect: Rect,
+        metrics: CellMetrics,
+        scroll_y: f32,
+    ) -> Result<Vec<Rect>, PaneStoreError> {
+        let term = self.ready_terminal(key)?;
+        let spans = vt_engine::selection::selection_viewport_spans(term)?;
+        let cell_w = metrics.cell_width.max(1.0);
+        let cell_h = metrics.cell_height.max(1.0);
+        let mut rects = Vec::with_capacity(spans.len());
+        for span in spans {
+            if span.end_col <= span.start_col {
+                continue;
+            }
+            let x = content_rect.x + f32::from(span.start_col) * cell_w;
+            let w = f32::from(span.end_col - span.start_col) * cell_w;
+            let y = content_rect.y + (span.row as f32) * cell_h + scroll_y;
+            rects.push(Rect::new(x, y, w, cell_h));
+        }
+        Ok(rects)
     }
 
     /// Extracts the OSC 8 hyperlink URI at viewport coordinate `(col, row)`, if present.
@@ -1487,7 +1558,7 @@ impl PaneStore {
     }
 
     // -----------------------------------------------------------------------
-    // Smooth overscan scrolling
+    // Smooth overscan scrolling + inertia
     // -----------------------------------------------------------------------
 
     /// Applies a smooth vertical scroll delta in logical pixels (`delta_y_px > 0` scrolls up into
@@ -1503,42 +1574,89 @@ impl PaneStore {
         cell_height_px: f32,
     ) -> Result<f32, PaneStoreError> {
         let pane = self.ready_pane_mut(key)?;
-        let Some(term) = pane.terminal.as_ref() else {
-            return Err(PaneStoreError::PaneNotReady(key.clone()));
-        };
+        let (accum, _, _) = scroll_wheel_px_inner(pane, delta_y_px, cell_height_px)?;
+        Ok(accum)
+    }
 
-        let cell_h = cell_height_px.max(1.0);
-        let initial_sb = term.scrollbar()?;
-        if initial_sb.total <= initial_sb.len {
-            pane.scroll_accum_px = 0.0;
-            return Ok(0.0);
+    /// Applies an interactive wheel/touchpad scroll step AND adds inertia momentum velocity
+    /// (`px/s`) that coasts smoothly via [`Self::tick_scroll_inertia`].
+    pub fn scroll_wheel_impulse(
+        &mut self,
+        key: &BlockKey,
+        delta_y_px: f32,
+        cell_height_px: f32,
+    ) -> Result<f32, PaneStoreError> {
+        let pane = self.ready_pane_mut(key)?;
+        let (accum, at_top, at_bottom) = scroll_wheel_px_inner(pane, delta_y_px, cell_height_px)?;
+        if (at_top && delta_y_px > 0.0) || (at_bottom && delta_y_px < 0.0) {
+            pane.scroll_velocity_px_per_sec = 0.0;
+        } else if delta_y_px.abs() > 0.01 {
+            if pane.scroll_velocity_px_per_sec != 0.0
+                && delta_y_px.signum() != pane.scroll_velocity_px_per_sec.signum()
+            {
+                pane.scroll_velocity_px_per_sec = 0.0;
+            }
+            pane.scroll_velocity_px_per_sec =
+                (pane.scroll_velocity_px_per_sec * 0.45 + delta_y_px * 11.0).clamp(-4800.0, 4800.0);
         }
+        Ok(accum)
+    }
 
-        pane.scroll_accum_px += delta_y_px;
-
-        // Whole-line steps: positive accum => scroll UP (negative delta in Ghostty viewport coords).
-        let whole_lines = (pane.scroll_accum_px / cell_h).trunc() as isize;
-        if whole_lines != 0 {
-            term.scroll_viewport(ScrollViewport::Delta(-whole_lines));
-            pane.scroll_accum_px -= (whole_lines as f32) * cell_h;
+    /// Advances active scroll inertia across all panes by `dt_secs` with exponential damping.
+    /// Returns `true` if any pane scrolled.
+    pub fn tick_scroll_inertia(&mut self, dt_secs: f32) -> bool {
+        let dt = dt_secs.clamp(0.0, 0.05);
+        if dt <= 0.0 {
+            return false;
         }
-
-        // Clamp fractional overscan strictly inside scrollback bounds so we never expose blank edges.
-        let sb = term.scrollbar()?;
-        let at_top = sb.offset == 0;
-        let at_bottom = sb.offset.saturating_add(sb.len) >= sb.total;
-        if (at_top && pane.scroll_accum_px > 0.0) || (at_bottom && pane.scroll_accum_px < 0.0) {
-            pane.scroll_accum_px = 0.0;
-        } else {
-            pane.scroll_accum_px = pane.scroll_accum_px.clamp(-(cell_h - 0.5), cell_h - 0.5);
+        let decay = (-10.5_f32 * dt).exp();
+        let mut stepped = false;
+        for pane in self.panes.values_mut() {
+            if pane.scroll_velocity_px_per_sec.abs() < 12.0 {
+                pane.scroll_velocity_px_per_sec = 0.0;
+                continue;
+            }
+            let step_px = pane.scroll_velocity_px_per_sec * dt;
+            let cell_h = pane.scroll_cell_height_px.max(1.0);
+            match scroll_wheel_px_inner(pane, step_px, cell_h) {
+                Ok((_, at_top, at_bottom)) => {
+                    if (at_top && pane.scroll_velocity_px_per_sec > 0.0)
+                        || (at_bottom && pane.scroll_velocity_px_per_sec < 0.0)
+                    {
+                        pane.scroll_velocity_px_per_sec = 0.0;
+                        pane.scroll_accum_px = 0.0;
+                    } else {
+                        pane.scroll_velocity_px_per_sec *= decay;
+                        if pane.scroll_velocity_px_per_sec.abs() < 12.0 {
+                            pane.scroll_velocity_px_per_sec = 0.0;
+                        }
+                    }
+                    stepped = true;
+                }
+                Err(_) => {
+                    pane.scroll_velocity_px_per_sec = 0.0;
+                }
+            }
         }
+        stepped
+    }
 
-        pane.dirty = true;
-        Ok(pane.scroll_accum_px)
+    /// Returns `true` when any pane has active smooth-scroll momentum waiting to settle.
+    pub fn has_active_scroll_inertia(&self) -> bool {
+        self.panes
+            .values()
+            .any(|p| p.scroll_velocity_px_per_sec.abs() >= 12.0)
+    }
+
+    /// Immediately cancels any active smooth-scroll inertia velocity on `key`.
+    pub fn cancel_scroll_inertia(&mut self, key: &BlockKey) {
+        if let Some(pane) = self.panes.get_mut(key) {
+            pane.scroll_velocity_px_per_sec = 0.0;
+        }
     }
 
     /// Jumps viewport scroll directly (e.g. `ScrollViewport::Top`, `Bottom`, `Row(r)`), clearing
-    /// fractional smooth-scroll offset.
+    /// fractional smooth-scroll offset and inertia velocity.
     pub fn scroll_viewport(
         &mut self,
         key: &BlockKey,
@@ -1550,6 +1668,12 @@ impl PaneStore {
         };
         term.scroll_viewport(scroll);
         pane.scroll_accum_px = 0.0;
+        pane.scroll_velocity_px_per_sec = 0.0;
+        if let Ok(sb) = term.scrollbar()
+            && (sb.total <= sb.len || sb.offset.saturating_add(sb.len) >= sb.total)
+        {
+            pane.unread_output_while_scrolled_up = false;
+        }
         pane.dirty = true;
         Ok(())
     }
@@ -1617,33 +1741,6 @@ impl PaneStore {
         })
     }
 
-    /// Advances an active search incrementally without blocking on large scrollback buffers.
-    pub fn search_step(
-        &mut self,
-        key: &BlockKey,
-        max_ticks: usize,
-    ) -> Result<SearchStatus, PaneStoreError> {
-        let pane = self.ready_pane_mut(key)?;
-        let Some(search) = pane.search.as_mut() else {
-            return Ok(SearchStatus::Complete);
-        };
-        let mut status = search.status()?;
-        for _ in 0..max_ticks.max(1) {
-            match status {
-                SearchStatus::Complete => break,
-                SearchStatus::FeedRequired => {
-                    search.feed()?;
-                    status = search.tick()?;
-                }
-                SearchStatus::Running => {
-                    status = search.tick()?;
-                }
-            }
-        }
-        pane.dirty = true;
-        Ok(status)
-    }
-
     /// Jumps selection/viewport to the next search match (older history).
     pub fn search_next(&mut self, key: &BlockKey) -> Result<bool, PaneStoreError> {
         let pane = self.ready_pane_mut(key)?;
@@ -1653,6 +1750,7 @@ impl PaneStore {
         let moved = search.select_next()?;
         if moved {
             pane.scroll_accum_px = 0.0;
+            pane.scroll_velocity_px_per_sec = 0.0;
             pane.dirty = true;
         }
         Ok(moved)
@@ -1667,21 +1765,10 @@ impl PaneStore {
         let moved = search.select_prev()?;
         if moved {
             pane.scroll_accum_px = 0.0;
+            pane.scroll_velocity_px_per_sec = 0.0;
             pane.dirty = true;
         }
         Ok(moved)
-    }
-
-    /// Projects all visible search matches into viewport `(col, row)` coordinates for highlight quads.
-    pub fn search_viewport_matches(
-        &mut self,
-        key: &BlockKey,
-    ) -> Result<Vec<ViewportMatch>, PaneStoreError> {
-        let pane = self.ready_pane_mut(key)?;
-        let Some(search) = pane.search.as_mut() else {
-            return Ok(Vec::new());
-        };
-        Ok(search.viewport_matches()?)
     }
 
     /// Closes the pane's active search session and frees its native searcher handle.
@@ -1691,6 +1778,145 @@ impl PaneStore {
             pane.search_query.clear();
             pane.dirty = true;
         }
+    }
+
+    /// Returns the screen-absolute `(start, end)` range of the currently selected search match.
+    pub fn search_selected_match_screen_range(
+        &self,
+        key: &BlockKey,
+    ) -> Result<Option<(ScreenPoint, ScreenPoint)>, PaneStoreError> {
+        let pane = self.ready_pane(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Ok(None);
+        };
+        let Some(search) = pane.search.as_ref() else {
+            return Ok(None);
+        };
+        Ok(search.selected_match_screen_range(term)?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Vim Copy Mode helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns `(initial_cursor, cols, total_rows, scrollbar)` for entering Copy Mode on `key`.
+    pub fn copy_mode_initial_cursor(
+        &self,
+        key: &BlockKey,
+    ) -> Option<(ScreenPoint, u16, u32, Scrollbar)> {
+        let pane = self.panes.get(key)?;
+        let term = pane.terminal.as_ref()?;
+        let (cols, total_rows) = vt_engine::screen_row_bounds(term).ok()?;
+        let sb = term.scrollbar().ok()?;
+        let mut cursor_col = 0u16;
+        let mut cursor_row = u32::try_from(sb.offset).unwrap_or(0);
+        if let Some((vcol, vrow)) = pane.render_state.cursor().viewport_pos {
+            cursor_col = vcol.min(cols.saturating_sub(1));
+            cursor_row = u32::try_from(sb.offset)
+                .unwrap_or(0)
+                .saturating_add(u32::from(vrow))
+                .min(total_rows.saturating_sub(1));
+        }
+        Some((
+            ScreenPoint {
+                col: cursor_col,
+                row: cursor_row,
+            },
+            cols,
+            total_rows,
+            sb,
+        ))
+    }
+
+    /// Returns `(cols, total_rows, scrollbar)` for an active Copy Mode pane.
+    pub fn copy_mode_screen_bounds(&self, key: &BlockKey) -> Option<(u16, u32, Scrollbar)> {
+        let pane = self.panes.get(key)?;
+        let term = pane.terminal.as_ref()?;
+        let (cols, total_rows) = vt_engine::screen_row_bounds(term).ok()?;
+        let sb = term.scrollbar().ok()?;
+        Some((cols, total_rows, sb))
+    }
+
+    pub fn copy_mode_select_range(
+        &mut self,
+        key: &BlockKey,
+        anchor: ScreenPoint,
+        cursor: ScreenPoint,
+        mode: SelectionMode,
+    ) -> Result<(), PaneStoreError> {
+        let pane = self.ready_pane_mut(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        };
+        vt_engine::select_range(term, anchor, cursor, mode)?;
+        pane.dirty = true;
+        Ok(())
+    }
+
+    pub fn copy_mode_clear_selection(&mut self, key: &BlockKey) -> Result<(), PaneStoreError> {
+        let pane = self.ready_pane_mut(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        };
+        vt_engine::clear_selection(term)?;
+        pane.dirty = true;
+        Ok(())
+    }
+
+    pub fn copy_mode_selection_text(
+        &self,
+        key: &BlockKey,
+    ) -> Result<Option<String>, PaneStoreError> {
+        let pane = self.ready_pane(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        };
+        Ok(vt_engine::selection_text(term, true, true)?)
+    }
+
+    pub fn copy_mode_first_non_blank(
+        &self,
+        key: &BlockKey,
+        screen_row: u32,
+    ) -> Result<u16, PaneStoreError> {
+        let pane = self.ready_pane(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        };
+        Ok(vt_engine::screen_first_non_blank_col(term, screen_row)?)
+    }
+
+    pub fn copy_mode_line_end(
+        &self,
+        key: &BlockKey,
+        screen_row: u32,
+    ) -> Result<u16, PaneStoreError> {
+        let pane = self.ready_pane(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        };
+        Ok(vt_engine::screen_line_end_col(term, screen_row)?)
+    }
+
+    pub fn copy_mode_word_motion(
+        &self,
+        key: &BlockKey,
+        from: ScreenPoint,
+        motion: WordMotion,
+    ) -> Result<ScreenPoint, PaneStoreError> {
+        let pane = self.ready_pane(key)?;
+        let Some(term) = pane.terminal.as_ref() else {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        };
+        Ok(vt_engine::screen_word_motion(term, from, motion)?)
+    }
+
+    /// Number of active/ready terminal pane streams tracked for `host_id`.
+    pub fn active_stream_count_for_host(&self, host_id: &str) -> usize {
+        self.panes
+            .iter()
+            .filter(|(k, p)| k.host_id == host_id && p.terminal.is_some())
+            .count()
     }
 
     // -----------------------------------------------------------------------
@@ -1739,6 +1965,17 @@ impl PaneStore {
             .ok_or_else(|| PaneStoreError::PaneNotReady(key.clone()))
     }
 
+    fn ready_pane(&self, key: &BlockKey) -> Result<&PaneRuntime, PaneStoreError> {
+        let pane = self
+            .panes
+            .get(key)
+            .ok_or_else(|| PaneStoreError::PaneNotFound(key.clone()))?;
+        if pane.terminal.is_none() {
+            return Err(PaneStoreError::PaneNotReady(key.clone()));
+        }
+        Ok(pane)
+    }
+
     fn ready_pane_mut(&mut self, key: &BlockKey) -> Result<&mut PaneRuntime, PaneStoreError> {
         let pane = self
             .panes
@@ -1748,6 +1985,18 @@ impl PaneStore {
             return Err(PaneStoreError::PaneNotReady(key.clone()));
         }
         Ok(pane)
+    }
+
+    pub(crate) fn insert_terminal(
+        &mut self,
+        key: BlockKey,
+        terminal: Terminal,
+    ) -> Result<(), PaneStoreError> {
+        let uid = self.alloc_pane_uid();
+        let _ = terminal.set_theme(&self.active_theme);
+        let runtime = PaneRuntime::from_terminal(uid, key.clone(), terminal)?;
+        self.panes.insert(key, runtime);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1762,6 +2011,7 @@ impl PaneStore {
         let mut pane = PaneRuntime::new(uid, key.clone(), cfg.clone())?;
         let term = Terminal::new(cols, rows, cfg)?;
         term.resize(cols, rows, 10, 20)?;
+        pane.decoder = None;
         pane.terminal = Some(term);
         pane.dirty = true;
         self.panes.insert(key.clone(), pane);
@@ -1778,9 +2028,88 @@ impl PaneStore {
         if let Some(term) = pane.terminal.as_ref() {
             term.write(bytes);
         }
+        update_unread_on_write(pane, !bytes.is_empty());
+        pane.program_bg_dirty = true;
         pane.dirty = true;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn resize_local_test_pane(
+        &mut self,
+        key: &BlockKey,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), PaneStoreError> {
+        let pane = self.ready_pane_mut(key)?;
+        if let Some(term) = pane.terminal.as_ref() {
+            term.resize(cols, rows, 10, 20)?;
+        }
+        pane.dirty = true;
+        Ok(())
+    }
+}
+
+fn update_unread_on_write(pane: &mut PaneRuntime, non_empty: bool) {
+    let Some(term) = pane.terminal.as_ref() else {
+        return;
+    };
+    if term.is_alternate_screen() {
+        pane.unread_output_while_scrolled_up = false;
+        return;
+    }
+    if let Ok(sb) = term.scrollbar() {
+        let at_bottom = sb.total <= sb.len || sb.offset.saturating_add(sb.len) >= sb.total;
+        if at_bottom {
+            pane.unread_output_while_scrolled_up = false;
+        } else if non_empty {
+            pane.unread_output_while_scrolled_up = true;
+        }
+    }
+}
+
+fn scroll_wheel_px_inner(
+    pane: &mut PaneRuntime,
+    delta_y_px: f32,
+    cell_height_px: f32,
+) -> Result<(f32, bool, bool), PaneStoreError> {
+    let Some(term) = pane.terminal.as_ref() else {
+        return Err(PaneStoreError::PaneNotReady(pane.key.clone()));
+    };
+
+    let cell_h = cell_height_px.max(1.0);
+    pane.scroll_cell_height_px = cell_h;
+    let initial_sb = term.scrollbar()?;
+    if initial_sb.total <= initial_sb.len {
+        pane.scroll_accum_px = 0.0;
+        pane.unread_output_while_scrolled_up = false;
+        return Ok((0.0, true, true));
+    }
+
+    pane.scroll_accum_px += delta_y_px;
+
+    // Whole-line steps: positive accum => scroll UP (negative delta in Ghostty viewport coords).
+    let whole_lines = (pane.scroll_accum_px / cell_h).trunc() as isize;
+    if whole_lines != 0 {
+        term.scroll_viewport(ScrollViewport::Delta(-whole_lines));
+        pane.scroll_accum_px -= (whole_lines as f32) * cell_h;
+    }
+
+    // Clamp fractional overscan strictly inside scrollback bounds so we never expose blank edges.
+    let sb = term.scrollbar()?;
+    let at_top = sb.offset == 0;
+    let at_bottom = sb.offset.saturating_add(sb.len) >= sb.total;
+    if at_bottom {
+        pane.unread_output_while_scrolled_up = false;
+    }
+    if (at_top && pane.scroll_accum_px > 0.0) || (at_bottom && pane.scroll_accum_px < 0.0) {
+        pane.scroll_accum_px = 0.0;
+    } else {
+        pane.scroll_accum_px = pane.scroll_accum_px.clamp(-(cell_h - 0.5), cell_h - 0.5);
+    }
+
+    pane.dirty = true;
+    Ok((pane.scroll_accum_px, at_top, at_bottom))
 }
 
 fn flush_post_finish_bytes(
@@ -2150,9 +2479,8 @@ fn emit_kitty_placements_with_renderer(
         };
 
         let gpu_id = compose_kitty_image_id(pane.pane_uid, p.image_id);
-        if !renderer.images().has_generation(gpu_id, p.generation)
-            && let Some(pixels) = vt_engine::read_kitty_image(term, p.image_id)?
-        {
+        let has_gen = renderer.images().has_generation(gpu_id, p.generation);
+        if !has_gen && let Some(pixels) = vt_engine::read_kitty_image(term, p.image_id)? {
             let uploaded = renderer.upload_image(ImageUpload {
                 id: gpu_id,
                 generation: pixels.generation,
@@ -2166,16 +2494,10 @@ fn emit_kitty_placements_with_renderer(
             }
         }
 
-        if let Some(cached) = renderer.images().get(gpu_id) {
+        let dims = renderer.images().get(gpu_id).map(|c| (c.width, c.height));
+        if let Some((w, h)) = dims {
             pane.gpu_placements_scratch.push(convert_kitty_placement(
-                p,
-                gpu_id,
-                cached.width,
-                cached.height,
-                viewport,
-                scale,
-                &clip_ctx,
-                clip_rect,
+                p, gpu_id, w, h, viewport, scale, &clip_ctx, clip_rect,
             ));
         }
     }
@@ -2552,6 +2874,7 @@ mod tests {
         assert_eq!(blk_title.as_deref(), Some("Omarex Unit Pane"));
 
         // 5. Render via headless GpuRenderer and confirm glyphs + Kitty GPU texture upload!
+        let _gpu_guard = crate::lock_headless_gpu_test();
         let mut renderer = GpuRenderer::new_headless(GpuConfig::default()).expect("headless GPU");
         let metrics = renderer.atlas_mut().measure_monospace_cell(14.0, 1.0);
         let vp = build_terminal_viewport(
@@ -2709,7 +3032,10 @@ mod tests {
 
         // 10. Evicting the session cleans up its Kitty Graphics textures from ImageTextureCache!
         assert_eq!(renderer.images().len(), 1);
-        let evicted = store.evict_session(LOCAL_HOST_ID, "sess-1", Some(renderer.images_mut()));
+        let evicted = {
+            let mut images = renderer.images_mut();
+            store.evict_session(LOCAL_HOST_ID, "sess-1", Some(&mut images))
+        };
         assert_eq!(evicted, 1);
         assert_eq!(renderer.images().len(), 0);
     }
@@ -2967,6 +3293,7 @@ mod tests {
         let (cols, rows) = pane_store.size(&key).expect("pane terminal size");
         assert!(cols > 0 && rows > 0);
 
+        let _gpu_guard = crate::lock_headless_gpu_test();
         let mut renderer = GpuRenderer::new_headless(GpuConfig::default()).expect("Vulkan GPU");
         let scale = 2.0f32;
         let font_size = 13.5f32;
@@ -3059,6 +3386,7 @@ mod tests {
         );
         store.feed_local_test_bytes(&key, seq.as_bytes()).unwrap();
 
+        let _gpu_guard = crate::lock_headless_gpu_test();
         let mut renderer = GpuRenderer::new_headless(GpuConfig::default()).expect("headless GPU");
         let metrics = CellMetrics {
             font_size: 14.0,
@@ -3127,6 +3455,7 @@ mod tests {
         );
         store.feed_local_test_bytes(&key, seq.as_bytes()).unwrap();
 
+        let _gpu_guard = crate::lock_headless_gpu_test();
         let mut renderer = GpuRenderer::new_headless(GpuConfig::default()).expect("headless GPU");
         let metrics = CellMetrics {
             font_size: 14.0,
@@ -3204,6 +3533,7 @@ mod tests {
         store.feed_local_test_bytes(&key, seq.as_bytes()).unwrap();
 
         // Render on a 1x Omarchy display (`cell_w=10px, cell_h=20px, scale=1.0`).
+        let _gpu_guard = crate::lock_headless_gpu_test();
         let mut renderer = GpuRenderer::new_headless(GpuConfig::default()).expect("headless GPU");
         let metrics = CellMetrics {
             font_size: 14.0,
@@ -3256,6 +3586,76 @@ mod tests {
             (img.bounds.width - 100.0).abs() <= 2.0,
             "expected Retina-to-1x scaled width ~100px, got {}",
             img.bounds.width
+        );
+    }
+
+    #[test]
+    fn scroll_inertia_coasts_clamps_at_bounds_and_tracks_unread_output_and_program_bg() {
+        let mut store = PaneStore::new().expect("store");
+        let key = BlockKey::new(LOCAL_HOST_ID, "session:test", "block:1");
+        store.create_local_test_pane(&key, 40, 6).expect("pane");
+
+        // Emit enough lines to populate scrollback.
+        let mut lines = String::new();
+        for idx in 1..=30 {
+            lines.push_str(&format!("line {idx}\r\n"));
+        }
+        store
+            .feed_local_test_bytes(&key, lines.as_bytes())
+            .expect("feed scrollback");
+        assert!(!store.is_scrolled_up(&key));
+        assert!(!store.has_unread_output(&key));
+
+        // Impulse scrolls up and initiates decaying coasting (85px = 4 lines + 5px overscan).
+        let applied = store
+            .scroll_wheel_impulse(&key, 85.0, 20.0)
+            .expect("impulse");
+        assert!(
+            applied.abs() > 0.0,
+            "expected non-zero fractional overscan, got {applied}"
+        );
+        assert!(store.has_active_scroll_inertia());
+        assert!(store.is_scrolled_up(&key));
+
+        // New output while scrolled up marks unread output.
+        store
+            .feed_local_test_bytes(&key, b"fresh output while scrolled\r\n")
+            .expect("feed unread");
+        assert!(store.has_unread_output(&key));
+
+        // Tick inertia until settled; must reach idle without drifting past bounds.
+        let mut ticks = 0;
+        while store.tick_scroll_inertia(1.0 / 60.0) {
+            ticks += 1;
+            assert!(ticks < 240, "scroll inertia did not settle in 4s");
+        }
+        assert!(!store.has_active_scroll_inertia());
+        assert!(store.is_scrolled_up(&key));
+
+        // Cancel & scroll_to_bottom clears unread badge.
+        store
+            .scroll_wheel_impulse(&key, 40.0, 20.0)
+            .expect("impulse 2");
+        assert!(store.has_active_scroll_inertia());
+        store.cancel_scroll_inertia(&key);
+        assert!(!store.has_active_scroll_inertia());
+        store.scroll_to_bottom(&key).expect("scroll to bottom");
+        assert!(!store.is_scrolled_up(&key));
+        assert!(!store.has_unread_output(&key));
+
+        // Alternate screen with colored border fills samples program_bg; normal screen returns None.
+        assert_eq!(store.refresh_program_bg(&key), None);
+        store
+            .feed_local_test_bytes(&key, b"\x1b[?1049h\x1b[48;2;24;48;72m\x1b[2J")
+            .expect("alt screen bg");
+        let sampled = store.refresh_program_bg(&key);
+        assert_eq!(
+            sampled,
+            Some(vt_engine::Rgb {
+                r: 24,
+                g: 48,
+                b: 72,
+            })
         );
     }
 }
