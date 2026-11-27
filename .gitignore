@@ -21,6 +21,3 @@ pkgbuild/*.pkg.tar.*
 *.swo
 .vscode/
 .idea/
-
-# Local development helper scripts
-bin/fix-board

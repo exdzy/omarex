@@ -29,7 +29,6 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06", "way
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
-swash = "0.2"
 etagere = "0.3"
 taffy = "0.16"
 resvg = "0.50"

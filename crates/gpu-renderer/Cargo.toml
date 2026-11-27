@@ -12,7 +12,6 @@ image.workspace = true
 omarchy-theme.workspace = true
 parking_lot.workspace = true
 resvg.workspace = true
-swash.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
 tracing.workspace = true

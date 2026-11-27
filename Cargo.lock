@@ -904,7 +904,6 @@ dependencies = [
  "omarchy-theme",
  "parking_lot 0.13.0",
  "resvg",
- "swash",
  "thiserror 2.0.21",
  "tiny-skia",
  "tracing",
@@ -1885,9 +1884,9 @@ dependencies = [
  "dirs",
  "gpu-renderer",
  "image",
+ "notify",
  "omarchy-theme",
  "open",
- "parking_lot 0.13.0",
  "raw-window-handle",
  "rex-proto",
  "rustix 1.1.6",
@@ -3311,11 +3310,8 @@ version = "0.1.0"
 dependencies = [
  "nucleo-matcher",
  "omarchy-theme",
- "rex-proto",
  "taffy",
- "thiserror 2.0.21",
  "tr3x-bridge",
- "tracing",
 ]
 
 [[package]]
