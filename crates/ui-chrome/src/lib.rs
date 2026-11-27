@@ -54,14 +54,15 @@ pub use layout::{
 };
 pub use modal::{
     DiagnosticsHostRow, DiagnosticsSnapshot, FilePickerEntry, FilePickerPurpose, FindBarState,
-    ModalContent, ModalKey, ModalKeyOutcome, ModalState, SettingsViewSnapshot, ToastAnchor,
+    IosPairingSnapshot, LocalServerState, ModalContent, ModalKey, ModalKeyOutcome, ModalState,
+    QrMatrix, ServerSettingsSnapshot, SettingsViewSnapshot, TailscalePairState, ToastAnchor,
     ToastItem, ToastSeverity, WhichKeyState, render_find_bar, render_modal, render_toasts,
     render_which_key,
 };
 pub use palette::{PaletteItem, PaletteMatcher, ScoredMatch, highlight_spans};
 pub use pane_chrome::{
-    Osc94Progress, Osc94State, PaneChromeOptions, PaneMeta, PortBadge, ScrollbarMetrics,
-    render_workspace_chrome,
+    Osc94Progress, Osc94State, PaneChromeOptions, PaneMeta, PortBadge, ResumeBadge,
+    ScrollbarMetrics, render_workspace_chrome,
 };
 pub use sidebar::{
     ActivitySortMode, HostConnectionState, SidebarHostView, SidebarScrollMetrics,
@@ -1795,6 +1796,7 @@ mod tests {
                     hovered: true,
                     bell_unread: false,
                     program_status: None,
+                    resume_badge: None,
                     osc94_progress: Some(Osc94Progress {
                         state: Osc94State::Normal,
                         percent: 65,
@@ -1822,6 +1824,7 @@ mod tests {
                     hovered: false,
                     bell_unread: false,
                     program_status: None,
+                    resume_badge: None,
                     osc94_progress: None,
                     scrollbar: ScrollbarMetrics::default(),
                     program_bg: None,
@@ -3141,6 +3144,7 @@ mod tests {
             hovered: false,
             bell_unread: false,
             program_status: None,
+            resume_badge: None,
             osc94_progress: None,
             scrollbar: ScrollbarMetrics::default(),
             program_bg: None,
@@ -3450,6 +3454,7 @@ mod tests {
             keymap_warnings: vec!["unused key".into()],
             active_ports: vec![":3000".into()],
             active_tunnels: vec![],
+            resume_records: vec!["Local/main · claude [trusted: rule=claude]".into()],
         }));
         let diag_out = tree.render(&input, &theme, Instant::now(), 0.0);
         diag_out
@@ -3638,6 +3643,251 @@ mod tests {
         assert_eq!(
             tree.handle_click(&term_out.draw_list, fx, fy, false),
             UiAction::UpdateSetting(SettingChange::FontSizePt(12.0))
+        );
+    }
+
+    #[test]
+    fn settings_connect_ios_tab_renders_qr_matrix_and_emits_pairing_actions() {
+        let qr = QrMatrix::encode_text("https://mikeomarchy-rex.tail847d0b.ts.net")
+            .expect("encode Tailscale URL into QR matrix");
+        assert!(qr.size >= 25 && qr.size <= 41);
+        assert!(qr.get(0, 0), "top-left QR finder corner must be dark");
+
+        let mut tree = UiTree::new();
+        let ios = IosPairingSnapshot::ready(
+            "https://mikeomarchy-rex.tail847d0b.ts.net",
+            Some("michael.karp2001@icloud.com".into()),
+            Some("michael.karp2001@icloud.com".into()),
+            Some("mikeomarchy-rex.tail847d0b.ts.net".into()),
+            false,
+        );
+        let snap = SettingsViewSnapshot::from_config(
+            &tree.layout_cfg,
+            omarchy_theme::MaterialStyle::default(),
+            true,
+            true,
+            true,
+        )
+        .with_ios_pairing(ios);
+        tree.open_modal(ModalState::open_settings(snap));
+        let input = sample_t3_23_window_input();
+        let theme = Theme::default();
+
+        // Click the "Connect iOS" category tab.
+        let out = tree.render(&input, &theme, Instant::now(), 0.0);
+        out.draw_list
+            .validate_invariants()
+            .expect("settings draw list invariants");
+        let ios_tab = out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| h.target == HitTarget::SettingsCategoryTab(SettingsCategory::ConnectIos))
+            .expect("ConnectIos category tab hit target");
+        assert!(ios_tab.target.is_pointer_clickable());
+        let (ix, iy) = ios_tab.rect.center();
+        assert_eq!(
+            tree.handle_click(&out.draw_list, ix, iy, false),
+            UiAction::None
+        );
+
+        // Render Connect iOS tab and verify QR code rects + interactive rows.
+        let ios_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        ios_out
+            .draw_list
+            .validate_invariants()
+            .expect("connect iOS QR draw list invariants");
+
+        let black_qr_spans = ios_out
+            .draw_list
+            .primitives
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    UiPrimitive::RoundedRect {
+                        fill,
+                        corner_radius,
+                        ..
+                    } if fill.r == 0 && fill.g == 0 && fill.b == 0 && fill.a > 0 && *corner_radius == 0.0
+                )
+            })
+            .count();
+        assert!(
+            black_qr_spans >= 40,
+            "expected >=40 crisp black QR module spans, got {black_qr_spans}"
+        );
+
+        let copy_hit = ios_out
+            .draw_list
+            .hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "ios_copy_url"),
+            )
+            .expect("ios_copy_url hit target");
+        let (cx, cy) = copy_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&ios_out.draw_list, cx, cy, false),
+            UiAction::UpdateSetting(SettingChange::IosCopyUrl)
+        );
+        assert!(
+            tree.modal.is_some(),
+            "Settings modal must stay open after copying Tailscale URL"
+        );
+
+        // Disabled state exposes Enable Tailscale CTA button.
+        let disabled_snap = SettingsViewSnapshot::from_config(
+            &tree.layout_cfg,
+            omarchy_theme::MaterialStyle::default(),
+            true,
+            true,
+            true,
+        )
+        .with_ios_pairing(IosPairingSnapshot {
+            state: TailscalePairState::Disabled { error: None },
+            ..IosPairingSnapshot::default()
+        });
+        tree.open_modal(ModalState::open_settings_category(
+            disabled_snap,
+            SettingsCategory::ConnectIos,
+        ));
+        let dis_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        dis_out
+            .draw_list
+            .validate_invariants()
+            .expect("disabled ConnectIos draw list invariants");
+        let enable_hit = dis_out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "ios_toggle_tailscale"))
+            .expect("ios_toggle_tailscale hit target");
+        let (ex, ey) = enable_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&dis_out.draw_list, ex, ey, false),
+            UiAction::UpdateSetting(SettingChange::IosToggleTailscale)
+        );
+    }
+
+    #[test]
+    fn settings_server_tab_two_step_stop_confirm_and_pane_resume_badges() {
+        let mut tree = UiTree::new();
+        let mut input = sample_t3_23_window_input();
+        input.pane_metas[0].resume_badge = Some(ResumeBadge {
+            program: "claude".into(),
+            trusted: true,
+            rule: Some("claude".into()),
+            untrusted_reason: None,
+        });
+        input.pane_metas[1].resume_badge = Some(ResumeBadge {
+            program: "nvim".into(),
+            trusted: false,
+            rule: None,
+            untrusted_reason: Some("dir not allowed".into()),
+        });
+        let theme = Theme::default();
+
+        // Pane headers render trusted & untrusted OSC 7577 resume badges cleanly.
+        let pane_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        pane_out
+            .draw_list
+            .validate_invariants()
+            .expect("pane resume badge draw invariants");
+        assert!(pane_out.draw_list.primitives.iter().any(|p| matches!(
+            p,
+            UiPrimitive::Text { text, .. } if text == "↻ claude"
+        )));
+
+        // Open Settings -> Server tab in Running state.
+        let snap = SettingsViewSnapshot::from_config(
+            &tree.layout_cfg,
+            omarchy_theme::MaterialStyle::default(),
+            true,
+            true,
+            true,
+        )
+        .with_server_status(ServerSettingsSnapshot {
+            state: LocalServerState::Running,
+            version: Some("0.1.0-preview.25".into()),
+            api_revision: Some(24),
+            pid: Some(1031),
+            started_at: Some("2026-11-27T09:56:52Z".into()),
+            session_count: 3,
+            endpoint: "unix:///run/user/1000/rex/server.sock".into(),
+            resumable_trusted_count: 2,
+            resumable_untrusted_count: 1,
+            busy_action: None,
+            last_error: None,
+            confirm_stop: false,
+        });
+        tree.open_modal(ModalState::open_settings_category(
+            snap,
+            SettingsCategory::Server,
+        ));
+        let out = tree.render(&input, &theme, Instant::now(), 0.0);
+        out.draw_list
+            .validate_invariants()
+            .expect("Settings Server tab draw list invariants");
+        assert!(out.draw_list.primitives.iter().any(|p| matches!(
+            p,
+            UiPrimitive::Text { text, .. } if text.contains("2 trusted") && text.contains("1 untrusted")
+        )));
+
+        // First click on Stop Server arms two-step confirmation without emitting ServerStop yet.
+        let stop_hit = out
+            .draw_list
+            .hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "server_stop"),
+            )
+            .expect("server_stop hit target");
+        let (sx, sy) = stop_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&out.draw_list, sx, sy, false),
+            UiAction::None
+        );
+
+        // Re-rendering now shows the confirmation banner and "Confirm Stop" pill.
+        let confirm_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        confirm_out
+            .draw_list
+            .validate_invariants()
+            .expect("confirmed Server tab draw list invariants");
+        assert!(confirm_out.draw_list.primitives.iter().any(|p| matches!(
+            p,
+            UiPrimitive::Text { text, .. } if text == "Confirm Stop"
+        )));
+
+        // Second click emits SettingChange::ServerStop.
+        let confirm_hit = confirm_out
+            .draw_list
+            .hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "server_stop"),
+            )
+            .expect("confirm server_stop hit target");
+        let (cx, cy) = confirm_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&confirm_out.draw_list, cx, cy, false),
+            UiAction::UpdateSetting(SettingChange::ServerStop)
+        );
+
+        // Restart Server dispatches SettingChange::ServerRestart immediately.
+        let restart_hit = confirm_out
+            .draw_list
+            .hits
+            .iter()
+            .find(
+                |h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "server_restart"),
+            )
+            .expect("server_restart hit target");
+        let (rx, ry) = restart_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&confirm_out.draw_list, rx, ry, false),
+            UiAction::UpdateSetting(SettingChange::ServerRestart)
         );
     }
 }

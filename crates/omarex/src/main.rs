@@ -321,7 +321,7 @@ OPTIONS:
         --wait-after-command, --hold Keep window open after -e command exits
     -e <COMMAND> [ARGS...]          Run command in a clean standalone ephemeral Rex session
         --headless-render <PATH>    Render live session offscreen on Vulkan to PNG path
-        --headless-scenario <NAME>  Render built-in QA scenario (sidebar-dark, sidebar-light, split-panes, floating-pr, copy-mode, syntax-viewer, diagnostics-hud, ports-pill, markdown-viewer, theme-switcher, settings-modal, dnd-split, multi-window)
+        --headless-scenario <NAME>  Render built-in QA scenario (sidebar-dark, sidebar-light, split-panes, floating-pr, copy-mode, syntax-viewer, diagnostics-hud, ports-pill, markdown-viewer, theme-switcher, settings-modal, settings-ios-qr, settings-server, program-resume, dnd-split, multi-window)
         --headless-viewer <PATH>    Open file/image/video in right-hand viewer for headless PNG (repeatable)
         --width <PX>                Headless render width in physical pixels (default: 1440)
         --height <PX>               Headless render height in physical pixels (default: 900)

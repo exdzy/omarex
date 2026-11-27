@@ -1047,6 +1047,38 @@ pub struct TailscaleStatus {
     pub control_url: Option<String>,
 }
 
+impl TailscaleStatus {
+    /// Returns the server's Tailscale HTTPS pairing URL when built-in Tailscale is running
+    /// and its HTTPS listener is available (matching `rex server tailscale pair`).
+    #[must_use]
+    pub fn https_pair_url(&self) -> Option<&str> {
+        if !self.state.eq_ignore_ascii_case("running") {
+            return None;
+        }
+        let https = self.https.as_ref()?;
+        if !https.state.eq_ignore_ascii_case("available") {
+            return None;
+        }
+        https.url.as_deref().filter(|u| !u.trim().is_empty())
+    }
+}
+
+/// Request payload for `server.tailscale.enable`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TailscaleEnableRequest {
+    pub allow_tailnet_members: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_url: Option<String>,
+}
+
+/// Response wrapper returned by `server.tailscale.{enable,disable,login,logout}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TailscaleStatusResponse {
+    pub tailscale: TailscaleStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfigStatus {
     pub generation: u64,
@@ -1087,6 +1119,30 @@ pub struct ServerStatus {
     pub config: Option<ServerConfigStatus>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub listeners: Vec<ServerListener>,
+}
+
+/// Request payload for `server.stop` (local Unix socket / named pipe only).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerStopRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_idle: Option<bool>,
+}
+
+/// Response payload for `server.version`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerVersionResponse {
+    pub rex_version: String,
+    pub platform: String,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub built_at: Option<String>,
+    #[serde(default)]
+    pub dirty: bool,
+    #[serde(default)]
+    pub api_revision: Option<u32>,
+    #[serde(default)]
+    pub api_min_revision: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1962,6 +2018,102 @@ pub struct TerminalProgramStatusResponse {
     pub records: Vec<ProgramStatusRecord>,
 }
 
+/// OSC 7577 Program Resume record returned by `com.superlogical.terminal.program_resume_records`
+/// or `terminal.program_resume_changed` block events.
+///
+/// `command` and `reported_command` can contain secrets (such as tokens or prompts passed as CLI
+/// flags), so `fmt::Debug` unconditionally redacts them.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramResumeRecord {
+    #[serde(default)]
+    pub owner: Option<ProcessOwner>,
+    #[serde(default)]
+    pub program: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub reported_at: String,
+    #[serde(default)]
+    pub chosen: bool,
+    #[serde(default)]
+    pub trusted: bool,
+    #[serde(default)]
+    pub rule: Option<String>,
+    #[serde(default)]
+    pub untrusted_reason: Option<String>,
+    /// Resume argv returned by `program_resume_records` (omitted in `program_resume_changed`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub command: Vec<String>,
+    /// Original argv reported by the program when a trust rule filtered/dropped flags.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub reported_command: Vec<String>,
+}
+
+impl ProgramResumeRecord {
+    /// Returns `true` when this record is both chosen for restart and trusted by a server rule.
+    #[must_use]
+    pub fn is_active_trusted(&self) -> bool {
+        self.chosen && self.trusted
+    }
+
+    /// Concise human-readable description for `untrusted_reason` (never includes command argv).
+    #[must_use]
+    pub fn untrusted_reason_label(&self) -> Option<&'static str> {
+        let reason = self.untrusted_reason.as_deref()?;
+        Some(match reason {
+            "no_rule" => "no trust rule",
+            "dir_not_allowed" => "dir not allowed",
+            "flag_not_listed" => "unlisted flag",
+            "flag_value" => "flag value rejected",
+            "flags_differ" => "flags differ",
+            "program_differs" => "program mismatch",
+            "wrapped" => "wrapped process",
+            "launch_unreadable" => "cmdline unreadable",
+            "config_incomplete" => "init.lua error",
+            _ => "untrusted",
+        })
+    }
+}
+
+impl fmt::Debug for ProgramResumeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgramResumeRecord")
+            .field("owner", &self.owner)
+            .field("program", &self.program)
+            .field("cwd", &self.cwd)
+            .field("reported_at", &self.reported_at)
+            .field("chosen", &self.chosen)
+            .field("trusted", &self.trusted)
+            .field("rule", &self.rule)
+            .field("untrusted_reason", &self.untrusted_reason)
+            .field(
+                "command",
+                &format!("[REDACTED; {} args]", self.command.len()),
+            )
+            .field(
+                "reported_command",
+                &format!("[REDACTED; {} args]", self.reported_command.len()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalProgramResumeRecordsResponse {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub records: Vec<ProgramResumeRecord>,
+}
+
+/// Payload for `com.superlogical.terminal` `program_resume_changed` block events.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramResumeChangedEvent {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub records: Vec<ProgramResumeRecord>,
+    /// `"report"`, `"clear"`, `"rejected"`, `"owner_exited"`, `"rules_changed"`, or future reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesiredSizeEntry {
     #[serde(default)]
@@ -2575,5 +2727,74 @@ mod tests {
         let xfer_val = serde_json::to_value(&xfer).unwrap();
         assert_eq!(xfer_val["to_session_id"], "s2");
         assert!(xfer_val.get("before_window_id").is_none());
+    }
+
+    #[test]
+    fn program_resume_records_and_server_stop_serde_and_redaction() {
+        let resp: TerminalProgramResumeRecordsResponse = serde_json::from_str(
+            r#"{
+                "records": [{
+                    "owner": {"pid": 96556, "name": "claude"},
+                    "program": "claude",
+                    "cwd": "/home/mike/Work/omarex",
+                    "reported_at": "2026-11-25T22:31:28Z",
+                    "chosen": true,
+                    "trusted": true,
+                    "rule": "claude",
+                    "command": ["claude", "--resume", "4394937c-b07a-4bd5-b6d0-034e7091ff1f", "--system-prompt", "TOP_SECRET_TOKEN"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(resp.records.len(), 1);
+        let rec = &resp.records[0];
+        assert!(rec.is_active_trusted());
+        assert_eq!(rec.program, "claude");
+        assert_eq!(rec.rule.as_deref(), Some("claude"));
+        assert_eq!(rec.command.len(), 5);
+
+        let dbg = format!("{rec:?}");
+        assert!(
+            !dbg.contains("TOP_SECRET_TOKEN"),
+            "command argv must be redacted in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED; 5 args]"));
+
+        // `program_resume_changed` omits `command` and may carry `untrusted_reason`
+        let ev: ProgramResumeChangedEvent = serde_json::from_str(
+            r#"{
+                "reason": "rules_changed",
+                "records": [{
+                    "owner": {"pid": 1234, "name": "nvim"},
+                    "program": "nvim",
+                    "reported_at": "2026-11-25T22:35:00Z",
+                    "chosen": true,
+                    "trusted": false,
+                    "untrusted_reason": "dir_not_allowed"
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ev.reason.as_deref(), Some("rules_changed"));
+        assert!(!ev.records[0].is_active_trusted());
+        assert_eq!(
+            ev.records[0].untrusted_reason_label(),
+            Some("dir not allowed")
+        );
+
+        let stop_all = serde_json::to_value(ServerStopRequest { if_idle: None }).unwrap();
+        assert_eq!(stop_all, serde_json::json!({}));
+        let stop_idle = serde_json::to_value(ServerStopRequest {
+            if_idle: Some(true),
+        })
+        .unwrap();
+        assert_eq!(stop_idle, serde_json::json!({"if_idle": true}));
+
+        let ver: ServerVersionResponse = serde_json::from_str(
+            r#"{"rex_version":"0.1.0-preview.25","platform":"linux_amd64","dirty":false,"api_revision":24}"#,
+        )
+        .unwrap();
+        assert_eq!(ver.rex_version, "0.1.0-preview.25");
+        assert_eq!(ver.api_revision, Some(24));
     }
 }

@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use omarchy_theme::{MaterialStyle, Theme, UiTokens};
+use omarchy_theme::{MaterialStyle, Rgba, Theme, UiTokens};
 use tr3x_bridge::keymap::WhichKeyHint;
 use tr3x_bridge::prompts::{ClientReplyPayload, PromptKind, PromptSession};
 
@@ -54,6 +54,130 @@ pub enum ModalKeyOutcome {
     Closed,
 }
 
+/// Pre-encoded square ISO/IEC 18004 QR code module matrix (`true` = dark module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QrMatrix {
+    pub size: usize,
+    pub modules: Vec<bool>,
+}
+
+impl QrMatrix {
+    /// Encodes `text` into a QR code matrix using Medium error correction (matching Rex CLI).
+    #[must_use]
+    pub fn encode_text(text: &str) -> Option<Self> {
+        if text.is_empty() {
+            return None;
+        }
+        let qr = qrcodegen::QrCode::encode_text(text, qrcodegen::QrCodeEcc::Medium).ok()?;
+        let size = usize::try_from(qr.size()).ok()?;
+        let mut modules = Vec::with_capacity(size * size);
+        for y in 0..size {
+            for x in 0..size {
+                modules.push(qr.get_module(x as i32, y as i32));
+            }
+        }
+        Some(Self { size, modules })
+    }
+
+    #[must_use]
+    pub fn get(&self, x: usize, y: usize) -> bool {
+        self.modules
+            .get(y * self.size + x)
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+/// Live Tailscale pairing state of the local Rex server for Rex iOS QR onboarding.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TailscalePairState {
+    #[default]
+    ServerDisconnected,
+    Unsupported,
+    Disabled {
+        error: Option<String>,
+    },
+    Starting,
+    NeedsLogin {
+        auth_url: Option<String>,
+    },
+    NeedsMachineApproval,
+    HttpsPending {
+        dns_name: Option<String>,
+    },
+    Ready {
+        url: String,
+    },
+}
+
+/// Snapshot of local Rex server Tailscale / iOS QR pairing status displayed in Settings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IosPairingSnapshot {
+    pub state: TailscalePairState,
+    pub tailnet_name: Option<String>,
+    pub account_login: Option<String>,
+    pub dns_name: Option<String>,
+    pub allow_tailnet_members: bool,
+    pub busy: bool,
+    pub last_error: Option<String>,
+    pub qr_modules: Option<QrMatrix>,
+}
+
+impl IosPairingSnapshot {
+    /// Convenience constructor for a ready-to-scan Tailscale HTTPS pairing state.
+    #[must_use]
+    pub fn ready(
+        url: impl Into<String>,
+        tailnet_name: Option<String>,
+        account_login: Option<String>,
+        dns_name: Option<String>,
+        allow_tailnet_members: bool,
+    ) -> Self {
+        let url = url.into();
+        let qr_modules = QrMatrix::encode_text(&url);
+        Self {
+            state: TailscalePairState::Ready { url },
+            tailnet_name,
+            account_login,
+            dns_name,
+            allow_tailnet_members,
+            busy: false,
+            last_error: None,
+            qr_modules,
+        }
+    }
+}
+
+/// Connection & lifecycle state of the local Rex server shown in Settings → Server.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LocalServerState {
+    Running,
+    Reconnecting {
+        reason: String,
+    },
+    #[default]
+    Stopped,
+    Error(String),
+}
+
+/// Snapshot of local Rex server & OSC 7577 Program Resume status displayed in Settings → Server.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerSettingsSnapshot {
+    pub state: LocalServerState,
+    pub version: Option<String>,
+    pub api_revision: Option<u32>,
+    pub pid: Option<u32>,
+    pub started_at: Option<String>,
+    pub session_count: u64,
+    pub endpoint: String,
+    pub resumable_trusted_count: usize,
+    pub resumable_untrusted_count: usize,
+    pub busy_action: Option<String>,
+    pub last_error: Option<String>,
+    /// Two-step confirmation guard before stopping the local Rex server.
+    pub confirm_stop: bool,
+}
+
 /// Interactive settings snapshot displayed inside the Settings modal (`Ctrl+Shift+,`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsViewSnapshot {
@@ -71,6 +195,8 @@ pub struct SettingsViewSnapshot {
     pub font_size_pt: f32,
     pub chime_enabled: bool,
     pub desktop_notifications: bool,
+    pub server: ServerSettingsSnapshot,
+    pub ios_pairing: IosPairingSnapshot,
 }
 
 impl SettingsViewSnapshot {
@@ -97,6 +223,8 @@ impl SettingsViewSnapshot {
             font_size_pt: 13.0,
             chime_enabled: true,
             desktop_notifications: true,
+            server: ServerSettingsSnapshot::default(),
+            ios_pairing: IosPairingSnapshot::default(),
         }
     }
 
@@ -114,6 +242,18 @@ impl SettingsViewSnapshot {
         self.font_size_pt = font_size_pt;
         self.chime_enabled = chime_enabled;
         self.desktop_notifications = desktop_notifications;
+        self
+    }
+
+    #[must_use]
+    pub fn with_server_status(mut self, server: ServerSettingsSnapshot) -> Self {
+        self.server = server;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ios_pairing(mut self, ios_pairing: IosPairingSnapshot) -> Self {
+        self.ios_pairing = ios_pairing;
         self
     }
 }
@@ -162,6 +302,8 @@ pub struct DiagnosticsSnapshot {
     pub keymap_warnings: Vec<String>,
     pub active_ports: Vec<String>,
     pub active_tunnels: Vec<String>,
+    /// Redacted OSC 7577 Program Resume record summaries (never includes command argv).
+    pub resume_records: Vec<String>,
 }
 
 /// Active modal content backing `FocusTarget::Modal(ModalKind)`.
@@ -276,10 +418,19 @@ impl ModalState {
     /// Opens the live Settings panel (`Ctrl+Shift+,`).
     #[must_use]
     pub fn open_settings(snapshot: SettingsViewSnapshot) -> Self {
+        Self::open_settings_category(snapshot, SettingsCategory::Workspace)
+    }
+
+    /// Opens the live Settings panel directly on `category` (e.g. `SettingsCategory::ConnectIos`).
+    #[must_use]
+    pub fn open_settings_category(
+        snapshot: SettingsViewSnapshot,
+        category: SettingsCategory,
+    ) -> Self {
         Self {
             content: ModalContent::Settings {
                 snapshot,
-                category: SettingsCategory::Workspace,
+                category,
                 selected_row: 0,
             },
             matcher: PaletteMatcher::new(),
@@ -721,32 +872,45 @@ impl ModalState {
                 category,
                 selected_row,
             } => {
-                let row_count = settings_category_row_count(*category).max(1);
+                let row_count = settings_category_row_count(*category, snapshot).max(1);
+                if *selected_row >= row_count {
+                    *selected_row = row_count - 1;
+                }
                 match key {
-                    ModalKey::Escape => ModalKeyOutcome::Closed,
+                    ModalKey::Escape => {
+                        if snapshot.server.confirm_stop {
+                            snapshot.server.confirm_stop = false;
+                            ModalKeyOutcome::Consumed
+                        } else {
+                            ModalKeyOutcome::Closed
+                        }
+                    }
                     ModalKey::Left { .. } => {
+                        snapshot.server.confirm_stop = false;
                         *category = prev_settings_category(*category);
                         *selected_row = 0;
                         ModalKeyOutcome::Consumed
                     }
                     ModalKey::Right { .. } | ModalKey::Tab => {
+                        snapshot.server.confirm_stop = false;
                         *category = next_settings_category(*category);
                         *selected_row = 0;
                         ModalKeyOutcome::Consumed
                     }
                     ModalKey::Up => {
+                        snapshot.server.confirm_stop = false;
                         *selected_row = (*selected_row + row_count - 1) % row_count;
                         ModalKeyOutcome::Consumed
                     }
                     ModalKey::Down => {
+                        snapshot.server.confirm_stop = false;
                         *selected_row = (*selected_row + 1) % row_count;
                         ModalKeyOutcome::Consumed
                     }
                     ModalKey::Enter | ModalKey::Space => {
                         if let Some(change) = cycle_setting_row(snapshot, *category, *selected_row)
                         {
-                            apply_setting_to_snapshot(snapshot, &change);
-                            ModalKeyOutcome::Action(UiAction::UpdateSetting(change))
+                            dispatch_setting_change(snapshot, change)
                         } else {
                             ModalKeyOutcome::Consumed
                         }
@@ -877,8 +1041,7 @@ impl ModalState {
             } => {
                 *selected_row = row_index;
                 if let Some(change) = cycle_setting_row(snapshot, *category, row_index) {
-                    apply_setting_to_snapshot(snapshot, &change);
-                    ModalKeyOutcome::Action(UiAction::UpdateSetting(change))
+                    dispatch_setting_change(snapshot, change)
                 } else {
                     ModalKeyOutcome::Consumed
                 }
@@ -912,8 +1075,7 @@ impl ModalState {
             };
             *category = cat;
             *selected_row = row_idx;
-            apply_setting_to_snapshot(snapshot, &change);
-            return ModalKeyOutcome::Action(UiAction::UpdateSetting(change));
+            return dispatch_setting_change(snapshot, change);
         }
         ModalKeyOutcome::Consumed
     }
@@ -921,12 +1083,13 @@ impl ModalState {
     /// Switches the active Settings category tab.
     pub fn select_settings_category(&mut self, next: SettingsCategory) -> bool {
         if let ModalContent::Settings {
+            snapshot,
             category,
             selected_row,
-            ..
         } = &mut self.content
         {
             let changed = *category != next;
+            snapshot.server.confirm_stop = false;
             *category = next;
             *selected_row = 0;
             return changed;
@@ -999,6 +1162,23 @@ impl ModalState {
     }
 }
 
+fn dispatch_setting_change(
+    snapshot: &mut SettingsViewSnapshot,
+    change: SettingChange,
+) -> ModalKeyOutcome {
+    if change == SettingChange::ServerStop {
+        if !snapshot.server.confirm_stop {
+            snapshot.server.confirm_stop = true;
+            return ModalKeyOutcome::Consumed;
+        }
+        snapshot.server.confirm_stop = false;
+    } else {
+        snapshot.server.confirm_stop = false;
+    }
+    apply_setting_to_snapshot(snapshot, &change);
+    ModalKeyOutcome::Action(UiAction::UpdateSetting(change))
+}
+
 fn apply_setting_to_snapshot(snapshot: &mut SettingsViewSnapshot, change: &SettingChange) {
     match *change {
         SettingChange::ToolbarPosition(pos) => snapshot.toolbar_position = pos,
@@ -1032,7 +1212,46 @@ fn apply_setting_to_snapshot(snapshot: &mut SettingsViewSnapshot, change: &Setti
         SettingChange::FontSizePt(pt) => {
             snapshot.font_size_pt = pt;
         }
-        SettingChange::OpenThemePicker => {}
+        SettingChange::OpenThemePicker | SettingChange::IosCopyUrl => {}
+        SettingChange::IosToggleTailscale
+        | SettingChange::IosToggleAllowTailnetMembers
+        | SettingChange::IosRefreshStatus => {
+            snapshot.ios_pairing.busy = true;
+            snapshot.ios_pairing.last_error = None;
+        }
+        SettingChange::IosOpenLoginUrl => {
+            if matches!(
+                snapshot.ios_pairing.state,
+                TailscalePairState::NeedsLogin { auth_url: None }
+            ) {
+                snapshot.ios_pairing.busy = true;
+                snapshot.ios_pairing.last_error = None;
+            }
+        }
+        SettingChange::ServerStart => {
+            snapshot.server.busy_action = Some("Starting…".to_owned());
+            snapshot.server.last_error = None;
+        }
+        SettingChange::ServerStop => {
+            snapshot.server.busy_action = Some("Stopping…".to_owned());
+            snapshot.server.last_error = None;
+        }
+        SettingChange::ServerRestart => {
+            snapshot.server.busy_action = Some("Restarting…".to_owned());
+            snapshot.server.last_error = None;
+        }
+        SettingChange::ServerReloadConfig => {
+            snapshot.server.busy_action = Some("Reloading…".to_owned());
+            snapshot.server.last_error = None;
+        }
+        SettingChange::ServerRefreshStatus => {
+            snapshot.server.busy_action = Some("Refreshing…".to_owned());
+            snapshot.server.last_error = None;
+        }
+        SettingChange::ServerReconnect => {
+            snapshot.server.busy_action = Some("Connecting…".to_owned());
+            snapshot.server.last_error = None;
+        }
     }
 }
 
@@ -1049,11 +1268,13 @@ fn filter_file_picker_entries(query: &str, entries: &[FilePickerEntry]) -> Vec<u
         .collect()
 }
 
-const SETTINGS_CATEGORIES: [(SettingsCategory, &str); 4] = [
+const SETTINGS_CATEGORIES: [(SettingsCategory, &str); 6] = [
     (SettingsCategory::Workspace, "Workspace"),
     (SettingsCategory::Appearance, "Appearance"),
     (SettingsCategory::Terminal, "Terminal"),
     (SettingsCategory::AudioAlerts, "Audio & Alerts"),
+    (SettingsCategory::Server, "Server"),
+    (SettingsCategory::ConnectIos, "Connect iOS"),
 ];
 
 fn next_settings_category(cat: SettingsCategory) -> SettingsCategory {
@@ -1061,25 +1282,208 @@ fn next_settings_category(cat: SettingsCategory) -> SettingsCategory {
         SettingsCategory::Workspace => SettingsCategory::Appearance,
         SettingsCategory::Appearance => SettingsCategory::Terminal,
         SettingsCategory::Terminal => SettingsCategory::AudioAlerts,
-        SettingsCategory::AudioAlerts => SettingsCategory::Workspace,
+        SettingsCategory::AudioAlerts => SettingsCategory::Server,
+        SettingsCategory::Server => SettingsCategory::ConnectIos,
+        SettingsCategory::ConnectIos => SettingsCategory::Workspace,
     }
 }
 
 fn prev_settings_category(cat: SettingsCategory) -> SettingsCategory {
     match cat {
-        SettingsCategory::Workspace => SettingsCategory::AudioAlerts,
+        SettingsCategory::Workspace => SettingsCategory::ConnectIos,
         SettingsCategory::Appearance => SettingsCategory::Workspace,
         SettingsCategory::Terminal => SettingsCategory::Appearance,
         SettingsCategory::AudioAlerts => SettingsCategory::Terminal,
+        SettingsCategory::Server => SettingsCategory::AudioAlerts,
+        SettingsCategory::ConnectIos => SettingsCategory::Server,
     }
 }
 
-fn settings_category_row_count(cat: SettingsCategory) -> usize {
+fn server_action_rows(srv: &ServerSettingsSnapshot) -> Vec<(&'static str, &'static str, String)> {
+    let busy = srv.busy_action.as_deref();
+    match &srv.state {
+        LocalServerState::Running => vec![
+            (
+                "server_restart",
+                "Restart Rex Server (Resumes OSC 7577 Programs)",
+                busy.unwrap_or("Restart").to_owned(),
+            ),
+            (
+                "server_stop",
+                if srv.confirm_stop {
+                    "Confirm Stop Local Rex Server"
+                } else {
+                    "Stop Local Rex Server"
+                },
+                if let Some(b) = busy {
+                    b.to_owned()
+                } else if srv.confirm_stop {
+                    "Confirm Stop".to_owned()
+                } else {
+                    "Stop Server".to_owned()
+                },
+            ),
+            (
+                "server_reload_config",
+                "Reload Rex Config (init.lua & Resume Rules)",
+                busy.unwrap_or("Reload").to_owned(),
+            ),
+            (
+                "server_refresh_status",
+                "Local Server Status",
+                busy.unwrap_or("Refresh").to_owned(),
+            ),
+        ],
+        LocalServerState::Reconnecting { .. } => vec![
+            (
+                "server_start",
+                "Start Local Rex Server",
+                busy.unwrap_or("Start Server").to_owned(),
+            ),
+            (
+                "server_reconnect",
+                "Reconnect Local Socket",
+                busy.unwrap_or("Reconnect").to_owned(),
+            ),
+        ],
+        LocalServerState::Stopped | LocalServerState::Error(_) => vec![
+            (
+                "server_start",
+                "Start Local Rex Server",
+                busy.unwrap_or("Start Server").to_owned(),
+            ),
+            (
+                "server_reconnect",
+                "Reconnect Local Socket",
+                busy.unwrap_or("Reconnect").to_owned(),
+            ),
+        ],
+    }
+}
+
+fn ios_action_rows(ios: &IosPairingSnapshot) -> Vec<(&'static str, &'static str, String)> {
+    match &ios.state {
+        TailscalePairState::Ready { .. } => vec![
+            ("ios_copy_url", "Tailscale Pair URL", "Copy URL".to_owned()),
+            (
+                "ios_allow_tailnet_members",
+                "Allow Tailnet Members",
+                if ios.busy {
+                    "Updating…".to_owned()
+                } else if ios.allow_tailnet_members {
+                    "On (Tailnet)".to_owned()
+                } else {
+                    "Owner Only".to_owned()
+                },
+            ),
+            (
+                "ios_toggle_tailscale",
+                "Tailscale Remote Access",
+                if ios.busy {
+                    "Working…".to_owned()
+                } else {
+                    "On · Turn Off".to_owned()
+                },
+            ),
+        ],
+        TailscalePairState::Disabled { .. } => vec![
+            (
+                "ios_toggle_tailscale",
+                "Tailscale Remote Access",
+                if ios.busy {
+                    "Starting…".to_owned()
+                } else {
+                    "Enable Tailscale".to_owned()
+                },
+            ),
+            (
+                "ios_refresh_status",
+                "Server Tailscale Status",
+                if ios.busy {
+                    "Checking…".to_owned()
+                } else {
+                    "Refresh".to_owned()
+                },
+            ),
+        ],
+        TailscalePairState::NeedsLogin { auth_url } => {
+            let mut rows = vec![(
+                "ios_open_login_url",
+                "Tailscale Sign-In",
+                if ios.busy {
+                    "Requesting…".to_owned()
+                } else if auth_url.is_some() {
+                    "Open Sign-In".to_owned()
+                } else {
+                    "Get Sign-In Link".to_owned()
+                },
+            )];
+            if auth_url.is_some() {
+                rows.push(("ios_copy_url", "Sign-In URL", "Copy Link".to_owned()));
+            } else {
+                rows.push((
+                    "ios_refresh_status",
+                    "Server Tailscale Status",
+                    if ios.busy {
+                        "Checking…".to_owned()
+                    } else {
+                        "Refresh".to_owned()
+                    },
+                ));
+            }
+            rows.push((
+                "ios_toggle_tailscale",
+                "Tailscale Remote Access",
+                if ios.busy {
+                    "Working…".to_owned()
+                } else {
+                    "Turn Off".to_owned()
+                },
+            ));
+            rows
+        }
+        TailscalePairState::Starting
+        | TailscalePairState::NeedsMachineApproval
+        | TailscalePairState::HttpsPending { .. } => vec![
+            (
+                "ios_refresh_status",
+                "Server Tailscale Status",
+                if ios.busy {
+                    "Checking…".to_owned()
+                } else {
+                    "Refresh".to_owned()
+                },
+            ),
+            (
+                "ios_toggle_tailscale",
+                "Tailscale Remote Access",
+                if ios.busy {
+                    "Working…".to_owned()
+                } else {
+                    "Turn Off".to_owned()
+                },
+            ),
+        ],
+        TailscalePairState::Unsupported | TailscalePairState::ServerDisconnected => vec![(
+            "ios_refresh_status",
+            "Server Tailscale Status",
+            if ios.busy {
+                "Checking…".to_owned()
+            } else {
+                "Refresh".to_owned()
+            },
+        )],
+    }
+}
+
+fn settings_category_row_count(cat: SettingsCategory, snapshot: &SettingsViewSnapshot) -> usize {
     match cat {
         SettingsCategory::Workspace => 4,
         SettingsCategory::Appearance => 6,
         SettingsCategory::Terminal => 2,
         SettingsCategory::AudioAlerts => 2,
+        SettingsCategory::Server => server_action_rows(&snapshot.server).len(),
+        SettingsCategory::ConnectIos => ios_action_rows(&snapshot.ios_pairing).len(),
     }
 }
 
@@ -1177,6 +1581,123 @@ fn setting_change_for_key(
             1,
             SettingChange::ToggleDesktopNotifications,
         )),
+        "ios_copy_url" => {
+            let row_idx = ios_action_rows(&s.ios_pairing)
+                .iter()
+                .position(|(k, _, _)| *k == "ios_copy_url")
+                .unwrap_or(0);
+            Some((
+                SettingsCategory::ConnectIos,
+                row_idx,
+                SettingChange::IosCopyUrl,
+            ))
+        }
+        "ios_allow_tailnet_members" => {
+            let row_idx = ios_action_rows(&s.ios_pairing)
+                .iter()
+                .position(|(k, _, _)| *k == "ios_allow_tailnet_members")
+                .unwrap_or(1);
+            Some((
+                SettingsCategory::ConnectIos,
+                row_idx,
+                SettingChange::IosToggleAllowTailnetMembers,
+            ))
+        }
+        "ios_toggle_tailscale" => {
+            let row_idx = ios_action_rows(&s.ios_pairing)
+                .iter()
+                .position(|(k, _, _)| *k == "ios_toggle_tailscale")
+                .unwrap_or(0);
+            Some((
+                SettingsCategory::ConnectIos,
+                row_idx,
+                SettingChange::IosToggleTailscale,
+            ))
+        }
+        "ios_open_login_url" => {
+            let row_idx = ios_action_rows(&s.ios_pairing)
+                .iter()
+                .position(|(k, _, _)| *k == "ios_open_login_url")
+                .unwrap_or(0);
+            Some((
+                SettingsCategory::ConnectIos,
+                row_idx,
+                SettingChange::IosOpenLoginUrl,
+            ))
+        }
+        "ios_refresh_status" => {
+            let row_idx = ios_action_rows(&s.ios_pairing)
+                .iter()
+                .position(|(k, _, _)| *k == "ios_refresh_status")
+                .unwrap_or(0);
+            Some((
+                SettingsCategory::ConnectIos,
+                row_idx,
+                SettingChange::IosRefreshStatus,
+            ))
+        }
+        "server_start" => {
+            let row_idx = server_action_rows(&s.server)
+                .iter()
+                .position(|(k, _, _)| *k == "server_start")
+                .unwrap_or(0);
+            Some((
+                SettingsCategory::Server,
+                row_idx,
+                SettingChange::ServerStart,
+            ))
+        }
+        "server_stop" => {
+            let row_idx = server_action_rows(&s.server)
+                .iter()
+                .position(|(k, _, _)| *k == "server_stop")
+                .unwrap_or(1);
+            Some((SettingsCategory::Server, row_idx, SettingChange::ServerStop))
+        }
+        "server_restart" => {
+            let row_idx = server_action_rows(&s.server)
+                .iter()
+                .position(|(k, _, _)| *k == "server_restart")
+                .unwrap_or(0);
+            Some((
+                SettingsCategory::Server,
+                row_idx,
+                SettingChange::ServerRestart,
+            ))
+        }
+        "server_reload_config" => {
+            let row_idx = server_action_rows(&s.server)
+                .iter()
+                .position(|(k, _, _)| *k == "server_reload_config")
+                .unwrap_or(2);
+            Some((
+                SettingsCategory::Server,
+                row_idx,
+                SettingChange::ServerReloadConfig,
+            ))
+        }
+        "server_refresh_status" => {
+            let row_idx = server_action_rows(&s.server)
+                .iter()
+                .position(|(k, _, _)| *k == "server_refresh_status")
+                .unwrap_or(3);
+            Some((
+                SettingsCategory::Server,
+                row_idx,
+                SettingChange::ServerRefreshStatus,
+            ))
+        }
+        "server_reconnect" => {
+            let row_idx = server_action_rows(&s.server)
+                .iter()
+                .position(|(k, _, _)| *k == "server_reconnect")
+                .unwrap_or(1);
+            Some((
+                SettingsCategory::Server,
+                row_idx,
+                SettingChange::ServerReconnect,
+            ))
+        }
         _ => None,
     }
 }
@@ -1235,6 +1756,16 @@ fn cycle_setting_row(
     category: SettingsCategory,
     row: usize,
 ) -> Option<SettingChange> {
+    if category == SettingsCategory::Server {
+        let rows = server_action_rows(&s.server);
+        let (key, _, _) = rows.get(row)?;
+        return setting_change_for_key(s, key).map(|(_, _, ch)| ch);
+    }
+    if category == SettingsCategory::ConnectIos {
+        let rows = ios_action_rows(&s.ios_pairing);
+        let (key, _, _) = rows.get(row)?;
+        return setting_change_for_key(s, key).map(|(_, _, ch)| ch);
+    }
     let key = match (category, row) {
         (SettingsCategory::Workspace, 0) => "toolbar_position",
         (SettingsCategory::Workspace, 1) => "toolbar_behavior",
@@ -1609,6 +2140,7 @@ pub fn render_modal(
                 left_x,
                 top_y,
                 modal_w,
+                viewport,
                 card_r,
                 shadow,
                 snapshot,
@@ -2905,6 +3437,7 @@ fn render_diagnostics_modal(
             TextAlign::Left,
             true,
         );
+        y += 18.0;
     } else {
         for line in snap
             .active_ports
@@ -2915,6 +3448,46 @@ fn render_diagnostics_modal(
             draw_list.push_text(
                 RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
                 format!("• {line}"),
+                tokens.fg_secondary,
+                FontKind::Mono,
+                10.5,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+            y += 17.0;
+        }
+    }
+    y += 8.0;
+
+    // 5. Program Resume (OSC 7577)
+    draw_list.push_text(
+        RectF::new(body_rect.x, y, body_rect.w, 16.0),
+        format!("Program Resume (OSC 7577) ({})", snap.resume_records.len()),
+        tokens.accent_primary,
+        FontKind::Sans,
+        12.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    y += 18.0;
+    if snap.resume_records.is_empty() {
+        draw_list.push_text(
+            RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+            "No active OSC 7577 resume records",
+            tokens.fg_muted,
+            FontKind::Mono,
+            10.5,
+            FontWeight::Regular,
+            TextAlign::Left,
+            true,
+        );
+    } else {
+        for line in snap.resume_records.iter().take(6) {
+            draw_list.push_text(
+                RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+                format!("↻ {line}"),
                 tokens.fg_secondary,
                 FontKind::Mono,
                 10.5,
@@ -2986,6 +3559,7 @@ fn render_settings_modal(
     left_x: f32,
     top_y: f32,
     modal_w: f32,
+    viewport: RectF,
     card_r: f32,
     shadow: ShadowSpec,
     s: &SettingsViewSnapshot,
@@ -3082,14 +3656,49 @@ fn render_settings_modal(
                 if s.desktop_notifications { "On" } else { "Off" }.to_owned(),
             ),
         ],
+        SettingsCategory::Server => server_action_rows(&s.server),
+        SettingsCategory::ConnectIos => ios_action_rows(&s.ios_pairing),
     };
 
     let tab_bar_h = 34.0;
-    let card_h = 46.0 + tab_bar_h + rows.len().max(1) as f32 * 38.0 + 16.0;
+    let wide_tab = matches!(
+        category,
+        SettingsCategory::Server | SettingsCategory::ConnectIos
+    );
+    let effective_w = if wide_tab {
+        (viewport.w * 0.58)
+            .clamp(540.0, 620.0)
+            .min((viewport.w - 32.0).max(240.0))
+    } else {
+        modal_w.max(520.0).min((viewport.w - 32.0).max(240.0))
+    };
+    let hero_h = match category {
+        SettingsCategory::Server => {
+            let has_banner = s.server.last_error.is_some() || s.server.confirm_stop;
+            116.0 + if has_banner { 26.0 } else { 0.0 }
+        }
+        SettingsCategory::ConnectIos => {
+            let has_err = s.ios_pairing.last_error.is_some()
+                || matches!(
+                    s.ios_pairing.state,
+                    TailscalePairState::Disabled { error: Some(_) }
+                );
+            if matches!(s.ios_pairing.state, TailscalePairState::Ready { .. }) {
+                220.0 + if has_err { 24.0 } else { 0.0 }
+            } else {
+                138.0 + if has_err { 24.0 } else { 0.0 }
+            }
+        }
+        _ => 0.0,
+    };
+    let card_h = 46.0 + tab_bar_h + hero_h + rows.len().max(1) as f32 * 38.0 + 16.0;
+    let effective_x = viewport.x + (viewport.w - effective_w) * 0.5;
+    let effective_y = top_y.min((viewport.bottom() - card_h - 16.0).max(viewport.y + 16.0));
+    let _ = left_x;
     let card = RectF::new(
-        left_x.round(),
-        top_y.round(),
-        modal_w.round(),
+        effective_x.round(),
+        effective_y.round(),
+        effective_w.round(),
         card_h.round(),
     );
     draw_list.push_rect(
@@ -3110,7 +3719,7 @@ fn render_settings_modal(
         RectF::new(
             card.x + 36.0,
             card.y + 13.0,
-            (card.w - 150.0).max(0.0),
+            (card.w - 200.0).max(0.0),
             20.0,
         ),
         "Settings",
@@ -3122,8 +3731,12 @@ fn render_settings_modal(
         true,
     );
     draw_list.push_text(
-        RectF::new(card.right() - 126.0, card.y + 15.0, 112.0, 16.0),
-        "←/→ tab · Enter cycle",
+        RectF::new(card.right() - 170.0, card.y + 15.0, 156.0, 16.0),
+        if wide_tab {
+            "←/→ tab · Enter run"
+        } else {
+            "←/→ tab · Enter cycle"
+        },
         tokens.fg_muted,
         FontKind::Mono,
         10.0,
@@ -3140,8 +3753,8 @@ fn render_settings_modal(
         None,
     );
 
-    // 4 category tabs
-    let tab_w = ((card.w - 16.0) / SETTINGS_CATEGORIES.len() as f32).max(60.0);
+    // Category tabs
+    let tab_w = ((card.w - 16.0) / SETTINGS_CATEGORIES.len() as f32).max(56.0);
     for (idx, &(cat, title)) in SETTINGS_CATEGORIES.iter().enumerate() {
         let tab_rect = RectF::new(
             card.x + 8.0 + idx as f32 * tab_w,
@@ -3180,7 +3793,7 @@ fn render_settings_modal(
                 tokens.fg_secondary
             },
             FontKind::Sans,
-            11.5,
+            11.0,
             if active {
                 FontWeight::SemiBold
             } else {
@@ -3193,6 +3806,33 @@ fn render_settings_modal(
     }
 
     let mut y = card.y + 46.0 + tab_bar_h + 6.0;
+    if category == SettingsCategory::Server {
+        let hero_rect = RectF::new(
+            card.x + 10.0,
+            y,
+            (card.w - 20.0).max(0.0),
+            (hero_h - 10.0).max(0.0),
+        );
+        render_server_settings_hero(draw_list, hero_rect, &s.server, tokens, theme_rounding);
+        y += hero_h;
+    } else if category == SettingsCategory::ConnectIos {
+        let hero_rect = RectF::new(
+            card.x + 10.0,
+            y,
+            (card.w - 20.0).max(0.0),
+            (hero_h - 10.0).max(0.0),
+        );
+        render_ios_pairing_hero(
+            draw_list,
+            hero_rect,
+            &s.ios_pairing,
+            interaction,
+            tokens,
+            theme_rounding,
+        );
+        y += hero_h;
+    }
+
     let row_r = cap_radius(7.0, theme_rounding);
     for (idx, (key, label, value)) in rows.into_iter().enumerate() {
         let row_rect = RectF::new(card.x + 8.0, y, (card.w - 16.0).max(0.0), 34.0);
@@ -3202,6 +3842,7 @@ fn render_settings_modal(
         let is_hovered = interaction.is_hovered(&toggle_target)
             || interaction.is_hovered(&HitTarget::ModalRow { index: idx });
         let is_pressed = interaction.is_pressed(&toggle_target);
+        let is_danger_confirm = key == "server_stop" && s.server.confirm_stop;
         if idx == selected_row || is_pressed {
             draw_list.push_rect(
                 row_rect,
@@ -3229,7 +3870,11 @@ fn render_settings_modal(
                 18.0,
             ),
             label,
-            tokens.fg_primary,
+            if is_danger_confirm {
+                tokens.status_error
+            } else {
+                tokens.fg_primary
+            },
             FontKind::Sans,
             12.5,
             FontWeight::Medium,
@@ -3244,8 +3889,14 @@ fn render_settings_modal(
         );
         draw_list.push_rect(
             pill,
-            tokens.surface_pane,
-            Some(if is_hovered || idx == selected_row {
+            if is_danger_confirm {
+                tokens.status_error.with_alpha_f32(0.18)
+            } else {
+                tokens.surface_pane
+            },
+            Some(if is_danger_confirm {
+                tokens.status_error
+            } else if is_hovered || idx == selected_row {
                 tokens.accent_primary.with_alpha_f32(0.50)
             } else {
                 tokens.border_hairline
@@ -3257,7 +3908,11 @@ fn render_settings_modal(
         draw_list.push_text(
             pill,
             value,
-            tokens.accent_primary,
+            if is_danger_confirm {
+                tokens.status_error
+            } else {
+                tokens.accent_primary
+            },
             FontKind::Mono,
             10.5,
             FontWeight::Medium,
@@ -3267,6 +3922,586 @@ fn render_settings_modal(
         draw_list.push_hit(row_rect, toggle_target, z_layer::MODAL + 1);
         draw_list.push_hit(row_rect, HitTarget::ModalRow { index: idx }, z_layer::MODAL);
         y += 38.0;
+    }
+}
+
+fn render_server_settings_hero(
+    draw_list: &mut UiDrawList,
+    hero: RectF,
+    srv: &ServerSettingsSnapshot,
+    tokens: &UiTokens,
+    theme_rounding: f32,
+) {
+    draw_list.push_rect(
+        hero,
+        tokens.surface_pane,
+        Some(tokens.border_hairline),
+        1.0,
+        cap_radius(8.0, theme_rounding),
+        None,
+    );
+
+    let (dot_color, headline) = match &srv.state {
+        LocalServerState::Running => (tokens.status_done, "Local Rex Server · Running".to_owned()),
+        LocalServerState::Reconnecting { reason } => (
+            tokens.status_blocked,
+            if reason.is_empty() {
+                "Local Rex Server · Reconnecting…".to_owned()
+            } else {
+                format!("Local Rex Server · Reconnecting ({reason})")
+            },
+        ),
+        LocalServerState::Stopped => (tokens.fg_muted, "Local Rex Server · Stopped".to_owned()),
+        LocalServerState::Error(err) => (
+            tokens.status_error,
+            format!("Local Rex Server · Error ({err})"),
+        ),
+    };
+
+    let x = hero.x + 14.0;
+    let w = (hero.w - 28.0).max(0.0);
+    let mut y = hero.y + 12.0;
+
+    draw_list.push_rect(
+        RectF::new(x, y + 5.0, 8.0, 8.0),
+        dot_color,
+        None,
+        0.0,
+        4.0,
+        None,
+    );
+    draw_list.push_text(
+        RectF::new(x + 14.0, y, (w - 14.0).max(0.0), 18.0),
+        headline,
+        tokens.fg_primary,
+        FontKind::Sans,
+        13.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    y += 22.0;
+
+    let mut meta_parts = Vec::new();
+    if let Some(ver) = &srv.version {
+        meta_parts.push(format!("rex {ver}"));
+    }
+    if let Some(rev) = srv.api_revision {
+        meta_parts.push(format!("API rev {rev}"));
+    }
+    if let Some(pid) = srv.pid {
+        meta_parts.push(format!("PID {pid}"));
+    }
+    if matches!(srv.state, LocalServerState::Running) {
+        meta_parts.push(format!(
+            "{} {}",
+            srv.session_count,
+            if srv.session_count == 1 {
+                "session"
+            } else {
+                "sessions"
+            }
+        ));
+    }
+    let meta_line = if meta_parts.is_empty() {
+        "Daemon inactive — start the server to restore saved sessions".to_owned()
+    } else {
+        meta_parts.join(" · ")
+    };
+    draw_list.push_text(
+        RectF::new(x, y, w, 16.0),
+        meta_line,
+        tokens.fg_secondary,
+        FontKind::Mono,
+        10.5,
+        FontWeight::Regular,
+        TextAlign::Left,
+        true,
+    );
+    y += 18.0;
+
+    let endpoint_line = if srv.endpoint.is_empty() {
+        "Endpoint: default local Unix socket".to_owned()
+    } else {
+        format!("Endpoint: {}", srv.endpoint)
+    };
+    draw_list.push_text(
+        RectF::new(x, y, w, 16.0),
+        endpoint_line,
+        tokens.fg_muted,
+        FontKind::Mono,
+        10.0,
+        FontWeight::Regular,
+        TextAlign::Left,
+        true,
+    );
+    y += 18.0;
+
+    let resume_summary = if srv.resumable_trusted_count > 0 || srv.resumable_untrusted_count > 0 {
+        format!(
+            "Program Resume (OSC 7577): {} trusted · {} untrusted",
+            srv.resumable_trusted_count, srv.resumable_untrusted_count
+        )
+    } else {
+        "Program Resume (OSC 7577): ready · no active resumable programs".to_owned()
+    };
+    draw_list.push_text(
+        RectF::new(x, y, w, 16.0),
+        resume_summary,
+        if srv.resumable_trusted_count > 0 {
+            tokens.status_done
+        } else if srv.resumable_untrusted_count > 0 {
+            tokens.status_blocked
+        } else {
+            tokens.fg_secondary
+        },
+        FontKind::Sans,
+        11.0,
+        FontWeight::Medium,
+        TextAlign::Left,
+        true,
+    );
+    y += 22.0;
+
+    if srv.confirm_stop {
+        let banner = RectF::new(x, y, w, 22.0);
+        draw_list.push_rect(
+            banner,
+            tokens.status_blocked.with_alpha_f32(0.16),
+            Some(tokens.status_blocked.with_alpha_f32(0.55)),
+            1.0,
+            cap_radius(5.0, theme_rounding),
+            None,
+        );
+        draw_list.push_text(
+            RectF::new(
+                banner.x + 8.0,
+                banner.y + 3.0,
+                (banner.w - 16.0).max(0.0),
+                16.0,
+            ),
+            "Stopping ends running processes; trusted OSC 7577 programs resume on next start.",
+            tokens.status_blocked,
+            FontKind::Sans,
+            10.5,
+            FontWeight::Medium,
+            TextAlign::Left,
+            true,
+        );
+    } else if let Some(err) = &srv.last_error {
+        let banner = RectF::new(x, y, w, 22.0);
+        draw_list.push_rect(
+            banner,
+            tokens.status_error.with_alpha_f32(0.14),
+            Some(tokens.status_error.with_alpha_f32(0.50)),
+            1.0,
+            cap_radius(5.0, theme_rounding),
+            None,
+        );
+        draw_list.push_text(
+            RectF::new(
+                banner.x + 8.0,
+                banner.y + 3.0,
+                (banner.w - 16.0).max(0.0),
+                16.0,
+            ),
+            err,
+            tokens.status_error,
+            FontKind::Mono,
+            10.0,
+            FontWeight::Regular,
+            TextAlign::Left,
+            true,
+        );
+    }
+}
+
+/// Draws an ISO/IEC 18004 QR code inside `slot` on a high-contrast `#FFFFFF` quiet-zone card
+/// using integer-aligned horizontal run-length merged `#000000` module rects (zero blur).
+fn render_qr_matrix(
+    draw_list: &mut UiDrawList,
+    slot: RectF,
+    qr: &QrMatrix,
+    border_color: Rgba,
+    theme_rounding: f32,
+) {
+    if qr.size == 0 || slot.w < 40.0 || slot.h < 40.0 {
+        return;
+    }
+    const QUIET_MODULES: usize = 4;
+    let total_modules = qr.size + QUIET_MODULES * 2;
+    let outer_pad = 4.0_f32;
+    let usable = (slot.w.min(slot.h) - outer_pad * 2.0).max(total_modules as f32);
+    let mod_px = (usable / total_modules as f32).floor().max(2.0);
+    let grid_side = mod_px * total_modules as f32;
+    let card_side = grid_side + outer_pad * 2.0;
+
+    let card_x = (slot.x + (slot.w - card_side) * 0.5).floor();
+    let card_y = (slot.y + (slot.h - card_side) * 0.5).floor();
+    let qr_card = RectF::new(card_x, card_y, card_side, card_side);
+
+    // Pure white quiet-zone container for guaranteed contrast on dark & light themes.
+    draw_list.push_rect(
+        qr_card,
+        Rgba::new(255, 255, 255, 255),
+        Some(border_color),
+        1.0,
+        cap_radius(8.0, theme_rounding),
+        None,
+    );
+
+    let origin_x = card_x + outer_pad + QUIET_MODULES as f32 * mod_px;
+    let origin_y = card_y + outer_pad + QUIET_MODULES as f32 * mod_px;
+    let dark = Rgba::new(0, 0, 0, 255);
+
+    for row in 0..qr.size {
+        let mut col = 0usize;
+        while col < qr.size {
+            if !qr.get(col, row) {
+                col += 1;
+                continue;
+            }
+            let start = col;
+            while col < qr.size && qr.get(col, row) {
+                col += 1;
+            }
+            let span_w = (col - start) as f32 * mod_px;
+            let rect = RectF::new(
+                origin_x + start as f32 * mod_px,
+                origin_y + row as f32 * mod_px,
+                span_w,
+                mod_px,
+            );
+            draw_list.push_rect(rect, dark, None, 0.0, 0.0, None);
+        }
+    }
+}
+
+fn render_ios_pairing_hero(
+    draw_list: &mut UiDrawList,
+    hero: RectF,
+    ios: &IosPairingSnapshot,
+    interaction: UiInteraction<'_>,
+    tokens: &UiTokens,
+    theme_rounding: f32,
+) {
+    draw_list.push_rect(
+        hero,
+        tokens.surface_pane,
+        Some(tokens.border_hairline),
+        1.0,
+        cap_radius(8.0, theme_rounding),
+        None,
+    );
+
+    let err_banner = ios.last_error.as_deref().or(match &ios.state {
+        TailscalePairState::Disabled { error: Some(e) } => Some(e.as_str()),
+        _ => None,
+    });
+    let content_h = if err_banner.is_some() {
+        (hero.h - 26.0).max(0.0)
+    } else {
+        hero.h
+    };
+
+    match &ios.state {
+        TailscalePairState::Ready { url } => {
+            let qr_col_w = 198.0_f32.min((hero.w * 0.42).max(150.0));
+            let qr_slot = RectF::new(
+                hero.x + 10.0,
+                hero.y + 8.0,
+                qr_col_w,
+                (content_h - 16.0).max(0.0),
+            );
+            if let Some(qr) = &ios.qr_modules {
+                render_qr_matrix(draw_list, qr_slot, qr, tokens.border_subtle, theme_rounding);
+            }
+
+            let info_x = qr_slot.right() + 14.0;
+            let info_w = (hero.right() - info_x - 12.0).max(0.0);
+            let mut iy = hero.y + 14.0;
+
+            // Live status indicator
+            draw_list.push_rect(
+                RectF::new(info_x, iy + 5.0, 8.0, 8.0),
+                tokens.status_done,
+                None,
+                0.0,
+                4.0,
+                None,
+            );
+            draw_list.push_text(
+                RectF::new(info_x + 14.0, iy, (info_w - 14.0).max(0.0), 18.0),
+                "Ready to Pair · Rex for iOS",
+                tokens.fg_primary,
+                FontKind::Sans,
+                13.0,
+                FontWeight::SemiBold,
+                TextAlign::Left,
+                true,
+            );
+            iy += 24.0;
+
+            let steps = [
+                "1. Open Rex on iPhone or iPad → Connect to Linux",
+                "2. Tap \"Pair via QR Code\" and scan this code",
+                "3. Keep your iOS device on the same Tailscale tailnet",
+            ];
+            for step in steps {
+                draw_list.push_text(
+                    RectF::new(info_x, iy, info_w, 16.0),
+                    step,
+                    tokens.fg_secondary,
+                    FontKind::Sans,
+                    11.0,
+                    FontWeight::Regular,
+                    TextAlign::Left,
+                    true,
+                );
+                iy += 18.0;
+            }
+            iy += 6.0;
+
+            // Clickable Tailscale HTTPS URL box
+            let copy_hit = HitTarget::SettingsToggle {
+                key: "ios_copy_url".to_owned(),
+            };
+            let url_hovered = interaction.is_hovered(&copy_hit);
+            let url_box = RectF::new(info_x, iy, info_w, 28.0);
+            draw_list.push_rect(
+                url_box,
+                if url_hovered {
+                    tokens.surface_row_hover
+                } else {
+                    tokens.surface_modal
+                },
+                Some(if url_hovered {
+                    tokens.accent_primary
+                } else {
+                    tokens.border_subtle
+                }),
+                1.0,
+                cap_radius(6.0, theme_rounding),
+                None,
+            );
+            draw_list.push_icon(
+                RectF::new(url_box.x + 8.0, url_box.y + 7.0, 14.0, 14.0),
+                IconId::Link,
+                tokens.accent_primary,
+            );
+            draw_list.push_text(
+                RectF::new(
+                    url_box.x + 26.0,
+                    url_box.y + 6.0,
+                    (url_box.w - 34.0).max(0.0),
+                    16.0,
+                ),
+                url,
+                tokens.accent_primary,
+                FontKind::Mono,
+                10.5,
+                FontWeight::Medium,
+                TextAlign::Left,
+                true,
+            );
+            draw_list.push_hit(url_box, copy_hit, z_layer::MODAL + 2);
+            iy += 34.0;
+
+            // Optional Tailnet / account line
+            let meta = match (ios.tailnet_name.as_deref(), ios.account_login.as_deref()) {
+                (Some(tn), Some(acc)) if tn != acc => format!("Tailnet: {tn} ({acc})"),
+                (Some(tn), _) => format!("Tailnet: {tn}"),
+                (None, Some(acc)) => format!("Account: {acc}"),
+                (None, None) => "Equivalent to: rex server tailscale pair".to_owned(),
+            };
+            draw_list.push_text(
+                RectF::new(info_x, iy, info_w, 16.0),
+                meta,
+                tokens.fg_muted,
+                FontKind::Mono,
+                10.0,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+        }
+        other => {
+            let (icon, accent, title, line1, line2, cta) = match other {
+                TailscalePairState::Disabled { .. } => (
+                    IconId::Globe,
+                    tokens.accent_primary,
+                    "Tailscale Remote Access is Off",
+                    "Turn on Rex's built-in Tailscale node to generate a QR code",
+                    "that Rex on iOS can scan directly over your private tailnet.",
+                    Some((
+                        "ios_toggle_tailscale",
+                        if ios.busy {
+                            "Starting Tailscale…"
+                        } else {
+                            "Enable Tailscale"
+                        },
+                    )),
+                ),
+                TailscalePairState::NeedsLogin { auth_url } => (
+                    IconId::Link,
+                    tokens.status_blocked,
+                    "Sign In to Tailscale",
+                    "Authenticate this Linux server with your Tailscale account.",
+                    "Once signed in, the iOS QR pairing code will appear automatically.",
+                    Some((
+                        "ios_open_login_url",
+                        if ios.busy {
+                            "Requesting Link…"
+                        } else if auth_url.is_some() {
+                            "Open Tailscale Sign-In"
+                        } else {
+                            "Get Sign-In Link"
+                        },
+                    )),
+                ),
+                TailscalePairState::Starting => (
+                    IconId::Globe,
+                    tokens.status_working,
+                    "Starting Tailscale…",
+                    "Connecting the local Rex server to your Tailscale tailnet.",
+                    "The QR code will appear automatically once HTTPS is ready.",
+                    None,
+                ),
+                TailscalePairState::NeedsMachineApproval => (
+                    IconId::Warning,
+                    tokens.status_blocked,
+                    "Waiting for Tailnet Approval",
+                    "Approve this device in your Tailscale admin console.",
+                    "The QR code will appear automatically once approved.",
+                    None,
+                ),
+                TailscalePairState::HttpsPending { dns_name } => (
+                    IconId::Globe,
+                    tokens.status_working,
+                    "Provisioning Tailscale HTTPS…",
+                    if dns_name.is_some() {
+                        "Tailscale is online; waiting for its HTTPS address to become ready."
+                    } else {
+                        "Waiting for Tailscale MagicDNS & HTTPS certificates to activate."
+                    },
+                    "Ensure HTTPS Certificates are enabled in Tailscale DNS settings.",
+                    None,
+                ),
+                TailscalePairState::Unsupported => (
+                    IconId::Server,
+                    tokens.fg_muted,
+                    "Built-in Tailscale Unavailable",
+                    "The connected Rex server does not expose built-in Tailscale.",
+                    "Update Rex or configure Tailscale on the local Rex daemon.",
+                    None,
+                ),
+                TailscalePairState::ServerDisconnected => (
+                    IconId::Server,
+                    tokens.fg_muted,
+                    "Local Rex Server Not Connected",
+                    "Connect to the local Rex daemon to display your iOS QR code.",
+                    "Rex iOS pairs with the local server's Tailscale HTTPS address.",
+                    None,
+                ),
+                TailscalePairState::Ready { .. } => unreachable!(),
+            };
+
+            draw_list.push_icon(
+                RectF::new(hero.x + 16.0, hero.y + 16.0, 18.0, 18.0),
+                icon,
+                accent,
+            );
+            draw_list.push_text(
+                RectF::new(hero.x + 42.0, hero.y + 14.0, (hero.w - 56.0).max(0.0), 20.0),
+                title,
+                tokens.fg_primary,
+                FontKind::Sans,
+                13.5,
+                FontWeight::SemiBold,
+                TextAlign::Left,
+                true,
+            );
+            draw_list.push_text(
+                RectF::new(hero.x + 16.0, hero.y + 42.0, (hero.w - 32.0).max(0.0), 16.0),
+                line1,
+                tokens.fg_secondary,
+                FontKind::Sans,
+                11.5,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+            draw_list.push_text(
+                RectF::new(hero.x + 16.0, hero.y + 60.0, (hero.w - 32.0).max(0.0), 16.0),
+                line2,
+                tokens.fg_muted,
+                FontKind::Sans,
+                11.0,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+
+            if let Some((cta_key, cta_label)) = cta {
+                let cta_target = HitTarget::SettingsToggle {
+                    key: cta_key.to_owned(),
+                };
+                let btn_w = ((cta_label.chars().count() as f32) * 7.0 + 28.0).clamp(140.0, 220.0);
+                let btn = RectF::new(hero.x + 16.0, hero.y + 86.0, btn_w, 28.0);
+                let hovered = interaction.is_hovered(&cta_target);
+                draw_list.push_rect(
+                    btn,
+                    if hovered {
+                        tokens.accent_primary.with_alpha_f32(0.88)
+                    } else {
+                        tokens.accent_primary
+                    },
+                    None,
+                    0.0,
+                    cap_radius(6.0, theme_rounding),
+                    None,
+                );
+                draw_list.push_text(
+                    btn,
+                    cta_label,
+                    tokens.accent_foreground,
+                    FontKind::Sans,
+                    11.5,
+                    FontWeight::SemiBold,
+                    TextAlign::Center,
+                    true,
+                );
+                draw_list.push_hit(btn, cta_target, z_layer::MODAL + 2);
+            } else if let TailscalePairState::HttpsPending {
+                dns_name: Some(dns),
+            } = other
+            {
+                draw_list.push_text(
+                    RectF::new(hero.x + 16.0, hero.y + 88.0, (hero.w - 32.0).max(0.0), 16.0),
+                    format!("Node: {dns}"),
+                    tokens.fg_muted,
+                    FontKind::Mono,
+                    10.5,
+                    FontWeight::Regular,
+                    TextAlign::Left,
+                    true,
+                );
+            }
+        }
+    }
+
+    if let Some(err) = err_banner {
+        let err_y = (hero.bottom() - 22.0).max(hero.y);
+        draw_list.push_text(
+            RectF::new(hero.x + 12.0, err_y, (hero.w - 24.0).max(0.0), 16.0),
+            format!("Error: {err}"),
+            tokens.status_error,
+            FontKind::Mono,
+            10.5,
+            FontWeight::Medium,
+            TextAlign::Left,
+            true,
+        );
     }
 }
 

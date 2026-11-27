@@ -433,6 +433,18 @@ pub fn builtin_client_actions() -> Vec<ActionEntry> {
             "preferences config",
         ),
         (
+            "client.connect_ios",
+            "Connect iOS Device (QR Code)…",
+            "Settings",
+            "ios iphone ipad mobile qr code tailscale pair remote",
+        ),
+        (
+            "client.server_settings",
+            "Rex Server & Program Resume…",
+            "Settings",
+            "server stop start restart resume osc7577 daemon reload config",
+        ),
+        (
             "client.diagnostics",
             "Rex Diagnostics",
             "System",

@@ -12,19 +12,27 @@ Built in **Rust** with **`wgpu` (Vulkan)** instanced GPU rendering and direct C 
 ## Highlights
 
 - **Rex API rev 24 Native Client**: Full `rex.control.v1` + `rex.data.terminal.v1` + `rex.data.bytes.v1` implementation with 1-RTT `session.bootstrap`, `reconnect_token` seamless resume, byte-counted stream recovery, bounded LRU warm-session caching, and authenticated `rex1;` APC nonce verification.
+- **OSC 7577 Program Resume & Local Server Controls**:
+  - Live `program_resume_records` hydration and `program_resume_changed` event tracking with trusted (`↻ <program>`) and untrusted (`⊘ <program>`) badges in pane headers.
+  - Seamless active-session re-attach & stream re-open across Rex server restarts (`instance_id` change detection with stale pane/revision reset).
+  - Dedicated **Settings → Server** tab (`client.server_settings`) with live version/PID/instance status, one-click Restart (resuming trusted OSC 7577 programs), two-step confirmed Stop, Start (preferring `rex-server.service`), Reload Config, and Reconnect.
+  - Redacted OSC 7577 summaries in **Diagnostics HUD** and debug bundles (command argv is never logged or exported).
+- **Connect Rex iOS via Tailscale QR**: Built-in **Settings → Connect iOS** tab rendering a crisp GPU-aligned ISO/IEC 18004 QR code for instant Tailscale HTTPS pairing, plus one-click Tailscale enable/login/disable actions.
 - **First-Class `tr3x` / T3 Code Integration**:
   - **2-line priority tab cards** in exact server window order with provider icon tiles (Claude, OpenAI/Codex, Gemini, Copilot, OpenCode, Kimi, Hermes, T3 Code), OSC 7501 status rollup & corner attention dots (`blocked`, `error`, unseen `done`), animated working pulse / progress pie, subagent `↳` hierarchy, and relative timestamps.
   - **Native `rex.ui` modal engine** (`input` & `pick`) supporting all 16 official icons, multi-select checkboxes (`Space` toggle, `Ctrl+Enter` confirm), `allow_other` custom entries, live timeout progress bar, non-blocking unordered `client.reply`, and multi-client `client_prompt_ended` dismissal.
   - **Dual client-action & multi-server proxy support**: executes both inline `client.action.client_actions` (`rex.client.queue`) and server-pushed `client_perform_requested` (`session.select`, `pane.paste`), plus `client_call_requested` remote server forwarding.
-  - **`/pr` floating drawer** (`[0.45, 0.0, 0.55, 1.0]` wide / `[0.03, 0.03, 0.94, 0.94]` narrow), draggable/resizable floating panes, minimized corner capsules, and 5-zone pane drag-and-drop.
-- **Full Modern Terminal Fidelity**:
+  - **`/pr` floating drawer** (`[0.45, 0.0, 0.55, 1.0]` wide / `[0.03, 0.03, 0.94, 0.94]` narrow), draggable/resizable floating panes, minimized corner capsules, 5-zone pane drag-and-drop, and true multi-window (`GpuShared`).
+- **Agent Companion 2.0 File & Media Viewer**: Interactive right-hand viewer supporting syntax-highlighted code, rich Markdown 2.0, unified Git diffs, images, audio waveforms, video, and PDFs directly from clickable terminal paths.
+- **Full Modern Terminal Fidelity & Typography**:
+  - HarfBuzz run-shaping font ligatures, procedural pixel-exact Powerline glyphs, 220 ms GPU Copy Shine, spring-physics pane focus borders, Vim-style Copy Mode, WCAG ANSI readability guard, and solid block-cursor glyph recoloring.
   - **Kitty Graphics Protocol** (`GHOSTTY_SYS_OPT_DECODE_PNG` -> GPU RGBA8 texture cache with bounded VRAM LRU eviction across `BelowBackground`, `BelowText`, and `AboveText` layers).
   - **Mode 5522** rich image/clipboard paste, drag-and-drop file uploads (`upload_begin`), OSC 8 clickable hyperlinks, OSC 133 prompt jumping, Mode 2026 synchronized output (`RENDER_HOLD`), and Mode 2031 (`CSI ? 997 n`) dark/light color-scheme reporting.
 - **Native Omarchy & Hyprland Integration**:
   - Zero-polling **`inotify`** live theme reload from `~/.config/omarchy/current/theme/` (`colors.toml`, `alacritty.toml`, `ghostty.conf`, `light.mode`), automatically pushing `com.superlogical.terminal.set_theme` (including explicit Mode 2031 `scheme`) to owned terminal blocks.
   - Live **Hyprland IPC** sync (`$HYPRLAND_INSTANCE_SIGNATURE`) for adaptive corner rounding, gaps, and border geometry.
-  - Native **D-Bus (`org.freedesktop.Notifications`)** click-to-focus notifications jumping straight to the exact `(host, session, block)`.
-- **Multi-Host Ready**: Connects simultaneously to local `unix://`, Tailscale `https://`, and `ssh://` (`rex __internal dial-stdio`) Rex servers with `hosts.list` synchronization.
+  - Native **D-Bus (`org.freedesktop.Notifications`)** click-to-focus notifications jumping straight to the exact `(host, session, block)` plus optional audio chimes.
+- **Multi-Host Ready**: Connects simultaneously to local `unix://`, Tailscale `https://`, and `ssh://` (`rex __internal dial-stdio`) Rex servers with `hosts.list` synchronization and live listening-port pills.
 
 ## Verified Release Performance
 
@@ -70,8 +78,8 @@ Measured on Omarchy Linux (`x86_64`, `NVIDIA GeForce RTX 4060 Ti`, Vulkan, `1920
 | `Ctrl+Shift+S` | `client.tab_style.toggle` | Cycle toolbar layout (`left`/`right`/`top`/`bottom`) |
 | `Ctrl+Shift+.` | `client.sidebar.activity.toggle` | Toggle Activity priority filter |
 | `Ctrl+Alt+F` | `client.sidebar.filter.focus` | Focus sidebar tab filter |
-| `Ctrl+Shift+,` | `client.settings` | Open Settings modal (theme, density, layout, material) |
-| `Ctrl+Alt+,` | `client.diagnostics` | Open Rex Diagnostics & keymap warnings |
+| `Ctrl+Shift+,` | `client.settings` | Open Settings modal (Appearance, Typography, Layout, Server, Connect iOS) |
+| `Ctrl+Alt+,` | `client.diagnostics` | Open Rex Diagnostics, OSC 7577 resume records & keymap warnings |
 | `Ctrl+Shift+R` | `session.refresh` | Refresh sessions and views |
 
 ### Tabs & Panes
@@ -189,6 +197,7 @@ See [docs/architecture.md](docs/architecture.md), [docs/protocol-spec.md](docs/p
 | [`resvg`](https://github.com/linebender/resvg) | `linebender/resvg` | `Apache-2.0 OR MIT` | Embedded vector SVG icon rendering |
 | [`tiny-skia`](https://github.com/linebender/tiny-skia) | `linebender/tiny-skia` | `BSD-3-Clause` | 2D CPU rasterizer backing SVG icon uploads |
 | [`image`](https://github.com/image-rs/image) | `image-rs/image` | `MIT OR Apache-2.0` | PNG/JPEG/GIF/WebP/BMP decoding (Kitty Graphics & paste) |
+| [`qrcodegen`](https://github.com/nayuki/QR-Code-generator) | `nayuki/QR-Code-generator` | `MIT` | ISO/IEC 18004 QR matrix generation for Connect Rex iOS Tailscale pairing |
 | [`bytemuck`](https://github.com/Lokathor/bytemuck) | `Lokathor/bytemuck` | `Zlib OR Apache-2.0 OR MIT` | Safe zero-copy casting for GPU vertex/instance buffers |
 
 #### Linux, Wayland & Desktop Integration

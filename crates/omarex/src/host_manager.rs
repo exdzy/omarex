@@ -19,12 +19,13 @@ use rex_proto::types::{
     ClientKeymapResponse, ClientListResponse, ClientPerformRequestedEvent, ClientPromptEndedEvent,
     ClientPromptRequestedEvent, ClientReplyRequest, DataConnectRequest, DataTicketSpec,
     DirEntry as ProtoDirEntry, HostsListResponse, LayoutCreateSpec, ListDirStatus, OwnMode,
-    ServerEvent, SessionBootstrapRequest, SessionBootstrapResponse, SessionCreateRequest,
-    SessionDisownBlockRequest, SessionFloatBlockRequest, SessionNewBlockRequest,
-    SessionNewLayerRequest, SessionNewSplitRequest, SessionNewWindowRequest,
-    SessionOwnBlockRequest, SessionResizeLayerRequest, SessionResizePaneRequest,
-    SessionSetLayerStateRequest, SessionSwapBlocksRequest, SessionTransferWindowRequest,
-    SessionView, SessionZoomBlockRequest, TerminalBlobReadArgs, TerminalClipboardReadArgs,
+    ServerEvent, ServerStatus, ServerStopRequest, ServerVersionResponse, SessionBootstrapRequest,
+    SessionBootstrapResponse, SessionCreateRequest, SessionDisownBlockRequest,
+    SessionFloatBlockRequest, SessionNewBlockRequest, SessionNewLayerRequest,
+    SessionNewSplitRequest, SessionNewWindowRequest, SessionOwnBlockRequest,
+    SessionResizeLayerRequest, SessionResizePaneRequest, SessionSetLayerStateRequest,
+    SessionSwapBlocksRequest, SessionTransferWindowRequest, SessionView, SessionZoomBlockRequest,
+    TailscaleEnableRequest, TailscaleStatus, TerminalBlobReadArgs, TerminalClipboardReadArgs,
     TerminalListDirArgs, TerminalListDirResponse, TerminalPortsResponse, TerminalResizeArgs,
     TerminalSetThemeArgs, TunnelDialOptions,
 };
@@ -389,6 +390,26 @@ pub enum HostCommand {
     },
     /// Send an interactive desktop notification via D-Bus (`org.freedesktop.Notifications`).
     SendNotification(NotificationRequest),
+    /// Fetch fresh `server.status` (including Tailscale & HTTPS readiness) for `host_id`.
+    RefreshServerStatus { host_id: String },
+    /// Enable (or update `allow_tailnet_members` on) the local Rex server's built-in Tailscale node.
+    EnableTailscale {
+        host_id: String,
+        allow_tailnet_members: bool,
+    },
+    /// Disable the local Rex server's built-in Tailscale node (keeps saved sign-in).
+    DisableTailscale { host_id: String },
+    /// Request a Tailscale browser sign-in URL (`server.tailscale.login`).
+    LoginTailscale { host_id: String },
+    /// Stop the local Rex server via `server.stop` and close the local client cleanly.
+    StopLocalServer { host_id: String, if_idle: bool },
+    /// Start the local Rex server (via user systemd unit if enabled, else `rex server start`)
+    /// and dial the local endpoint once ready.
+    StartLocalServer { host_id: String },
+    /// Gracefully stop the local Rex server, wait for shutdown, restart it, and reconnect.
+    RestartLocalServer { host_id: String },
+    /// Re-dial the local Rex server endpoint without spawning a new server process.
+    ReconnectLocalServer { host_id: String },
     /// Shut down all host connections, data streams, and background tasks cleanly.
     Shutdown,
 }
@@ -602,6 +623,28 @@ pub enum RuntimeEvent {
         key: BlockKey,
         remote_port: u16,
         error: String,
+    },
+    /// Fresh `server.status` snapshot returned for `host_id` (used by Connect iOS Settings tab).
+    ServerStatusRefreshed {
+        host_id: String,
+        result: Result<Box<ServerStatus>, String>,
+    },
+    /// Completion of `server.tailscale.{enable,disable,login}` RPC.
+    TailscaleActionFinished {
+        host_id: String,
+        action: String,
+        result: Result<TailscaleStatus, String>,
+    },
+    /// Server build/version metadata fetched via `server.version`.
+    ServerVersionLoaded {
+        host_id: String,
+        version: ServerVersionResponse,
+    },
+    /// Completion of local server lifecycle action (`"stop"`, `"start"`, `"restart"`, `"reload_config"`).
+    ServerLifecycleFinished {
+        host_id: String,
+        action: String,
+        result: Result<String, String>,
     },
 }
 
@@ -1020,6 +1063,7 @@ fn should_surface_rpc_error(context: &str, err: &rex_proto::ProtoError) -> bool 
         | "com.superlogical.terminal.clipboard_read"
         | "com.superlogical.terminal.ports"
         | "com.superlogical.terminal.blob_read"
+        | "com.superlogical.terminal.program_resume_records"
         | "session.new_block"
         | "client.key"
         | "client.reply" => !err.is_not_found(),
@@ -1079,6 +1123,13 @@ enum InternalMsg {
         attach_state: Arc<HostAttachState>,
         event_task: tokio::task::JoinHandle<()>,
     },
+    TeardownHost {
+        host_id: String,
+        reason: String,
+    },
+    DialLocalHost {
+        host_id: String,
+    },
     StreamEnded {
         key: BlockKey,
     },
@@ -1132,13 +1183,15 @@ async fn run_host_manager(
 
     let keymap_req = Arc::new(config.initial_keymap_request.clone());
     let client_label = config.client_label.clone();
+    let local_endpoint = config.local_endpoint.clone();
+    let preferred_local_session_id = config.preferred_local_session_id.clone();
 
     // Auto-dial local default Rex server if configured.
-    if let Some(local_ep) = config.local_endpoint {
+    if let Some(local_ep) = local_endpoint.clone() {
         spawn_host_dial(
             LOCAL_HOST_ID.to_owned(),
             local_ep,
-            config.preferred_local_session_id,
+            preferred_local_session_id.clone(),
             client_label.clone(),
             Arc::clone(&keymap_req),
             emitter.clone(),
@@ -1179,6 +1232,51 @@ async fn run_host_manager(
                             old.attach_state.clear_all();
                             old.client.shutdown();
                             old.event_task.abort();
+                        }
+                    }
+                    InternalMsg::TeardownHost { host_id, reason } => {
+                        tunnels.retain(|_, tun| {
+                            if tun.host_id == host_id {
+                                let _ = tun.cancel_tx.send(true);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        let matching: Vec<BlockKey> = streams
+                            .keys()
+                            .filter(|k| k.host_id == host_id)
+                            .cloned()
+                            .collect();
+                        for key in matching {
+                            if let Some(mut st) = streams.remove(&key)
+                                && let Some(tx) = st.cancel_tx.take()
+                            {
+                                let _ = tx.send(());
+                            }
+                        }
+                        if let Some(host) = hosts.remove(&host_id) {
+                            host.attach_state.clear_all();
+                            host.client.shutdown();
+                            host.event_task.abort();
+                        }
+                        emitter.emit(RuntimeEvent::HostDisconnected {
+                            host_id,
+                            will_reconnect: false,
+                            reason,
+                        });
+                    }
+                    InternalMsg::DialLocalHost { host_id } => {
+                        if let Some(ep) = local_endpoint.clone() {
+                            spawn_host_dial(
+                                host_id,
+                                ep,
+                                preferred_local_session_id.clone(),
+                                client_label.clone(),
+                                Arc::clone(&keymap_req),
+                                emitter.clone(),
+                                internal_tx.clone(),
+                            );
                         }
                     }
                     InternalMsg::StreamEnded { key } => {
@@ -1494,9 +1592,29 @@ async fn run_host_manager(
                         if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
                             let em = emitter.clone();
                             tokio::spawn(async move {
-                                if let Err(err) = client.server_config_reload().await {
-                                    emit_rpc_error(&em, host_id, "server.config_reload", &err);
+                                match client.server_config_reload().await {
+                                    Ok(_) => {
+                                        em.emit(RuntimeEvent::ServerLifecycleFinished {
+                                            host_id,
+                                            action: "reload_config".to_owned(),
+                                            result: Ok("Reloaded Rex config and resume rules".to_owned()),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        emit_rpc_error(&em, host_id.clone(), "server.config_reload", &err);
+                                        em.emit(RuntimeEvent::ServerLifecycleFinished {
+                                            host_id,
+                                            action: "reload_config".to_owned(),
+                                            result: Err(err.to_string()),
+                                        });
+                                    }
                                 }
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "reload_config".to_owned(),
+                                result: Err("Local Rex server is not connected".to_owned()),
                             });
                         }
                     }
@@ -2362,6 +2480,269 @@ async fn run_host_manager(
                             });
                         }
                     }
+
+                    HostCommand::RefreshServerStatus { host_id } => {
+                        if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let (status_res, ver_res) =
+                                    tokio::join!(client.server_status(), client.server_version());
+                                if let Ok((version, _)) = ver_res {
+                                    em.emit(RuntimeEvent::ServerVersionLoaded {
+                                        host_id: host_id.clone(),
+                                        version,
+                                    });
+                                }
+                                let res = status_res
+                                    .map(|(status, _)| Box::new(status))
+                                    .map_err(|e| e.to_string());
+                                em.emit(RuntimeEvent::ServerStatusRefreshed {
+                                    host_id,
+                                    result: res,
+                                });
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::ServerStatusRefreshed {
+                                host_id,
+                                result: Err("Local Rex server is not connected".to_owned()),
+                            });
+                        }
+                    }
+
+                    HostCommand::EnableTailscale {
+                        host_id,
+                        allow_tailnet_members,
+                    } => {
+                        if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let req = TailscaleEnableRequest {
+                                    allow_tailnet_members,
+                                    hostname: None,
+                                    control_url: None,
+                                };
+                                let res = client
+                                    .server_tailscale_enable(&req)
+                                    .await
+                                    .map(|(resp, _)| resp.tailscale)
+                                    .map_err(|e| e.to_string());
+                                em.emit(RuntimeEvent::TailscaleActionFinished {
+                                    host_id,
+                                    action: "enable".to_owned(),
+                                    result: res,
+                                });
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::TailscaleActionFinished {
+                                host_id,
+                                action: "enable".to_owned(),
+                                result: Err("Local Rex server is not connected".to_owned()),
+                            });
+                        }
+                    }
+
+                    HostCommand::DisableTailscale { host_id } => {
+                        if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let res = client
+                                    .server_tailscale_disable()
+                                    .await
+                                    .map(|(resp, _)| resp.tailscale)
+                                    .map_err(|e| e.to_string());
+                                em.emit(RuntimeEvent::TailscaleActionFinished {
+                                    host_id,
+                                    action: "disable".to_owned(),
+                                    result: res,
+                                });
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::TailscaleActionFinished {
+                                host_id,
+                                action: "disable".to_owned(),
+                                result: Err("Local Rex server is not connected".to_owned()),
+                            });
+                        }
+                    }
+
+                    HostCommand::LoginTailscale { host_id } => {
+                        if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            tokio::spawn(async move {
+                                let res = client
+                                    .server_tailscale_login()
+                                    .await
+                                    .map(|(resp, _)| resp.tailscale)
+                                    .map_err(|e| e.to_string());
+                                em.emit(RuntimeEvent::TailscaleActionFinished {
+                                    host_id,
+                                    action: "login".to_owned(),
+                                    result: res,
+                                });
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::TailscaleActionFinished {
+                                host_id,
+                                action: "login".to_owned(),
+                                result: Err("Local Rex server is not connected".to_owned()),
+                            });
+                        }
+                    }
+
+                    HostCommand::StopLocalServer { host_id, if_idle } => {
+                        if let Some(client) = hosts.get(&host_id).map(|h| h.client.clone()) {
+                            let em = emitter.clone();
+                            let itx = internal_tx.clone();
+                            tokio::spawn(async move {
+                                let req = ServerStopRequest {
+                                    if_idle: if_idle.then_some(true),
+                                };
+                                match client.server_stop(&req).await {
+                                    Ok(_) => {
+                                        // Close control + data connections immediately so Rex exits
+                                        // cleanly without waiting its 1-second grace timeout.
+                                        let _ = itx.send(InternalMsg::TeardownHost {
+                                            host_id: host_id.clone(),
+                                            reason: "Rex server stopped".to_owned(),
+                                        });
+                                        em.emit(RuntimeEvent::ServerLifecycleFinished {
+                                            host_id,
+                                            action: "stop".to_owned(),
+                                            result: Ok("Local Rex server stopped".to_owned()),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        em.emit(RuntimeEvent::ServerLifecycleFinished {
+                                            host_id,
+                                            action: "stop".to_owned(),
+                                            result: Err(err.to_string()),
+                                        });
+                                    }
+                                }
+                            });
+                        } else {
+                            emitter.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "stop".to_owned(),
+                                result: Err("Local Rex server is not connected".to_owned()),
+                            });
+                        }
+                    }
+
+                    HostCommand::StartLocalServer { host_id } => {
+                        let Some(ep) = local_endpoint.clone() else {
+                            emitter.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "start".to_owned(),
+                                result: Err("No local Rex endpoint configured".to_owned()),
+                            });
+                            continue;
+                        };
+                        let em = emitter.clone();
+                        let itx = internal_tx.clone();
+                        tokio::spawn(async move {
+                            let res = start_local_rex_server(&ep).await;
+                            if res.is_ok() {
+                                let _ = itx.send(InternalMsg::DialLocalHost {
+                                    host_id: host_id.clone(),
+                                });
+                            }
+                            em.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "start".to_owned(),
+                                result: res,
+                            });
+                        });
+                    }
+
+                    HostCommand::RestartLocalServer { host_id } => {
+                        let Some(ep) = local_endpoint.clone() else {
+                            emitter.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "restart".to_owned(),
+                                result: Err("No local Rex endpoint configured".to_owned()),
+                            });
+                            continue;
+                        };
+                        // Cancel active streams & tunnels on this host before stopping the server.
+                        tunnels.retain(|_, tun| {
+                            if tun.host_id == host_id {
+                                let _ = tun.cancel_tx.send(true);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        let matching: Vec<BlockKey> = streams
+                            .keys()
+                            .filter(|k| k.host_id == host_id)
+                            .cloned()
+                            .collect();
+                        for key in matching {
+                            if let Some(mut st) = streams.remove(&key)
+                                && let Some(tx) = st.cancel_tx.take()
+                            {
+                                let _ = tx.send(());
+                            }
+                        }
+                        let old_host = hosts.remove(&host_id);
+                        emitter.emit(RuntimeEvent::HostDisconnected {
+                            host_id: host_id.clone(),
+                            will_reconnect: true,
+                            reason: "Restarting Rex server…".to_owned(),
+                        });
+                        let em = emitter.clone();
+                        let itx = internal_tx.clone();
+                        tokio::spawn(async move {
+                            if let Some(host) = old_host {
+                                let stop_res = host
+                                    .client
+                                    .server_stop(&ServerStopRequest { if_idle: None })
+                                    .await;
+                                host.attach_state.clear_all();
+                                host.client.shutdown();
+                                host.event_task.abort();
+                                if let Err(err) = stop_res {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "server.stop returned error during restart; continuing"
+                                    );
+                                }
+                                wait_for_endpoint_down(&ep, Duration::from_secs(3)).await;
+                            }
+                            let res = start_local_rex_server(&ep).await;
+                            if res.is_ok() {
+                                let _ = itx.send(InternalMsg::DialLocalHost {
+                                    host_id: host_id.clone(),
+                                });
+                            }
+                            em.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "restart".to_owned(),
+                                result: res.map(|_| "Restarted local Rex server".to_owned()),
+                            });
+                        });
+                    }
+
+                    HostCommand::ReconnectLocalServer { host_id } => {
+                        if let Some(ep) = local_endpoint.clone() {
+                            spawn_host_dial(
+                                host_id,
+                                ep,
+                                preferred_local_session_id.clone(),
+                                client_label.clone(),
+                                Arc::clone(&keymap_req),
+                                emitter.clone(),
+                                internal_tx.clone(),
+                            );
+                        } else {
+                            emitter.emit(RuntimeEvent::ServerLifecycleFinished {
+                                host_id,
+                                action: "reconnect".to_owned(),
+                                result: Err("No local Rex endpoint configured".to_owned()),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -2393,7 +2774,11 @@ async fn hydrate_blocks_concurrent(
                 ..Default::default()
             };
 
-            match client.terminal_program_status(&session_id, &block_id).await {
+            let (ps_res, resume_res) = tokio::join!(
+                client.terminal_program_status(&session_id, &block_id),
+                client.terminal_program_resume_records(&session_id, &block_id),
+            );
+            match ps_res {
                 Ok((ps, _)) => {
                     meta.program_statuses = ps.records;
                 }
@@ -2403,6 +2788,9 @@ async fn hydrate_blocks_concurrent(
                     return None;
                 }
                 Err(_) => {}
+            }
+            if let Ok((rr, _)) = resume_res {
+                meta.program_resume_records = Some(rr.records);
             }
 
             // Plain shell blocks (without OSC 7501 status records) also hydrate `pwd` and
@@ -2424,6 +2812,7 @@ async fn hydrate_blocks_concurrent(
             }
 
             if !meta.program_statuses.is_empty()
+                || meta.program_resume_records.is_some()
                 || meta.pwd.is_some()
                 || meta.foreground_process.is_some()
                 || meta.title.is_some()
@@ -2576,12 +2965,20 @@ async fn run_host_bootstrap(
         data_tickets: Some(vec![DataTicketSpec::terminal_v1()]),
     };
 
-    let (boot_res, km_res, hosts_res, clients_res) = tokio::join!(
+    let (boot_res, km_res, hosts_res, clients_res, ver_res) = tokio::join!(
         client.bootstrap(&boot_req),
         client.client_keymap(&keymap_req),
         client.hosts_list(),
         client.client_list(),
+        client.server_version(),
     );
+
+    if let Ok((version, _)) = ver_res {
+        emitter.emit(RuntimeEvent::ServerVersionLoaded {
+            host_id: host_id.clone(),
+            version,
+        });
+    }
 
     if let Ok((clients, _)) = clients_res {
         emitter.emit(RuntimeEvent::ClientsListed {
@@ -2920,6 +3317,107 @@ where
 
 const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PORTS_BLOB_BYTES: usize = 2 * 1024 * 1024;
+
+/// Fast probe returning `true` if `endpoint` currently accepts a local Unix or TCP connection.
+async fn endpoint_is_reachable(endpoint: &RexEndpoint) -> bool {
+    match endpoint {
+        RexEndpoint::Unix(path) => tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::UnixStream::connect(path),
+        )
+        .await
+        .is_ok_and(|res| res.is_ok()),
+        RexEndpoint::Tcp { host, port, .. } => tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::TcpStream::connect((host.as_str(), *port)),
+        )
+        .await
+        .is_ok_and(|res| res.is_ok()),
+        RexEndpoint::Ssh { .. } => false,
+    }
+}
+
+/// Waits up to `timeout` for a stopping local Rex server endpoint to stop accepting connections.
+async fn wait_for_endpoint_down(endpoint: &RexEndpoint, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if !endpoint_is_reachable(endpoint).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Starts the local Rex server cleanly (preferring an enabled systemd user unit such as
+/// `rex-server.service` or `rex.service`, otherwise falling back to `rex server start`)
+/// and waits until `endpoint` becomes reachable.
+async fn start_local_rex_server(endpoint: &RexEndpoint) -> Result<String, String> {
+    if endpoint_is_reachable(endpoint).await {
+        return Ok("Local Rex server is already running".to_owned());
+    }
+
+    let endpoint_clone = endpoint.clone();
+    let launch_note = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let is_default_unix = endpoint_clone == RexEndpoint::discover_default();
+        if is_default_unix {
+            for unit in ["rex-server.service", "rex.service"] {
+                let enabled = std::process::Command::new("systemctl")
+                    .args(["--user", "is-enabled", "--quiet", unit])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if enabled {
+                    let out = std::process::Command::new("systemctl")
+                        .args(["--user", "start", unit])
+                        .output()
+                        .map_err(|e| format!("failed to run systemctl for {unit}: {e}"))?;
+                    if out.status.success() {
+                        return Ok(format!("Started local Rex server via {unit}"));
+                    }
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                    return Err(if stderr.is_empty() {
+                        format!("systemctl --user start {unit} failed")
+                    } else {
+                        stderr
+                    });
+                }
+            }
+        }
+
+        let mut cmd = std::process::Command::new("rex");
+        cmd.args(["server", "start"]);
+        if let RexEndpoint::Unix(path) = &endpoint_clone
+            && !is_default_unix
+        {
+            cmd.args(["--listen", &format!("unix://{}", path.display())]);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("failed to spawn `rex server start`: {e}"))?;
+        if out.status.success() {
+            Ok("Started local Rex server".to_owned())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            Err(if detail.is_empty() {
+                format!("`rex server start` exited with {}", out.status)
+            } else {
+                detail
+            })
+        }
+    })
+    .await
+    .map_err(|e| format!("server start task failed: {e}"))??;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if endpoint_is_reachable(endpoint).await {
+            return Ok(launch_note);
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    Err("Rex server started, but its socket did not become ready within 5s".to_owned())
+}
 
 /// Local filesystem fallback for `com.superlogical.terminal.list_dir` when local Rex block is
 /// offline/headless.

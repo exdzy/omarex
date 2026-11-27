@@ -53,6 +53,15 @@ pub struct PortBadge {
     pub tunneled: bool,
 }
 
+/// OSC 7577 Program Resume status badge displayed in pane headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeBadge {
+    pub program: String,
+    pub trusted: bool,
+    pub rule: Option<String>,
+    pub untrusted_reason: Option<String>,
+}
+
 /// Per-pane chrome metadata supplied for rendering tiled or floating panes.
 #[derive(Debug, Clone)]
 pub struct PaneMeta {
@@ -64,6 +73,8 @@ pub struct PaneMeta {
     pub hovered: bool,
     pub bell_unread: bool,
     pub program_status: Option<RolledUpStatus>,
+    /// Active OSC 7577 Program Resume record summary for this pane, if any.
+    pub resume_badge: Option<ResumeBadge>,
     pub osc94_progress: Option<Osc94Progress>,
     pub scrollbar: ScrollbarMetrics,
     /// Optional explicit background from TUI `fill_with_program_colors`.
@@ -996,6 +1007,62 @@ fn render_pane_header(
                 false,
             );
             cx += bw + 6.0;
+        }
+    }
+
+    // OSC 7577 Program Resume badge (`↻ claude` when trusted, `⊘ program` when untrusted)
+    if let Some(resume) = meta.and_then(|m| m.resume_badge.as_ref()) {
+        let prog = resume.program.trim();
+        let label = if resume.trusted {
+            if prog.is_empty() {
+                "↻ resume".to_owned()
+            } else {
+                format!("↻ {prog}")
+            }
+        } else if prog.is_empty() {
+            "⊘ untrusted".to_owned()
+        } else {
+            format!("⊘ {prog}")
+        };
+        let pill_w = (label.chars().count() as f32 * 6.4 + 14.0).clamp(52.0, 136.0);
+        if cx + pill_w <= max_x {
+            let pill_h = 19.0;
+            let pill_y = header_rect.y + (header_rect.h - pill_h) * 0.5;
+            let pill_rect = RectF::new(cx, pill_y, pill_w, pill_h);
+            let pill_r = if theme_rounding <= 0.0 {
+                0.0
+            } else {
+                pill_h * 0.5
+            };
+            let pill_color = if resume.trusted {
+                tokens.status_done
+            } else {
+                tokens.status_blocked
+            };
+            draw_list.push_rect(
+                pill_rect,
+                pill_color.with_alpha_f32(0.12),
+                Some(pill_color.with_alpha_f32(0.42)),
+                1.0,
+                pill_r,
+                None,
+            );
+            draw_list.push_text(
+                RectF::new(
+                    pill_rect.x + 6.0,
+                    pill_rect.y + 2.0,
+                    (pill_rect.w - 12.0).max(0.0),
+                    15.0,
+                ),
+                label,
+                pill_color,
+                FontKind::Mono,
+                10.0,
+                FontWeight::Medium,
+                TextAlign::Center,
+                true,
+            );
+            cx += pill_w + 6.0;
         }
     }
 

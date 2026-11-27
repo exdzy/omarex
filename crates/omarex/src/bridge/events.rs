@@ -114,6 +114,13 @@ impl OmarexController {
                         reason,
                     );
                 }
+                if host_id == LOCAL_HOST_ID {
+                    self.tailscale_action_busy = false;
+                    if !will_reconnect {
+                        self.server_action_busy = None;
+                    }
+                    self.refresh_open_settings_modals(contexts);
+                }
             }
 
             RuntimeEvent::HostError {
@@ -198,7 +205,24 @@ impl OmarexController {
                     .chain(bootstrap.attached_sessions.iter())
                     .map(|s| s.session.session_id.clone())
                     .collect();
-                host.apply_bootstrap(*bootstrap, api_rev);
+                let server_restarted = host.apply_bootstrap(*bootstrap, api_rev);
+                if server_restarted {
+                    // The Rex server instance restarted (restoring sessions & trusted OSC 7577
+                    // programs): evict stale pre-restart VT runtimes and stream tracking so fresh
+                    // `GHOSTSNP` snapshots open cleanly for every active window.
+                    self.pane_store.evict_host(&host_id, None);
+                    self.opened_streams.retain(|k| k.host_id != host_id);
+                    self.hydrated_blocks.retain(|k| k.host_id != host_id);
+                    self.ports_queried_blocks.retain(|k| k.host_id != host_id);
+                    self.workspace.invalidate_host_sent_resizes(&host_id);
+                }
+                if host_id == LOCAL_HOST_ID {
+                    self.tailscale_action_busy = false;
+                    self.tailscale_last_error = None;
+                    self.server_action_busy = None;
+                    self.server_last_error = None;
+                    self.refresh_open_settings_modals(contexts);
+                }
                 let updated_set: HashSet<SessionKey> = updated_session_ids
                     .iter()
                     .map(|sid| SessionKey::new(host_id.clone(), sid.clone()))
@@ -328,24 +352,27 @@ impl OmarexController {
                                 });
                             }
                         });
-                    } else if !contexts.is_empty() {
-                        // Sync any open windows already viewing sessions updated by this bootstrap.
+                    } else if contexts.is_empty() {
+                        self.reconcile_active_session_after_bootstrap(
+                            &host_id,
+                            &updated_set,
+                            &tickets,
+                            selected_id.as_deref(),
+                            server_restarted,
+                        );
+                    } else {
+                        // Sync EVERY open window viewing a session on `host_id` — including
+                        // non-default sessions not returned in `bootstrap.selected_session`!
                         for ctx in contexts.iter_mut() {
-                            if let Some(sk) = ctx.active_session.clone()
-                                && updated_set.contains(&sk)
-                            {
-                                let focused = self
-                                    .workspace
-                                    .session(&sk)
-                                    .and_then(|s| s.view.as_ref())
-                                    .and_then(active_window_of_view)
-                                    .and_then(primary_block_id_of_window)
-                                    .map(str::to_owned);
-                                self.with_window_context(ctx, |ctrl| {
-                                    ctrl.ui.on_session_view_changed(focused);
-                                    ctrl.open_active_window_streams(&sk, &tickets);
-                                });
-                            }
+                            self.with_window_context(ctx, |ctrl| {
+                                ctrl.reconcile_active_session_after_bootstrap(
+                                    &host_id,
+                                    &updated_set,
+                                    &tickets,
+                                    selected_id.as_deref(),
+                                    server_restarted,
+                                );
+                            });
                         }
                     }
                 }
@@ -1261,6 +1288,148 @@ impl OmarexController {
                     error,
                 );
             }
+
+            RuntimeEvent::ServerStatusRefreshed { host_id, result } => {
+                if host_id == LOCAL_HOST_ID {
+                    self.tailscale_action_busy = false;
+                    self.server_action_busy = None;
+                }
+                match result {
+                    Ok(status) => {
+                        if let Some(host) = self.workspace.host_mut(&host_id) {
+                            host.tailscale_status = status.tailscale.clone();
+                            host.server_status = Some(*status);
+                        }
+                        if host_id == LOCAL_HOST_ID {
+                            self.tailscale_last_error = None;
+                            self.server_last_error = None;
+                        }
+                    }
+                    Err(err) => {
+                        if host_id == LOCAL_HOST_ID {
+                            self.tailscale_last_error = Some(err.clone());
+                            self.server_last_error = Some(err);
+                        }
+                    }
+                }
+                if host_id == LOCAL_HOST_ID {
+                    self.refresh_open_settings_modals(contexts);
+                }
+            }
+
+            RuntimeEvent::ServerVersionLoaded { host_id, version } => {
+                if let Some(host) = self.workspace.host_mut(&host_id) {
+                    host.server_version = Some(version);
+                }
+                if host_id == LOCAL_HOST_ID {
+                    self.refresh_open_settings_modals(contexts);
+                }
+            }
+
+            RuntimeEvent::ServerLifecycleFinished {
+                host_id,
+                action,
+                result,
+            } => {
+                if host_id == LOCAL_HOST_ID {
+                    self.server_action_busy = None;
+                }
+                match result {
+                    Ok(msg) => {
+                        if host_id == LOCAL_HOST_ID {
+                            self.server_last_error = None;
+                        }
+                        let title = match action.as_str() {
+                            "stop" => "Rex server stopped",
+                            "start" => "Rex server started",
+                            "restart" => "Rex server restarted",
+                            "reload_config" => "Rex config reloaded",
+                            _ => "Rex server updated",
+                        };
+                        self.push_toast_on_window(
+                            contexts,
+                            pref_idx,
+                            ToastSeverity::Success,
+                            title,
+                            msg,
+                        );
+                    }
+                    Err(err) => {
+                        if host_id == LOCAL_HOST_ID {
+                            self.server_last_error = Some(err.clone());
+                        }
+                        self.push_toast_on_window(
+                            contexts,
+                            pref_idx,
+                            ToastSeverity::Warning,
+                            format!("Rex server {action} failed"),
+                            err,
+                        );
+                    }
+                }
+                if host_id == LOCAL_HOST_ID {
+                    self.refresh_open_settings_modals(contexts);
+                }
+            }
+
+            RuntimeEvent::TailscaleActionFinished {
+                host_id,
+                action,
+                result,
+            } => {
+                if host_id == LOCAL_HOST_ID {
+                    self.tailscale_action_busy = false;
+                }
+                match result {
+                    Ok(ts) => {
+                        let auth_url_to_open = if action == "login" && !self.read_only {
+                            ts.auth_url.clone().filter(|u| !u.trim().is_empty())
+                        } else {
+                            None
+                        };
+                        if let Some(host) = self.workspace.host_mut(&host_id) {
+                            host.tailscale_status = Some(ts);
+                        }
+                        if host_id == LOCAL_HOST_ID {
+                            self.tailscale_last_error = None;
+                        }
+                        if let Some(url) = auth_url_to_open {
+                            if let Err(err) = open::that_detached(&url) {
+                                self.push_toast_on_window(
+                                    contexts,
+                                    pref_idx,
+                                    ToastSeverity::Warning,
+                                    "Could not open browser",
+                                    format!("{url} ({err})"),
+                                );
+                            } else {
+                                self.push_toast_on_window(
+                                    contexts,
+                                    pref_idx,
+                                    ToastSeverity::Info,
+                                    "Opened Tailscale sign-in",
+                                    url,
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if host_id == LOCAL_HOST_ID {
+                            self.tailscale_last_error = Some(err.clone());
+                        }
+                        self.push_toast_on_window(
+                            contexts,
+                            pref_idx,
+                            ToastSeverity::Warning,
+                            format!("Tailscale {action} failed"),
+                            err,
+                        );
+                    }
+                }
+                if host_id == LOCAL_HOST_ID {
+                    self.refresh_open_settings_modals(contexts);
+                }
+            }
         }
     }
 
@@ -1575,9 +1744,16 @@ impl OmarexController {
                     }
                     _ => None,
                 };
+                let program_resume_changed = matches!(
+                    &sess_ev,
+                    SessionEvent::BlockEvent(blk_ev) if blk_ev.name == "program_resume_changed"
+                );
                 let needs_view = self
                     .workspace
                     .apply_session_event(host_id, &session_id, &sess_ev);
+                if program_resume_changed && host_id == LOCAL_HOST_ID {
+                    self.refresh_open_settings_modals(contexts);
+                }
                 if let Some(ps_key) = program_status_block_key
                     && let Some(blk) = self.workspace.block(&ps_key)
                 {
@@ -1640,6 +1816,11 @@ impl OmarexController {
             ServerEvent::TailscaleStatusChanged(ts) => {
                 if let Some(host) = self.workspace.host_mut(host_id) {
                     host.tailscale_status = Some(ts);
+                }
+                if host_id == LOCAL_HOST_ID {
+                    self.tailscale_action_busy = false;
+                    self.tailscale_last_error = None;
+                    self.refresh_open_settings_modals(contexts);
                 }
             }
             ServerEvent::EventDropped { .. } => {
@@ -2200,6 +2381,70 @@ impl OmarexController {
             });
         }
         self.workspace.on_session_destroyed(host_id, session_id);
+    }
+
+    /// Reconciles the current window's active session after `BootstrapReady` (especially after a
+    /// Rex server restart or long disconnect where pane data streams expired and non-default
+    /// sessions were not included in `bootstrap.selected_session`).
+    fn reconcile_active_session_after_bootstrap(
+        &mut self,
+        host_id: &str,
+        updated_set: &HashSet<SessionKey>,
+        tickets: &HashMap<(String, String), String>,
+        server_selected: Option<&str>,
+        server_restarted: bool,
+    ) {
+        let Some(sk) = self.workspace.active_session.clone() else {
+            return;
+        };
+        if sk.host_id != host_id {
+            return;
+        }
+        if self.workspace.session(&sk).is_some() {
+            if updated_set.contains(&sk) {
+                if let Some(sess) = self.workspace.session_mut(&sk) {
+                    sess.warmth = SessionWarmth::Active;
+                }
+                let focused = self
+                    .workspace
+                    .session(&sk)
+                    .and_then(|s| s.view.as_ref())
+                    .and_then(active_window_of_view)
+                    .and_then(primary_block_id_of_window)
+                    .map(str::to_owned);
+                self.ui.on_session_view_changed(focused.clone());
+                self.open_active_window_streams(&sk, tickets);
+                self.maybe_hydrate_session_metadata(&sk);
+                if server_restarted {
+                    self.force_immediate_resize = true;
+                    if let Some(bid) = focused {
+                        self.maybe_claim_ownership(
+                            &BlockKey::new(sk.host_id, sk.session_id, bid),
+                            OwnershipTrigger::AttachOrView,
+                        );
+                    }
+                }
+            } else {
+                // Non-default session still exists on the restarted server, but wasn't returned
+                // inside `bootstrap.selected_session`: re-attach it immediately so its view and
+                // pane streams recover without requiring manual session switching!
+                if let Some(sess) = self.workspace.session_mut(&sk) {
+                    sess.warmth = SessionWarmth::Active;
+                }
+                self.send_command(HostCommand::SelectSession {
+                    host_id: sk.host_id,
+                    session_id: sk.session_id,
+                });
+            }
+        } else {
+            // Session no longer exists (e.g., server restarted with `--discard` or `--restore=false`).
+            self.workspace.active_session = None;
+            if let Some(chosen_sess) = self.pick_initial_session_id(host_id, server_selected) {
+                let fallback = SessionKey::new(host_id.to_owned(), chosen_sess);
+                self.activate_session(fallback.clone(), tickets);
+                self.maybe_hydrate_session_metadata(&fallback);
+            }
+        }
     }
 
     pub(super) fn open_active_window_streams(

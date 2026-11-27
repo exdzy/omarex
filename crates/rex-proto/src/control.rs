@@ -24,22 +24,23 @@ use crate::types::{
     CreatedWindowInfo, DataConnectRequest, DataConnectResponse, HelloMessage, HostsListResponse,
     HostsPutRequest, HostsPutResponse, HostsRemoveRequest, HostsRemoveResponse,
     IncomingControlFrame, MIN_COMPRESS_BYTES, ReconnectToken, RevisionResponse, ServerEvent,
-    ServerStatus, SessionAttachResponse, SessionBootstrapRequest, SessionBootstrapResponse,
-    SessionCreateRequest, SessionCreateResponse, SessionDisownBlockRequest,
-    SessionFloatBlockRequest, SessionFloatBlockResponse, SessionListResponse,
-    SessionNewBlockRequest, SessionNewBlockResponse, SessionNewLayerRequest,
+    ServerStatus, ServerStopRequest, ServerVersionResponse, SessionAttachResponse,
+    SessionBootstrapRequest, SessionBootstrapResponse, SessionCreateRequest, SessionCreateResponse,
+    SessionDisownBlockRequest, SessionFloatBlockRequest, SessionFloatBlockResponse,
+    SessionListResponse, SessionNewBlockRequest, SessionNewBlockResponse, SessionNewLayerRequest,
     SessionNewLayerResponse, SessionNewSplitRequest, SessionNewSplitResponse,
     SessionNewWindowRequest, SessionOwnBlockRequest, SessionResizeLayerRequest,
     SessionResizePaneRequest, SessionSetLayerStateRequest, SessionSwapBlocksRequest,
     SessionSwapBlocksResponse, SessionTransferWindowRequest, SessionTransferWindowResponse,
-    SessionView, SessionZoomBlockRequest, SessionZoomBlockResponse, TerminalBlobReadArgs,
-    TerminalBlobReadResponse, TerminalClipboardReadArgs, TerminalClipboardReadResponse,
-    TerminalDownloadBeginArgs, TerminalDownloadBeginResponse, TerminalListDirArgs,
-    TerminalListDirResponse, TerminalModesResponse, TerminalPortsResponse, TerminalProcessResponse,
-    TerminalProgramStatusResponse, TerminalPwdResponse, TerminalResizeArgs, TerminalSetThemeArgs,
-    TerminalSizeResponse, TerminalTitleResponse, TerminalUploadBeginArgs,
-    TerminalUploadBeginResponse, TerminalWriteArgs, TerminalWriteResponse, TunnelInfoResponse,
-    WelcomeMessage,
+    SessionView, SessionZoomBlockRequest, SessionZoomBlockResponse, TailscaleEnableRequest,
+    TailscaleStatusResponse, TerminalBlobReadArgs, TerminalBlobReadResponse,
+    TerminalClipboardReadArgs, TerminalClipboardReadResponse, TerminalDownloadBeginArgs,
+    TerminalDownloadBeginResponse, TerminalListDirArgs, TerminalListDirResponse,
+    TerminalModesResponse, TerminalPortsResponse, TerminalProcessResponse,
+    TerminalProgramResumeRecordsResponse, TerminalProgramStatusResponse, TerminalPwdResponse,
+    TerminalResizeArgs, TerminalSetThemeArgs, TerminalSizeResponse, TerminalTitleResponse,
+    TerminalUploadBeginArgs, TerminalUploadBeginResponse, TerminalWriteArgs, TerminalWriteResponse,
+    TunnelInfoResponse, WelcomeMessage,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -713,6 +714,42 @@ impl ControlClient {
         self.call_empty("server.status").await
     }
 
+    pub async fn server_version(&self) -> Result<(ServerVersionResponse, u64), ProtoError> {
+        self.call_empty("server.version").await
+    }
+
+    pub async fn server_stop(&self, req: &ServerStopRequest) -> Result<u64, ProtoError> {
+        let out = self
+            .call_raw("server.stop", Some(serde_json::to_value(req)?))
+            .await?;
+        Ok(out.seq)
+    }
+
+    pub async fn server_tailscale_enable(
+        &self,
+        req: &TailscaleEnableRequest,
+    ) -> Result<(TailscaleStatusResponse, u64), ProtoError> {
+        self.call("server.tailscale.enable", req).await
+    }
+
+    pub async fn server_tailscale_disable(
+        &self,
+    ) -> Result<(TailscaleStatusResponse, u64), ProtoError> {
+        self.call_empty("server.tailscale.disable").await
+    }
+
+    pub async fn server_tailscale_login(
+        &self,
+    ) -> Result<(TailscaleStatusResponse, u64), ProtoError> {
+        self.call_empty("server.tailscale.login").await
+    }
+
+    pub async fn server_tailscale_logout(
+        &self,
+    ) -> Result<(TailscaleStatusResponse, u64), ProtoError> {
+        self.call_empty("server.tailscale.logout").await
+    }
+
     pub async fn server_config_reload(&self) -> Result<(Value, u64), ProtoError> {
         let out = self
             .call_raw("server.config_reload", Some(serde_json::json!({})))
@@ -820,6 +857,20 @@ impl ControlClient {
             block_id,
             "com.superlogical.terminal.program_status",
             None,
+        )
+        .await
+    }
+
+    pub async fn terminal_program_resume_records(
+        &self,
+        session_id: &str,
+        block_id: &str,
+    ) -> Result<(TerminalProgramResumeRecordsResponse, u64), ProtoError> {
+        self.call_block::<serde_json::Value, _>(
+            session_id,
+            block_id,
+            "com.superlogical.terminal.program_resume_records",
+            Some(serde_json::json!({})),
         )
         .await
     }

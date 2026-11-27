@@ -34,9 +34,10 @@ use ui_chrome::{
     DropZoneHit, FilePickerPurpose, FloatingHitZone, FloatingLayerSpec, HitTarget,
     HostConnectionState, IconId, ImageViewerState, MarkdownInlineImage, ModalContent,
     Osc94Progress, PaneDensity, PaneHeaderMode, PaneMeta, PdfViewerState, PortBadge, RectF,
-    ResolvedTarget, ScrollbarMetrics, SidebarHostView, SidebarSessionView, SidebarTabView,
-    SplitAxis, SplitNode, TargetKind, TextViewerState, ToastItem, ToastSeverity, ToolbarBehavior,
-    ToolbarPosition, UiFrameInput, UiRenderOutput, UiTree, VideoViewerState, ViewerContent,
+    ResolvedTarget, ResumeBadge, ScrollbarMetrics, SidebarHostView, SidebarSessionView,
+    SidebarTabView, SplitAxis, SplitNode, TargetKind, TextViewerState, ToastItem, ToastSeverity,
+    ToolbarBehavior, ToolbarPosition, UiFrameInput, UiRenderOutput, UiTree, VideoViewerState,
+    ViewerContent,
 };
 use vt_engine::{MouseButton, Overscan, PhysicalKey, RowCellSpan, ScreenPoint, SelectionMode};
 
@@ -168,6 +169,9 @@ pub enum HeadlessScenario {
     MarkdownViewer,
     ThemeSwitcher,
     SettingsModal,
+    SettingsIosQr,
+    SettingsServer,
+    ProgramResume,
     DndSplit,
     MultiWindow,
 }
@@ -185,6 +189,9 @@ impl HeadlessScenario {
         "markdown-viewer",
         "theme-switcher",
         "settings-modal",
+        "settings-ios-qr",
+        "settings-server",
+        "program-resume",
         "dnd-split",
         "multi-window",
     ];
@@ -202,6 +209,9 @@ impl HeadlessScenario {
             "markdown-viewer" => Ok(Self::MarkdownViewer),
             "theme-switcher" => Ok(Self::ThemeSwitcher),
             "settings-modal" => Ok(Self::SettingsModal),
+            "settings-ios-qr" => Ok(Self::SettingsIosQr),
+            "settings-server" => Ok(Self::SettingsServer),
+            "program-resume" => Ok(Self::ProgramResume),
             "dnd-split" => Ok(Self::DndSplit),
             "multi-window" => Ok(Self::MultiWindow),
             other => Err(format!(
@@ -225,6 +235,9 @@ impl HeadlessScenario {
             Self::MarkdownViewer => "markdown-viewer",
             Self::ThemeSwitcher => "theme-switcher",
             Self::SettingsModal => "settings-modal",
+            Self::SettingsIosQr => "settings-ios-qr",
+            Self::SettingsServer => "settings-server",
+            Self::ProgramResume => "program-resume",
             Self::DndSplit => "dnd-split",
             Self::MultiWindow => "multi-window",
         }
@@ -708,6 +721,10 @@ pub struct OmarexController {
     pub(super) shared_resize_gen: u64,
     pub(super) current_window_synced_ui_gen: u64,
     pub(super) current_window_synced_resize_gen: u64,
+    pub(super) tailscale_action_busy: bool,
+    pub(super) tailscale_last_error: Option<String>,
+    pub(super) server_action_busy: Option<String>,
+    pub(super) server_last_error: Option<String>,
 }
 
 impl OmarexController {
@@ -857,6 +874,10 @@ impl OmarexController {
             shared_resize_gen: 0,
             current_window_synced_ui_gen: 0,
             current_window_synced_resize_gen: 0,
+            tailscale_action_busy: false,
+            tailscale_last_error: None,
+            server_action_busy: None,
+            server_last_error: None,
         })
     }
 
@@ -1084,6 +1105,26 @@ impl OmarexController {
             self.current_window_synced_resize_gen = self.shared_resize_gen;
         }
         self.needs_redraw = true;
+    }
+
+    pub(super) fn refresh_open_settings_modals(&mut self, contexts: &mut [&mut WindowContext]) {
+        let fresh_snap = self.settings_view_snapshot();
+        if let Some(modal) = &mut self.ui.modal
+            && let ModalContent::Settings { snapshot, .. } = &mut modal.content
+        {
+            *snapshot = fresh_snap.clone();
+            self.needs_redraw = true;
+        }
+        for ctx in contexts.iter_mut() {
+            if let Some(modal) = &mut ctx.ui.modal
+                && let ModalContent::Settings { snapshot, .. } = &mut modal.content
+            {
+                *snapshot = fresh_snap.clone();
+                ctx.needs_redraw = true;
+            }
+        }
+        self.shared_ui_gen = self.shared_ui_gen.saturating_add(1);
+        self.current_window_synced_ui_gen = self.shared_ui_gen;
     }
 
     /// Synchronizes shared settings/theme UI state onto `ctx` if another window mutated them.
@@ -1735,6 +1776,13 @@ impl OmarexController {
         }
         out.push_str(&format!("Active ports: {:?}\n", snap.active_ports));
         out.push_str(&format!("Active tunnels: {:?}\n", snap.active_tunnels));
+        out.push_str(&format!(
+            "Program Resume (OSC 7577): {}\n",
+            snap.resume_records.len()
+        ));
+        for rec in &snap.resume_records {
+            out.push_str(&format!("  - {rec}\n"));
+        }
         out
     }
 
@@ -1772,6 +1820,7 @@ impl OmarexController {
 
         let mut hosts = Vec::new();
         let mut active_ports = Vec::new();
+        let mut resume_records = Vec::new();
         for host_id in &self.workspace.host_order {
             let Some(host) = self.workspace.host(host_id) else {
                 continue;
@@ -1781,11 +1830,18 @@ impl OmarexController {
                     api_revision,
                     resumed,
                     ..
-                } => format!(
-                    "Connected rev {}{}",
-                    api_revision,
-                    if *resumed { " (resumed)" } else { "" }
-                ),
+                } => {
+                    let ver = host
+                        .server_version
+                        .as_ref()
+                        .map(|v| format!(" {}", v.rex_version))
+                        .unwrap_or_default();
+                    format!(
+                        "Connected{ver} rev {}{}",
+                        api_revision,
+                        if *resumed { " (resumed)" } else { "" }
+                    )
+                }
                 HostStatus::Connecting => "Connecting".to_owned(),
                 HostStatus::Reconnecting { reason } => {
                     format!("Reconnecting ({})", redact_diagnostics_text(reason))
@@ -1821,6 +1877,31 @@ impl OmarexController {
                         active_ports.push(format!(
                             "{} {}:{} ({proc_lbl})",
                             host.label, p.address, p.port
+                        ));
+                    }
+                    if let Some(rec) = blk.chosen_resume_record() {
+                        let prog = if rec.program.trim().is_empty() {
+                            "program"
+                        } else {
+                            rec.program.trim()
+                        };
+                        let trust = if rec.trusted {
+                            match rec.rule.as_deref() {
+                                Some(rule) if !rule.is_empty() => {
+                                    format!("trusted: rule={rule}")
+                                }
+                                _ => "trusted".to_owned(),
+                            }
+                        } else {
+                            format!(
+                                "untrusted: {}",
+                                rec.untrusted_reason_label().unwrap_or("not trusted")
+                            )
+                        };
+                        // Never include `rec.command` argv in diagnostics (may contain secrets).
+                        resume_records.push(format!(
+                            "{}/{} · {} [{}]",
+                            host.label, sess.label, prog, trust
                         ));
                     }
                     let _ = bid;
@@ -1870,6 +1951,7 @@ impl OmarexController {
             keymap_warnings,
             active_ports,
             active_tunnels,
+            resume_records,
         }
     }
 
@@ -3452,6 +3534,17 @@ impl OmarexController {
                         })
                         .unwrap_or_default();
 
+                    let resume_badge =
+                        rt.and_then(|r| r.chosen_resume_record())
+                            .map(|rec| ResumeBadge {
+                                program: rec.program.clone(),
+                                trusted: rec.trusted,
+                                rule: rec.rule.clone(),
+                                untrusted_reason: rec
+                                    .untrusted_reason_label()
+                                    .map(ToOwned::to_owned),
+                            });
+
                     pane_metas.push(PaneMeta {
                         block_id: block_id.clone(),
                         label,
@@ -3461,6 +3554,7 @@ impl OmarexController {
                         hovered: hovered_pane_id.as_deref() == Some(block_id.as_str()),
                         bell_unread: rt.is_some_and(|r| r.has_bell) && !focused,
                         program_status: rolled,
+                        resume_badge,
                         osc94_progress: self.block_osc94.get(&key).copied(),
                         scrollbar,
                         program_bg: self

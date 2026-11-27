@@ -13,10 +13,11 @@ use tr3x_bridge::{
     parse_client_command, reply_to_proto,
 };
 use ui_chrome::{
-    FilePickerPurpose, FocusTarget, HitTarget, IconId, ModalKind, ModalState, PaletteItem,
-    PaneDensity, PaneHeaderButton, PaneHeaderMode, SettingChange, SettingsViewSnapshot,
-    ToastSeverity, ToolbarBehavior, ToolbarPosition, UiAction, ViewerAction, ViewerContent,
-    WhichKeyState, classify_path, parse_path_with_location,
+    FilePickerPurpose, FocusTarget, HitTarget, IconId, IosPairingSnapshot, LocalServerState,
+    ModalKind, ModalState, PaletteItem, PaneDensity, PaneHeaderButton, PaneHeaderMode, QrMatrix,
+    ServerSettingsSnapshot, SettingChange, SettingsCategory, SettingsViewSnapshot,
+    TailscalePairState, ToastSeverity, ToolbarBehavior, ToolbarPosition, UiAction, ViewerAction,
+    ViewerContent, WhichKeyState, classify_path, parse_path_with_location,
 };
 use vt_engine::ScrollViewport;
 
@@ -1585,6 +1586,190 @@ impl OmarexController {
                 self.open_modal_kind(ModalKind::ThemePicker);
                 return;
             }
+            SettingChange::IosCopyUrl => {
+                let ios = self.ios_pairing_snapshot();
+                let copy_target = match &ios.state {
+                    TailscalePairState::Ready { url } => {
+                        Some(("Copied Tailscale URL", url.clone()))
+                    }
+                    TailscalePairState::NeedsLogin {
+                        auth_url: Some(url),
+                    } => Some(("Copied Tailscale sign-in link", url.clone())),
+                    _ => None,
+                };
+                if let Some((title, url)) = copy_target {
+                    if self.clipboard_enabled {
+                        set_system_clipboard_text(&url);
+                    }
+                    self.push_toast(ToastSeverity::Success, title, url);
+                } else {
+                    self.push_toast(
+                        ToastSeverity::Warning,
+                        "No Tailscale URL ready",
+                        "Enable Tailscale and wait for HTTPS to finish provisioning",
+                    );
+                }
+                return;
+            }
+            SettingChange::IosToggleTailscale => {
+                if self.read_only {
+                    return;
+                }
+                let local_ts = self
+                    .workspace
+                    .host(LOCAL_HOST_ID)
+                    .and_then(|h| h.tailscale_status.as_ref());
+                let is_disabled = local_ts.is_none_or(|ts| {
+                    ts.state.eq_ignore_ascii_case("disabled") || ts.state.is_empty()
+                });
+                let allow_members = local_ts.is_some_and(|ts| ts.allow_tailnet_members);
+                self.tailscale_action_busy = true;
+                self.tailscale_last_error = None;
+                if is_disabled {
+                    self.send_command(HostCommand::EnableTailscale {
+                        host_id: LOCAL_HOST_ID.to_owned(),
+                        allow_tailnet_members: allow_members,
+                    });
+                } else {
+                    self.send_command(HostCommand::DisableTailscale {
+                        host_id: LOCAL_HOST_ID.to_owned(),
+                    });
+                }
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::IosToggleAllowTailnetMembers => {
+                if self.read_only {
+                    return;
+                }
+                let current_allow = self
+                    .workspace
+                    .host(LOCAL_HOST_ID)
+                    .and_then(|h| h.tailscale_status.as_ref())
+                    .is_some_and(|ts| ts.allow_tailnet_members);
+                self.tailscale_action_busy = true;
+                self.tailscale_last_error = None;
+                self.send_command(HostCommand::EnableTailscale {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                    allow_tailnet_members: !current_allow,
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::IosOpenLoginUrl => {
+                let existing_url = self
+                    .workspace
+                    .host(LOCAL_HOST_ID)
+                    .and_then(|h| h.tailscale_status.as_ref())
+                    .and_then(|ts| ts.auth_url.clone())
+                    .filter(|u| !u.trim().is_empty());
+                if let Some(url) = existing_url {
+                    if !self.read_only {
+                        if let Err(err) = open::that_detached(&url) {
+                            self.push_toast(
+                                ToastSeverity::Warning,
+                                "Could not open browser",
+                                format!("{url} ({err})"),
+                            );
+                        } else {
+                            self.push_toast(ToastSeverity::Info, "Opened Tailscale sign-in", url);
+                        }
+                    }
+                } else if !self.read_only {
+                    self.tailscale_action_busy = true;
+                    self.tailscale_last_error = None;
+                    self.send_command(HostCommand::LoginTailscale {
+                        host_id: LOCAL_HOST_ID.to_owned(),
+                    });
+                    self.mark_shared_settings_changed(false);
+                }
+                return;
+            }
+            SettingChange::IosRefreshStatus => {
+                if self.read_only {
+                    return;
+                }
+                self.tailscale_action_busy = true;
+                self.tailscale_last_error = None;
+                self.send_command(HostCommand::RefreshServerStatus {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::ServerStart => {
+                if self.read_only {
+                    return;
+                }
+                self.server_action_busy = Some("Starting…".to_owned());
+                self.server_last_error = None;
+                self.send_command(HostCommand::StartLocalServer {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::ServerStop => {
+                if self.read_only {
+                    return;
+                }
+                self.server_action_busy = Some("Stopping…".to_owned());
+                self.server_last_error = None;
+                self.send_command(HostCommand::StopLocalServer {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                    if_idle: false,
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::ServerRestart => {
+                if self.read_only {
+                    return;
+                }
+                self.server_action_busy = Some("Restarting…".to_owned());
+                self.server_last_error = None;
+                self.send_command(HostCommand::RestartLocalServer {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::ServerReloadConfig => {
+                if self.read_only {
+                    return;
+                }
+                self.server_action_busy = Some("Reloading…".to_owned());
+                self.server_last_error = None;
+                self.send_command(HostCommand::ReloadConfig {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::ServerRefreshStatus => {
+                if self.read_only {
+                    return;
+                }
+                self.server_action_busy = Some("Refreshing…".to_owned());
+                self.server_last_error = None;
+                self.send_command(HostCommand::RefreshServerStatus {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
+            SettingChange::ServerReconnect => {
+                if self.read_only {
+                    return;
+                }
+                self.server_action_busy = Some("Connecting…".to_owned());
+                self.server_last_error = None;
+                self.send_command(HostCommand::ReconnectLocalServer {
+                    host_id: LOCAL_HOST_ID.to_owned(),
+                });
+                self.mark_shared_settings_changed(false);
+                return;
+            }
         }
 
         self.mark_shared_settings_changed(true);
@@ -1701,8 +1886,7 @@ impl OmarexController {
                 ));
             }
             ModalKind::Settings => {
-                let snap = self.settings_view_snapshot();
-                self.ui.open_modal(ModalState::open_settings(snap));
+                self.open_settings_at(SettingsCategory::Workspace);
             }
             ModalKind::Diagnostics => {
                 let snap = self.build_diagnostics_snapshot();
@@ -2001,6 +2185,12 @@ impl OmarexController {
             ClientCommand::FindNext => self.dispatch_ui_action(UiAction::FindNext, now),
             ClientCommand::FindPrevious => self.dispatch_ui_action(UiAction::FindPrev, now),
             ClientCommand::OpenSettings => self.open_modal_kind(ModalKind::Settings),
+            ClientCommand::OpenConnectIos => {
+                self.open_settings_at(SettingsCategory::ConnectIos);
+            }
+            ClientCommand::OpenServerSettings => {
+                self.open_settings_at(SettingsCategory::Server);
+            }
             ClientCommand::OpenDiagnostics => {
                 self.open_modal_kind(ModalKind::Diagnostics);
             }
@@ -2704,6 +2894,148 @@ impl OmarexController {
         });
     }
 
+    pub(super) fn open_settings_at(&mut self, category: SettingsCategory) {
+        let snap = self.settings_view_snapshot();
+        self.ui
+            .open_modal(ModalState::open_settings_category(snap, category));
+        if !self.read_only
+            && self
+                .workspace
+                .host(LOCAL_HOST_ID)
+                .is_some_and(|h| matches!(h.status, HostStatus::Connected { .. }))
+        {
+            self.send_command(HostCommand::RefreshServerStatus {
+                host_id: LOCAL_HOST_ID.to_owned(),
+            });
+        }
+    }
+
+    pub(super) fn ios_pairing_snapshot(&self) -> IosPairingSnapshot {
+        let Some(host) = self.workspace.host(LOCAL_HOST_ID) else {
+            return IosPairingSnapshot {
+                state: TailscalePairState::ServerDisconnected,
+                busy: self.tailscale_action_busy,
+                last_error: self.tailscale_last_error.clone(),
+                ..IosPairingSnapshot::default()
+            };
+        };
+        if !matches!(host.status, HostStatus::Connected { .. }) {
+            return IosPairingSnapshot {
+                state: TailscalePairState::ServerDisconnected,
+                busy: self.tailscale_action_busy,
+                last_error: self.tailscale_last_error.clone(),
+                ..IosPairingSnapshot::default()
+            };
+        }
+        let Some(ts) = &host.tailscale_status else {
+            return IosPairingSnapshot {
+                state: TailscalePairState::Unsupported,
+                busy: self.tailscale_action_busy,
+                last_error: self.tailscale_last_error.clone(),
+                ..IosPairingSnapshot::default()
+            };
+        };
+
+        let mut qr_modules = None;
+        let state = match ts.state.to_ascii_lowercase().as_str() {
+            "disabled" => TailscalePairState::Disabled {
+                error: ts.error.clone(),
+            },
+            "needs_login" => TailscalePairState::NeedsLogin {
+                auth_url: ts.auth_url.clone().filter(|u| !u.trim().is_empty()),
+            },
+            "needs_machine_approval" => TailscalePairState::NeedsMachineApproval,
+            "running" => {
+                if let Some(url) = ts.https_pair_url() {
+                    qr_modules = QrMatrix::encode_text(url);
+                    TailscalePairState::Ready {
+                        url: url.to_owned(),
+                    }
+                } else {
+                    TailscalePairState::HttpsPending {
+                        dns_name: ts.dns_name.clone(),
+                    }
+                }
+            }
+            _ => TailscalePairState::Starting,
+        };
+
+        IosPairingSnapshot {
+            state,
+            tailnet_name: ts.tailnet_name.clone(),
+            account_login: ts.account.as_ref().map(|a| a.login_name.clone()),
+            dns_name: ts.dns_name.clone(),
+            allow_tailnet_members: ts.allow_tailnet_members,
+            busy: self.tailscale_action_busy,
+            last_error: self.tailscale_last_error.clone(),
+            qr_modules,
+        }
+    }
+
+    pub(super) fn server_settings_snapshot(&self) -> ServerSettingsSnapshot {
+        let Some(host) = self.workspace.host(LOCAL_HOST_ID) else {
+            return ServerSettingsSnapshot {
+                state: LocalServerState::Stopped,
+                endpoint: RexEndpoint::discover_default().to_string(),
+                busy_action: self.server_action_busy.clone(),
+                last_error: self.server_last_error.clone(),
+                ..ServerSettingsSnapshot::default()
+            };
+        };
+
+        let mut trusted = 0usize;
+        let mut untrusted = 0usize;
+        for sess in host.sessions.values() {
+            for blk in sess.blocks.values() {
+                if let Some(rec) = blk.chosen_resume_record() {
+                    if rec.trusted {
+                        trusted += 1;
+                    } else {
+                        untrusted += 1;
+                    }
+                }
+            }
+        }
+
+        let (state, api_revision) = match &host.status {
+            HostStatus::Connected { api_revision, .. } => {
+                (LocalServerState::Running, Some(*api_revision))
+            }
+            HostStatus::Connecting => (
+                LocalServerState::Reconnecting {
+                    reason: "connecting…".to_owned(),
+                },
+                None,
+            ),
+            HostStatus::Reconnecting { reason } => (
+                LocalServerState::Reconnecting {
+                    reason: redact_diagnostics_text(reason),
+                },
+                None,
+            ),
+            HostStatus::Disconnected => (LocalServerState::Stopped, None),
+            HostStatus::Error(err) => (LocalServerState::Error(redact_diagnostics_text(err)), None),
+        };
+
+        let st = host.server_status.as_ref();
+        ServerSettingsSnapshot {
+            state,
+            version: host.server_version.as_ref().map(|v| v.rex_version.clone()),
+            api_revision: api_revision.or_else(|| st.and_then(|s| s.api_revision)),
+            pid: st.map(|s| s.pid),
+            started_at: st.map(|s| s.started_at.clone()),
+            session_count: st
+                .map(|s| s.session_count)
+                .unwrap_or(host.sessions.len() as u64),
+            endpoint: host.endpoint.to_string(),
+            resumable_trusted_count: trusted,
+            resumable_untrusted_count: untrusted,
+            busy_action: self.server_action_busy.clone(),
+            last_error: self.server_last_error.clone(),
+            confirm_stop: false,
+        }
+    }
+
     pub(super) fn settings_view_snapshot(&self) -> SettingsViewSnapshot {
         SettingsViewSnapshot::from_config(
             &self.ui.layout_cfg,
@@ -2719,6 +3051,8 @@ impl OmarexController {
             self.settings.chime_enabled,
             self.settings.desktop_notifications,
         )
+        .with_server_status(self.server_settings_snapshot())
+        .with_ios_pairing(self.ios_pairing_snapshot())
     }
 
     pub(super) fn apply_theme_palette(&mut self, palette: omarchy_theme::ThemePalette) {

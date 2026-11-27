@@ -12,12 +12,14 @@ use gpu_renderer::{
 use omarchy_theme::{Rgba, Theme, ThemePalette};
 use rex_proto::RexEndpoint;
 use rex_proto::types::{
-    BlockView, LayerView, LayoutNode, PortEntry, PortProcessEntry, PortScanStatus, SessionSummary,
-    SessionView, SplitNode as ProtoSplitNode, TailscaleStatus, TerminalPortsResponse, WindowView,
+    BlockView, LayerView, LayoutNode, PortEntry, PortProcessEntry, PortScanStatus, ProcessOwner,
+    ProgramResumeRecord, ServerStatus, ServerVersionResponse, SessionSummary, SessionView,
+    SplitNode as ProtoSplitNode, TailscaleAccount, TailscaleHttps, TailscaleStatus,
+    TerminalPortsResponse, WindowView,
 };
 use tr3x_bridge::ClientCommand;
 use ui_chrome::{
-    FontKind, FontWeight as UiFontWeight, ModalKind, PaneHeaderMode, RectF,
+    FontKind, FontWeight as UiFontWeight, ModalKind, PaneHeaderMode, RectF, SettingsCategory,
     TextAlign as UiTextAlign, TextViewerState, ToolbarBehavior, ToolbarPosition, UiPrimitive,
     UiRenderOutput, ViewerContent, ViewerImagePlacement, classify_path, hit_test_drop_zone,
     parse_path_with_location,
@@ -1294,6 +1296,13 @@ fn connect(host: &str) -> Result<Session, Error> {
         HeadlessScenario::SettingsModal => {
             ctrl.open_modal_kind(ModalKind::Settings);
         }
+        HeadlessScenario::SettingsIosQr => {
+            ctrl.open_settings_at(SettingsCategory::ConnectIos);
+        }
+        HeadlessScenario::SettingsServer => {
+            ctrl.open_settings_at(SettingsCategory::Server);
+        }
+        HeadlessScenario::ProgramResume => {}
         HeadlessScenario::PortsPill => {
             let Some(sk) = ctrl.workspace.active_session.clone() else {
                 return;
@@ -1895,17 +1904,49 @@ pub(super) fn seed_scenario_state(
         resumed: false,
     };
     local_host.tailscale_status = Some(TailscaleStatus {
-        state: "Running".into(),
-        dns_name: Some("omarchy-workstation.ts.net".into()),
+        state: "running".into(),
+        dns_name: Some("omarchy-workstation.tail000000.ts.net".into()),
         error: None,
         auth_url: None,
-        account: None,
-        tailnet_name: None,
+        account: Some(TailscaleAccount {
+            login_name: "mike@omarchy.org".into(),
+        }),
+        tailnet_name: Some("omarchy.ts.net".into()),
         allow_tailnet_members: false,
         tags: Vec::new(),
-        https: None,
+        https: Some(TailscaleHttps {
+            state: "available".into(),
+            url: Some("https://omarchy-workstation.tail000000.ts.net".into()),
+        }),
         control_url: None,
     });
+    if matches!(
+        scenario,
+        HeadlessScenario::SettingsServer | HeadlessScenario::ProgramResume
+    ) {
+        local_host.server_status = Some(ServerStatus {
+            pid: 1031,
+            instance_id: "01a6468f-9065-47c0-951e-72119dd0e815".into(),
+            host_id: Some("host:local".into()),
+            started_at: "2026-11-27T09:56:52Z".into(),
+            exit_empty: false,
+            session_count: 2,
+            tailscale: local_host.tailscale_status.clone(),
+            api_revision: Some(24),
+            api_min_revision: Some(0),
+            config: None,
+            listeners: Vec::new(),
+        });
+        local_host.server_version = Some(ServerVersionResponse {
+            rex_version: "0.1.0-preview.25".into(),
+            platform: "linux/amd64".into(),
+            commit: Some("b070aae".into()),
+            built_at: Some("2026-11-25T21:59:11Z".into()),
+            dirty: false,
+            api_revision: Some(24),
+            api_min_revision: Some(0),
+        });
+    }
     local_host.on_session_created(SessionSummary {
         session_id: "session:work".into(),
         label: "Work".into(),
@@ -1938,7 +1979,9 @@ pub(super) fn seed_scenario_state(
     ctrl.workspace.select_session(active_sk.clone());
 
     let (layout_node, blocks, extra_layers) = match scenario {
-        HeadlessScenario::SplitPanes | HeadlessScenario::DndSplit => (
+        HeadlessScenario::SplitPanes
+        | HeadlessScenario::DndSplit
+        | HeadlessScenario::ProgramResume => (
             LayoutNode {
                 rect: [0.0, 0.0, 1.0, 1.0],
                 block_id: None,
@@ -1961,7 +2004,11 @@ pub(super) fn seed_scenario_state(
             vec![
                 BlockView {
                     block_id: Some("block:1".into()),
-                    label: "cargo build".into(),
+                    label: if scenario == HeadlessScenario::ProgramResume {
+                        "claude — omarex".into()
+                    } else {
+                        "cargo build".into()
+                    },
                     creator_name: Some("com.superlogical.terminal".into()),
                     flavor: Some("com.superlogical.terminal.shell".into()),
                     host_id: Some("host:local".into()),
@@ -1969,7 +2016,11 @@ pub(super) fn seed_scenario_state(
                 },
                 BlockView {
                     block_id: Some("block:2".into()),
-                    label: "git diff".into(),
+                    label: if scenario == HeadlessScenario::ProgramResume {
+                        "nvim — README.md".into()
+                    } else {
+                        "git diff".into()
+                    },
                     creator_name: Some("com.superlogical.terminal".into()),
                     flavor: Some("com.superlogical.terminal.shell".into()),
                     host_id: Some("host:local".into()),
@@ -2099,16 +2150,25 @@ pub(super) fn seed_scenario_state(
 
     if matches!(
         scenario,
-        HeadlessScenario::SplitPanes | HeadlessScenario::DndSplit
+        HeadlessScenario::SplitPanes | HeadlessScenario::DndSplit | HeadlessScenario::ProgramResume
     ) {
         let term2 = vt_engine::Terminal::new(90, 36, vt_engine::TerminalConfig::default())
             .expect("create scenario terminal 2");
-        term2.write(
-            b"\x1b[1;35m[Split Pane 2]\x1b[0m git status --short\r\n\
-              \x1b[32m M\x1b[0m crates/gpu-renderer/src/lib.rs\r\n\
-              \x1b[32m M\x1b[0m crates/omarex/src/app.rs\r\n\
-              \x1b[32m M\x1b[0m crates/omarex/src/bridge/render.rs\r\n",
-        );
+        if scenario == HeadlessScenario::ProgramResume {
+            term2.write(
+                b"\x1b[1;36m[OSC 7577]\x1b[0m Program Resume status\r\n\
+                  \x1b[32m  trusted:\x1b[0m   claude  (auto-resumes on Rex restart)\r\n\
+                  \x1b[33m  untrusted:\x1b[0m nvim    (no_rule in init.lua)\r\n\r\n\
+                  \x1b[90mRestart Rex from Settings -> Server anytime.\x1b[0m\r\n",
+            );
+        } else {
+            term2.write(
+                b"\x1b[1;35m[Split Pane 2]\x1b[0m git status --short\r\n\
+                  \x1b[32m M\x1b[0m crates/gpu-renderer/src/lib.rs\r\n\
+                  \x1b[32m M\x1b[0m crates/omarex/src/app.rs\r\n\
+                  \x1b[32m M\x1b[0m crates/omarex/src/bridge/render.rs\r\n",
+            );
+        }
         let _ = ctrl.pane_store.insert_terminal(
             BlockKey::new(LOCAL_HOST_ID, "session:work", "block:2"),
             term2,
@@ -2227,6 +2287,66 @@ fn connect(host: &str) -> Result<Session, Error> {
         }
         HeadlessScenario::SettingsModal => {
             ctrl.open_modal_kind(ModalKind::Settings);
+        }
+        HeadlessScenario::SettingsIosQr => {
+            ctrl.open_settings_at(SettingsCategory::ConnectIos);
+        }
+        HeadlessScenario::SettingsServer => {
+            if let Some(blk) = ctrl.workspace.block_mut(&key1) {
+                blk.program_resume_records = vec![ProgramResumeRecord {
+                    owner: Some(ProcessOwner {
+                        pid: 74877,
+                        name: "claude".into(),
+                    }),
+                    program: "claude".into(),
+                    cwd: Some("/home/mike/Work/omarex".into()),
+                    reported_at: "2026-11-27T13:05:00Z".into(),
+                    chosen: true,
+                    trusted: true,
+                    rule: Some("claude".into()),
+                    untrusted_reason: None,
+                    command: Vec::new(),
+                    reported_command: Vec::new(),
+                }];
+            }
+            ctrl.open_settings_at(SettingsCategory::Server);
+        }
+        HeadlessScenario::ProgramResume => {
+            if let Some(blk1) = ctrl.workspace.block_mut(&key1) {
+                blk1.program_resume_records = vec![ProgramResumeRecord {
+                    owner: Some(ProcessOwner {
+                        pid: 74877,
+                        name: "claude".into(),
+                    }),
+                    program: "claude".into(),
+                    cwd: Some("/home/mike/Work/omarex".into()),
+                    reported_at: "2026-11-27T13:05:00Z".into(),
+                    chosen: true,
+                    trusted: true,
+                    rule: Some("claude".into()),
+                    untrusted_reason: None,
+                    command: Vec::new(),
+                    reported_command: Vec::new(),
+                }];
+            }
+            let key2 = BlockKey::new(LOCAL_HOST_ID, "session:work", "block:2");
+            if let Some(blk2) = ctrl.workspace.block_mut(&key2) {
+                blk2.program_resume_records = vec![ProgramResumeRecord {
+                    owner: Some(ProcessOwner {
+                        pid: 74912,
+                        name: "nvim".into(),
+                    }),
+                    program: "nvim".into(),
+                    cwd: Some("/home/mike/Work/omarex".into()),
+                    reported_at: "2026-11-27T13:06:00Z".into(),
+                    chosen: true,
+                    trusted: false,
+                    rule: None,
+                    untrusted_reason: Some("no_rule".into()),
+                    command: Vec::new(),
+                    reported_command: Vec::new(),
+                }];
+            }
         }
         HeadlessScenario::MultiWindow => {}
     }

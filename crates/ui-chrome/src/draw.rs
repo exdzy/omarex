@@ -186,6 +186,8 @@ pub enum SettingsCategory {
     Appearance,
     Terminal,
     AudioAlerts,
+    Server,
+    ConnectIos,
 }
 
 /// Strict keyboard focus owner preventing background `session_view_changed` events from
@@ -498,6 +500,8 @@ impl HitTarget {
                 | Self::ModalConfirmButton
                 | Self::ModalCancelButton
                 | Self::SettingsToggle { .. }
+                | Self::SettingsCategoryTab(_)
+                | Self::DiagnosticsCopyBundle
                 | Self::FindBarPrev
                 | Self::FindBarNext
                 | Self::FindBarCaseToggle
@@ -1089,6 +1093,17 @@ pub enum SettingChange {
     ToggleDesktopNotifications,
     FontSizePt(f32),
     OpenThemePicker,
+    IosCopyUrl,
+    IosToggleTailscale,
+    IosToggleAllowTailnetMembers,
+    IosOpenLoginUrl,
+    IosRefreshStatus,
+    ServerStart,
+    ServerStop,
+    ServerRestart,
+    ServerReloadConfig,
+    ServerRefreshStatus,
+    ServerReconnect,
 }
 
 /// Typed high-level UI action returned to `omarex` on pointer/keyboard interaction.

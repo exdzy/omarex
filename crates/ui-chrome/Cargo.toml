@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 nucleo-matcher.workspace = true
 omarchy-theme.workspace = true
+qrcodegen.workspace = true
 taffy.workspace = true
 tr3x-bridge.workspace = true

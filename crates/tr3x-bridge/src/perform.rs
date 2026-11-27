@@ -175,6 +175,8 @@ pub enum ClientCommand {
     FindNext,
     FindPrevious,
     OpenSettings,
+    OpenConnectIos,
+    OpenServerSettings,
     OpenDiagnostics,
     ToggleSidebar,
     ToggleTabStyle,
@@ -311,6 +313,10 @@ pub fn parse_client_command(
         "client.find.next" => ClientCommand::FindNext,
         "client.find.previous" => ClientCommand::FindPrevious,
         "client.settings" => ClientCommand::OpenSettings,
+        "client.connect_ios" | "client.ios.connect" | "client.pair.ios" => {
+            ClientCommand::OpenConnectIos
+        }
+        "client.server_settings" | "client.server.settings" => ClientCommand::OpenServerSettings,
         "client.diagnostics" => ClientCommand::OpenDiagnostics,
         "client.sidebar.toggle" => ClientCommand::ToggleSidebar,
         "client.tab_style.toggle" => ClientCommand::ToggleTabStyle,

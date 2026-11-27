@@ -918,3 +918,54 @@ fn new_gap02_headless_viewer_short_viewport_scrollbar_does_not_panic() {
     let rgba = image::open(&out_path).expect("decode PNG").to_rgba8();
     assert_eq!(rgba.dimensions(), (1440, 420));
 }
+
+#[test]
+fn settings_ios_qr_headless_scenario_renders_scannable_qr_code() {
+    let tmp = TempTestDir::new("settings-ios-qr");
+    let (dark_path, _, dark_img) =
+        run_headless_scenario(&tmp, "settings-ios-qr", "ios_qr_dark.png", 1280, 760);
+    let (_, _, settings_img) =
+        run_headless_scenario(&tmp, "settings-modal", "settings_default.png", 1280, 760);
+
+    let frac = diff_fraction(&dark_img, &settings_img);
+    assert!(
+        frac > 0.01,
+        "settings-ios-qr must visibly differ from default settings-modal (diff={frac:.4})"
+    );
+
+    if let Ok(out) = Command::new("zbarimg")
+        .args(["--raw", "-q", dark_path.to_str().unwrap()])
+        .output()
+        && out.status.success()
+    {
+        let decoded = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert_eq!(
+            decoded, "https://omarchy-workstation.tail000000.ts.net",
+            "GPU-rendered Connect iOS QR code must decode cleanly to the Tailscale HTTPS URL"
+        );
+    }
+}
+
+#[test]
+fn settings_server_and_program_resume_headless_scenarios_render_cleanly() {
+    let tmp = TempTestDir::new("settings-server-resume");
+    let (_, _, server_img) =
+        run_headless_scenario(&tmp, "settings-server", "settings_server.png", 1280, 760);
+    let (_, _, settings_img) =
+        run_headless_scenario(&tmp, "settings-modal", "settings_default.png", 1280, 760);
+    let server_diff = diff_fraction(&server_img, &settings_img);
+    assert!(
+        server_diff > 0.01,
+        "settings-server must visibly differ from default settings-modal (diff={server_diff:.4})"
+    );
+
+    let (_, _, resume_img) =
+        run_headless_scenario(&tmp, "program-resume", "program_resume.png", 1280, 760);
+    let (_, _, split_img) =
+        run_headless_scenario(&tmp, "split-panes", "split_panes.png", 1280, 760);
+    let resume_diff = diff_fraction(&resume_img, &split_img);
+    assert!(
+        resume_diff > 0.005,
+        "program-resume must visibly differ from baseline split-panes (diff={resume_diff:.4})"
+    );
+}

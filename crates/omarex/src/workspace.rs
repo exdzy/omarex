@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use omarchy_theme::{AppearanceMode, ThemePalette};
 use rex_proto::RexEndpoint;
 use rex_proto::types::{
-    BlockEventPayload, OwnMode, PortEntry, PortProcessEntry, PortScanStatus, ProgramStatusRecord,
-    SessionBootstrapResponse, SessionEvent, SessionSummary, SessionView, TailscaleStatus,
-    TerminalPortsResponse, TerminalResizeArgs, TerminalSetThemeArgs, ThemeScheme,
+    BlockEventPayload, OwnMode, PortEntry, PortProcessEntry, PortScanStatus,
+    ProgramResumeChangedEvent, ProgramResumeRecord, ProgramStatusRecord, ServerStatus,
+    ServerVersionResponse, SessionBootstrapResponse, SessionEvent, SessionSummary, SessionView,
+    TailscaleStatus, TerminalPortsResponse, TerminalResizeArgs, TerminalSetThemeArgs, ThemeScheme,
 };
 
 /// Adaptive resize coalescing window (snappy single-frame settle while coalescing drags).
@@ -87,6 +88,7 @@ impl BlockKey {
 pub struct HydratedBlockMeta {
     pub block_id: String,
     pub program_statuses: Vec<ProgramStatusRecord>,
+    pub program_resume_records: Option<Vec<ProgramResumeRecord>>,
     pub pwd: Option<String>,
     pub foreground_process: Option<String>,
     pub title: Option<String>,
@@ -100,6 +102,8 @@ pub struct BlockRuntimeState {
     pub pwd: Option<String>,
     pub foreground_process: Option<String>,
     pub program_statuses: Vec<ProgramStatusRecord>,
+    /// Active OSC 7577 Program Resume records reported for this block (newest first).
+    pub program_resume_records: Vec<ProgramResumeRecord>,
     pub exited_code: Option<i32>,
     pub has_bell: bool,
     /// `true` once `GHOSTSNP` reached the `READY` record and the pane is safe to resize.
@@ -141,6 +145,16 @@ impl BlockRuntimeState {
         port.pid
             .and_then(|pid| self.port_processes.get(&pid))
             .map(|p| p.display_label().to_owned())
+    }
+
+    /// Returns the chosen OSC 7577 Program Resume record (or the newest reported record if none
+    /// is explicitly marked `chosen`), if any program in this block reported resume metadata.
+    #[must_use]
+    pub fn chosen_resume_record(&self) -> Option<&ProgramResumeRecord> {
+        self.program_resume_records
+            .iter()
+            .find(|r| r.chosen)
+            .or_else(|| self.program_resume_records.first())
     }
 }
 
@@ -326,6 +340,8 @@ pub struct HostEntry {
     pub sessions: HashMap<String, SessionEntry>,
     pub keymap_hash: Option<String>,
     pub hosts_registry_hash: Option<String>,
+    pub server_status: Option<ServerStatus>,
+    pub server_version: Option<ServerVersionResponse>,
     pub tailscale_status: Option<TailscaleStatus>,
     pub dropped_events_count: u64,
     pub reconnect_count: u64,
@@ -344,6 +360,8 @@ impl HostEntry {
             sessions: HashMap::new(),
             keymap_hash: None,
             hosts_registry_hash: None,
+            server_status: None,
+            server_version: None,
             tailscale_status: None,
             dropped_events_count: 0,
             reconnect_count: 0,
@@ -377,14 +395,43 @@ impl HostEntry {
     }
 
     /// Apply a `session.bootstrap` snapshot cleanly in one pass.
-    pub fn apply_bootstrap(&mut self, boot: SessionBootstrapResponse, api_revision: u32) {
+    ///
+    /// Returns `true` if `server_status.instance_id` changed from the previously connected server
+    /// instance (i.e., the Rex server restarted and restored sessions with fresh view revisions).
+    pub fn apply_bootstrap(&mut self, boot: SessionBootstrapResponse, api_revision: u32) -> bool {
+        let server_restarted = self.server_status.as_ref().is_some_and(|prev| {
+            !prev.instance_id.is_empty()
+                && !boot.server_status.instance_id.is_empty()
+                && prev.instance_id != boot.server_status.instance_id
+        });
+
         self.status = HostStatus::Connected {
             client_id: boot.client_id,
-            server_host_id: boot.server_status.host_id,
+            server_host_id: boot.server_status.host_id.clone(),
             api_revision,
             resumed: false,
         };
         self.tailscale_status = boot.server_status.tailscale.clone();
+        self.server_status = Some(boot.server_status);
+
+        if server_restarted {
+            // A restarted Rex server resets per-session view revisions and PTY stream state even
+            // when restored session/block IDs match previous ones. Reset cached revisions so fresh
+            // views and future `session_view_changed` events are never rejected as stale.
+            for sess in self.sessions.values_mut() {
+                sess.applied_revision = 0;
+                sess.pending_revision = 0;
+                sess.view_fetch_in_flight = false;
+                sess.warmth = SessionWarmth::Cold;
+                for blk in sess.blocks.values_mut() {
+                    blk.snapshot_ready = false;
+                    blk.pending_resize = None;
+                    blk.last_sent_resize = None;
+                    blk.last_server_size = None;
+                    blk.program_resume_records.clear();
+                }
+            }
+        }
 
         let mut new_order = Vec::with_capacity(boot.attach_all.sessions.len());
         let mut live_ids = HashSet::with_capacity(boot.attach_all.sessions.len());
@@ -409,6 +456,7 @@ impl HostEntry {
                 entry.apply_view(att.view);
             }
         }
+        server_restarted
     }
 
     /// Upsert a newly created session at the end of `session_order`.
@@ -759,6 +807,9 @@ impl WorkspaceState {
             if !meta.program_statuses.is_empty() {
                 entry.program_statuses = meta.program_statuses;
             }
+            if let Some(resume_records) = meta.program_resume_records {
+                entry.program_resume_records = resume_records;
+            }
             if meta.pwd.is_some() {
                 entry.pwd = meta.pwd;
             }
@@ -1094,6 +1145,13 @@ fn apply_block_event_to_state(blk: &mut BlockRuntimeState, ev: &BlockEventPayloa
                 .unwrap_or_default();
             blk.program_statuses
                 .retain(|r| r.id.as_deref().unwrap_or("") != target_id);
+        }
+        "program_resume_changed" => {
+            if let Ok(changed) =
+                serde_json::from_value::<ProgramResumeChangedEvent>(ev.payload.clone())
+            {
+                blk.program_resume_records = changed.records;
+            }
         }
         "title_changed" => {
             if let Some(title) = ev.payload.get("title").and_then(|v| v.as_str()) {
@@ -1479,6 +1537,7 @@ mod tests {
                     updated_at: "2026-11-26T10:15:00+01:00".into(),
                     owner: None,
                 }],
+                program_resume_records: None,
                 pwd: Some("file://localhost/home/user/projects/omarex".into()),
                 foreground_process: Some("tr3x".into()),
                 title: None,

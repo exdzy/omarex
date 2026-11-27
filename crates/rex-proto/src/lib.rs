@@ -230,15 +230,27 @@ mod live_smoke_tests {
             .expect("client.keymap should succeed");
         assert!(!keymap.config.instance_id.is_empty());
 
-        // 3. Read-only hosts.list query
+        // 3. Read-only hosts.list & server.version queries
         let (hosts, _) = client
             .hosts_list()
             .await
             .expect("hosts.list should succeed");
         assert!(!hosts.hash.is_empty());
 
-        // 4. If a live terminal data ticket was issued, open /api/data, verify WELCOME & GHOSTSNP magic, then close cleanly (1000).
+        let (version, _) = client
+            .server_version()
+            .await
+            .expect("server.version should succeed");
+        assert!(!version.rex_version.is_empty());
+        assert!(!version.platform.is_empty());
+
+        // 4. If a live terminal data ticket was issued, verify read-only OSC 7577 `program_resume_records`
+        //    query AND open /api/data, verify WELCOME & GHOSTSNP magic, then close cleanly (1000).
         if let Some(grant) = boot.data_tickets.first() {
+            let (_resume_records, _) = client
+                .terminal_program_resume_records(&grant.session_id, &grant.block_id)
+                .await
+                .expect("com.superlogical.terminal.program_resume_records should succeed");
             let mut stream = TerminalDataStream::connect_with_ticket(
                 client.endpoint().clone(),
                 grant.session_id.clone(),

@@ -618,16 +618,27 @@ impl PaneStore {
     }
 
     /// Ensures `program_bg` is up-to-date for `key` before `build_ui_frame_input` (e.g. frame 1
-    /// in `--headless-render`) without disturbing `pane.render_state` dirty-row tracking.
+    /// in `--headless-render`).
+    ///
+    /// Updates `pane.render_state` directly instead of a temporary scratch `RenderState`, because
+    /// `ghostty_render_state_begin_update` consumes and clears dirty flags on the underlying
+    /// `GhosttyTerminal` (a scratch `RenderState` would steal dirty rows and leave `pane_cache`
+    /// frozen on stale/empty rows!). Leaves `pane.render_state` dirty so the subsequent
+    /// `render_pane*` pass rebuilds all modified rows before calling `clean()`.
     pub fn refresh_program_bg(&mut self, key: &BlockKey) -> Option<vt_engine::Rgb> {
         let pane = self.panes.get_mut(key)?;
         if pane.program_bg_dirty
             && let Some(term) = pane.terminal.as_ref()
-            && let Ok(mut scratch_rs) = RenderState::new()
-            && scratch_rs.begin_update(term, Overscan::default()).is_ok()
-            && scratch_rs.end_update().is_ok()
+            && (!term.is_render_held() || !pane.has_rendered_once)
+            && let Ok(snap) = pane.render_state.begin_update(term, Overscan::default())
+            && pane.render_state.end_update().is_ok()
         {
-            if let Ok(bg) = scratch_rs.sample_program_bg(term.is_alternate_screen()) {
+            pane.last_update_snapshot = snap;
+            pane.has_rendered_once = true;
+            if let Ok(bg) = pane
+                .render_state
+                .sample_program_bg(term.is_alternate_screen())
+            {
                 pane.program_bg = bg;
             }
             pane.program_bg_dirty = false;
@@ -1038,9 +1049,10 @@ impl PaneStore {
             pane.render_state.end_update()?;
             pane.last_update_snapshot = snap;
             pane.has_rendered_once = true;
-            if let Ok(new_pbg) = pane
-                .render_state
-                .sample_program_bg(term.is_alternate_screen())
+            if pane.program_bg_dirty
+                && let Ok(new_pbg) = pane
+                    .render_state
+                    .sample_program_bg(term.is_alternate_screen())
             {
                 if new_pbg != pane.program_bg {
                     pane.program_bg = new_pbg;
@@ -1139,9 +1151,10 @@ impl PaneStore {
             pane.render_state.end_update()?;
             pane.last_update_snapshot = snap;
             pane.has_rendered_once = true;
-            if let Ok(new_pbg) = pane
-                .render_state
-                .sample_program_bg(term.is_alternate_screen())
+            if pane.program_bg_dirty
+                && let Ok(new_pbg) = pane
+                    .render_state
+                    .sample_program_bg(term.is_alternate_screen())
             {
                 if new_pbg != pane.program_bg {
                     pane.program_bg = new_pbg;
@@ -1267,6 +1280,33 @@ impl PaneStore {
             .panes
             .keys()
             .filter(|k| k.host_id == host_id && k.session_id == session_id)
+            .cloned()
+            .collect();
+        let mut evicted_uids = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(pane) = self.panes.remove(key) {
+                evicted_uids.push(u64::from(pane.pane_uid));
+            }
+        }
+        if let Some(cache) = image_cache
+            && !evicted_uids.is_empty()
+        {
+            cache.retain(|id| !evicted_uids.contains(&(id >> 32)));
+        }
+        evicted_uids.len()
+    }
+
+    /// Evicts all panes belonging to `host_id` (used when a Rex server instance restarts so stale
+    /// terminal runtimes are cleanly replaced by fresh `GHOSTSNP` snapshots).
+    pub fn evict_host(
+        &mut self,
+        host_id: &str,
+        image_cache: Option<&mut ImageTextureCache>,
+    ) -> usize {
+        let keys: Vec<BlockKey> = self
+            .panes
+            .keys()
+            .filter(|k| k.host_id == host_id)
             .cloned()
             .collect();
         let mut evicted_uids = Vec::with_capacity(keys.len());
@@ -3656,6 +3696,99 @@ mod tests {
                 g: 48,
                 b: 72,
             })
+        );
+    }
+
+    #[test]
+    fn refresh_program_bg_and_selection_spans_never_steal_dirty_rows_from_render_cache() {
+        let _gpu_guard = crate::lock_headless_gpu_test();
+        let mut renderer =
+            GpuRenderer::new_headless(GpuConfig::default()).expect("headless renderer");
+        let palette = ThemePalette::default_dark();
+        let mut store = PaneStore::with_theme(&palette).expect("store");
+        let key = BlockKey::new(LOCAL_HOST_ID, "session:test", "block:dirty");
+        store.create_local_test_pane(&key, 40, 6).expect("pane");
+
+        let metrics = renderer.atlas_mut().measure_monospace_cell(14.0, 1.0);
+        let vp_rect = Rect::new(0.0, 0.0, 400.0, 160.0);
+        let viewport = build_terminal_viewport(
+            vp_rect,
+            vp_rect.to_clip_rect(),
+            40,
+            6,
+            metrics,
+            0.0,
+            &palette,
+            true,
+            false,
+        );
+
+        // Frame 1: render the initially empty terminal so every row's RowId enters `pane_cache`.
+        let mut dl1 = DrawList::new(400, 160, 1.0);
+        let res1 = store
+            .render_pane(
+                &key,
+                &viewport,
+                Overscan::default(),
+                &mut renderer,
+                &mut dl1,
+            )
+            .expect("frame 1")
+            .expect("ready pane");
+        assert_eq!(res1.stats.glyphs, 0, "empty terminal should emit 0 glyphs");
+
+        // Frame 2: new text arrives in place on row 0 (same RowId!), and the controller runs
+        // `refresh_program_bg` BEFORE `render_pane` — this previously created a scratch
+        // RenderState that stole GhosttyTerminal's dirty bits and left row 0 cached as blank!
+        store
+            .feed_local_test_bytes(&key, b"hello omarex")
+            .expect("write text");
+        let _ = store.refresh_program_bg(&key);
+        // Also verify querying selection rects before rendering never steals dirty bits.
+        let _ = store.selection_viewport_rects(&key, vp_rect, metrics, 0.0);
+
+        let mut dl2 = DrawList::new(400, 160, 1.0);
+        let res2 = store
+            .render_pane(
+                &key,
+                &viewport,
+                Overscan::default(),
+                &mut renderer,
+                &mut dl2,
+            )
+            .expect("frame 2")
+            .expect("ready pane");
+        assert!(
+            res2.stats.rebuilt_rows >= 1,
+            "expected modified row to rebuild after refresh_program_bg, got stats={:?}",
+            res2.stats
+        );
+        assert!(
+            res2.stats.glyphs >= 11,
+            "expected all non-space glyphs of 'hello omarex' to render, got {}",
+            res2.stats.glyphs
+        );
+
+        // Frame 3: typing more characters on the SAME row must rebuild again (not stay frozen!).
+        store
+            .feed_local_test_bytes(&key, b" 12345")
+            .expect("write more");
+        let _ = store.refresh_program_bg(&key);
+        let mut dl3 = DrawList::new(400, 160, 1.0);
+        let res3 = store
+            .render_pane(
+                &key,
+                &viewport,
+                Overscan::default(),
+                &mut renderer,
+                &mut dl3,
+            )
+            .expect("frame 3")
+            .expect("ready pane");
+        assert!(
+            res3.stats.rebuilt_rows >= 1 && res3.stats.glyphs >= 16,
+            "expected incremental typing on same row to render all glyphs, got {:?}",
+            res3.stats
         );
     }
 }

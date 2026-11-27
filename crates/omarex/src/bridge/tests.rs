@@ -7119,3 +7119,481 @@ fn sidebar_resize_drag_commit_syncs_sibling_window_contexts() {
         let _ = std::fs::remove_dir_all(parent);
     }
 }
+
+#[test]
+fn settings_connect_ios_tailscale_qr_lifecycle_and_live_refresh() {
+    use rex_proto::types::{ServerEvent, TailscaleAccount, TailscaleHttps, TailscaleStatus};
+    use ui_chrome::{ModalContent, SettingsCategory, TailscalePairState};
+
+    let mut ctrl = make_test_controller();
+    seed_single_pane_workspace(&mut ctrl);
+    let now = Instant::now();
+
+    // 1. Initially local host has no tailscale_status -> Unsupported.
+    ctrl.dispatch_command_id("client.connect_ios", None, now);
+    match ctrl.ui.modal.as_ref().map(|m| &m.content) {
+        Some(ModalContent::Settings {
+            category, snapshot, ..
+        }) => {
+            assert_eq!(*category, SettingsCategory::ConnectIos);
+            assert_eq!(snapshot.ios_pairing.state, TailscalePairState::Unsupported);
+            assert!(snapshot.ios_pairing.qr_modules.is_none());
+        }
+        other => panic!("expected ConnectIos settings modal, got {other:?}"),
+    }
+    let cmds = ctrl.drain_pending_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            HostCommand::RefreshServerStatus { host_id } if host_id == LOCAL_HOST_ID
+        )),
+        "opening Settings must refresh local server status"
+    );
+
+    // 2. Server pushes TailscaleStatusChanged(disabled) -> Settings modal updates live.
+    ctrl.process_runtime_event(
+        RuntimeEvent::ControlEvent {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            seq: 10,
+            event: Box::new(ServerEvent::TailscaleStatusChanged(TailscaleStatus {
+                state: "disabled".into(),
+                error: None,
+                dns_name: None,
+                auth_url: None,
+                account: None,
+                tailnet_name: None,
+                allow_tailnet_members: false,
+                tags: Vec::new(),
+                https: None,
+                control_url: None,
+            })),
+        },
+        now,
+    );
+    match ctrl.ui.modal.as_ref().map(|m| &m.content) {
+        Some(ModalContent::Settings { snapshot, .. }) => {
+            assert_eq!(
+                snapshot.ios_pairing.state,
+                TailscalePairState::Disabled { error: None }
+            );
+        }
+        other => panic!("expected updated disabled state, got {other:?}"),
+    }
+
+    // 3. Clicking Enable Tailscale dispatches HostCommand::EnableTailscale.
+    ctrl.dispatch_ui_action(
+        UiAction::UpdateSetting(SettingChange::IosToggleTailscale),
+        now,
+    );
+    let enable_cmds = ctrl.drain_pending_commands();
+    assert!(enable_cmds.iter().any(|c| matches!(
+        c,
+        HostCommand::EnableTailscale {
+            host_id,
+            allow_tailnet_members: false
+        } if host_id == LOCAL_HOST_ID
+    )));
+
+    // 4. Tailscale transitions to running + HTTPS available -> QR matrix appears live!
+    ctrl.process_runtime_event(
+        RuntimeEvent::TailscaleActionFinished {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            action: "enable".into(),
+            result: Ok(TailscaleStatus {
+                state: "running".into(),
+                error: None,
+                dns_name: Some("mikeomarchy-rex.tail847d0b.ts.net".into()),
+                auth_url: None,
+                account: Some(TailscaleAccount {
+                    login_name: "mike@omarchy.org".into(),
+                }),
+                tailnet_name: Some("mike@omarchy.org".into()),
+                allow_tailnet_members: false,
+                tags: Vec::new(),
+                https: Some(TailscaleHttps {
+                    state: "available".into(),
+                    url: Some("https://mikeomarchy-rex.tail847d0b.ts.net".into()),
+                }),
+                control_url: None,
+            }),
+        },
+        now,
+    );
+    match ctrl.ui.modal.as_ref().map(|m| &m.content) {
+        Some(ModalContent::Settings {
+            category, snapshot, ..
+        }) => {
+            assert_eq!(*category, SettingsCategory::ConnectIos);
+            assert_eq!(
+                snapshot.ios_pairing.state,
+                TailscalePairState::Ready {
+                    url: "https://mikeomarchy-rex.tail847d0b.ts.net".into()
+                }
+            );
+            assert!(snapshot.ios_pairing.qr_modules.is_some());
+            assert!(!snapshot.ios_pairing.busy);
+        }
+        other => panic!("expected Ready QR state, got {other:?}"),
+    }
+
+    // 5. Toggling Allow Tailnet Members sends EnableTailscale { allow_tailnet_members: true }.
+    ctrl.dispatch_ui_action(
+        UiAction::UpdateSetting(SettingChange::IosToggleAllowTailnetMembers),
+        now,
+    );
+    let allow_cmds = ctrl.drain_pending_commands();
+    assert!(allow_cmds.iter().any(|c| matches!(
+        c,
+        HostCommand::EnableTailscale {
+            host_id,
+            allow_tailnet_members: true
+        } if host_id == LOCAL_HOST_ID
+    )));
+
+    // 6. Toggling Tailscale off while running dispatches DisableTailscale.
+    ctrl.dispatch_ui_action(
+        UiAction::UpdateSetting(SettingChange::IosToggleTailscale),
+        now,
+    );
+    let disable_cmds = ctrl.drain_pending_commands();
+    assert!(disable_cmds.iter().any(|c| matches!(
+        c,
+        HostCommand::DisableTailscale { host_id } if host_id == LOCAL_HOST_ID
+    )));
+
+    if let Some(parent) = ctrl.settings_path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[test]
+fn server_restart_reattaches_non_default_active_session_and_resets_stale_revisions() {
+    let mut ctrl = make_test_controller();
+    let now = Instant::now();
+
+    let make_view =
+        |sid: &str, label: &str, rev: u64, blk_id: &str| rex_proto::types::SessionView {
+            revision: rev,
+            session_id: Some(sid.into()),
+            label: label.into(),
+            active_window_id: Some("w1".into()),
+            windows: vec![rex_proto::types::WindowView {
+                window_id: Some("w1".into()),
+                label: "main".into(),
+                focused_block_id: Some(blk_id.into()),
+                zoomed_block_id: None,
+                tiled_zoomed_block_id: None,
+                layers: vec![rex_proto::types::LayerView {
+                    layer_id: Some("l1".into()),
+                    kind: "tiled".into(),
+                    bounds: [0.0, 0.0, 1.0, 1.0],
+                    state: None,
+                    layout: Some(rex_proto::types::LayoutNode {
+                        rect: [0.0, 0.0, 1.0, 1.0],
+                        block_id: Some(blk_id.into()),
+                        split: None,
+                    }),
+                    blocks: vec![rex_proto::types::BlockView {
+                        block_id: Some(blk_id.into()),
+                        label: "claude".into(),
+                        creator_name: Some("com.superlogical.terminal".into()),
+                        flavor: Some("com.superlogical.terminal.shell".into()),
+                        host_id: Some("host-1".into()),
+                        owner: None,
+                    }],
+                }],
+            }],
+        };
+
+    let make_bootstrap = |instance_id: &str, pid: u32, selected_rev: u64| {
+        rex_proto::types::SessionBootstrapResponse {
+            client_id: format!("cli-{pid}"),
+            server_status: rex_proto::types::ServerStatus {
+                pid,
+                instance_id: instance_id.into(),
+                host_id: Some("host-1".into()),
+                started_at: "2026-11-27T10:00:00Z".into(),
+                exit_empty: false,
+                session_count: 2,
+                tailscale: None,
+                api_revision: Some(24),
+                api_min_revision: Some(0),
+                config: None,
+                listeners: Vec::new(),
+            },
+            attach_all: rex_proto::types::AttachAllSnapshot {
+                sessions: vec![
+                    rex_proto::types::SessionSummary {
+                        session_id: "sess-1".into(),
+                        label: "main".into(),
+                    },
+                    rex_proto::types::SessionSummary {
+                        session_id: "sess-2".into(),
+                        label: "claude-work".into(),
+                    },
+                ],
+            },
+            selected_session: Some(rex_proto::types::AttachedSessionSnapshot {
+                session: rex_proto::types::SessionSummary {
+                    session_id: "sess-1".into(),
+                    label: "main".into(),
+                },
+                view: make_view("sess-1", "main", selected_rev, "blk-1"),
+            }),
+            attached_sessions: Vec::new(),
+            data_tickets: Vec::new(),
+        }
+    };
+
+    // 1. Initial connection & bootstrap -> switch user to non-default `sess-2` at high revision 42.
+    ctrl.process_runtime_event(
+        RuntimeEvent::BootstrapReady {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            bootstrap: Box::new(make_bootstrap("inst-before", 1001, 10)),
+            seq: 1,
+        },
+        now,
+    );
+    let sk2 = SessionKey::new(LOCAL_HOST_ID, "sess-2");
+    ctrl.activate_session(sk2.clone(), &HashMap::new());
+    ctrl.process_runtime_event(
+        RuntimeEvent::SessionViewUpdated {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            session_id: "sess-2".into(),
+            view: Box::new(make_view("sess-2", "claude-work", 42, "blk-2")),
+            seq: 2,
+        },
+        now,
+    );
+    assert_eq!(ctrl.workspace.active_session.as_ref(), Some(&sk2));
+    assert_eq!(ctrl.workspace.session(&sk2).unwrap().applied_revision, 42);
+    assert!(
+        ctrl.opened_streams
+            .contains(&BlockKey::new(LOCAL_HOST_ID, "sess-2", "blk-2"))
+    );
+    ctrl.drain_pending_commands();
+
+    // 2. Rex server restarts with a new `instance_id` (`inst-after`) and fresh low revisions (1).
+    // Bootstrap only attaches `sess-1`; `sess-2` is listed in `attach_all.sessions`.
+    ctrl.process_runtime_event(
+        RuntimeEvent::BootstrapReady {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            bootstrap: Box::new(make_bootstrap("inst-after", 2002, 1)),
+            seq: 1,
+        },
+        now,
+    );
+    assert_eq!(
+        ctrl.workspace.session(&sk2).unwrap().applied_revision,
+        0,
+        "server restart must reset stale view revisions so restored rev=1 is accepted"
+    );
+    let cmds = ctrl.drain_pending_commands();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            HostCommand::SelectSession { host_id, session_id }
+            if host_id == LOCAL_HOST_ID && session_id == "sess-2"
+        )),
+        "BootstrapReady after server restart must re-attach non-default active session `sess-2`: {cmds:?}"
+    );
+
+    // 3. Server replies to SelectSession with restored `sess-2` at revision=1 -> accepted & stream reopened!
+    ctrl.process_runtime_event(
+        RuntimeEvent::SessionViewUpdated {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            session_id: "sess-2".into(),
+            view: Box::new(make_view("sess-2", "claude-work", 1, "blk-2")),
+            seq: 2,
+        },
+        now,
+    );
+    assert_eq!(ctrl.workspace.session(&sk2).unwrap().applied_revision, 1);
+    let reopen_cmds = ctrl.drain_pending_commands();
+    assert!(
+        reopen_cmds.iter().any(|c| matches!(
+            c,
+            HostCommand::OpenBlockStream { host_id, session_id, block_id, .. }
+            if host_id == LOCAL_HOST_ID && session_id == "sess-2" && block_id == "blk-2"
+        )),
+        "restored active session must reopen block stream after server restart: {reopen_cmds:?}"
+    );
+    assert!(
+        reopen_cmds.iter().any(|c| matches!(
+            c,
+            HostCommand::HydrateSessionMetadata { host_id, session_id, block_ids }
+            if host_id == LOCAL_HOST_ID && session_id == "sess-2" && block_ids.contains(&"blk-2".to_owned())
+        )),
+        "restored active session must re-hydrate metadata (OSC 7501 & 7577)"
+    );
+
+    if let Some(parent) = ctrl.settings_path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[test]
+fn osc7577_program_resume_tracking_badges_redaction_and_server_settings_lifecycle() {
+    let mut ctrl = make_test_controller();
+    seed_single_pane_workspace(&mut ctrl);
+    let now = Instant::now();
+    ctrl.drain_pending_commands();
+
+    // 1. Live `program_resume_changed` event populates pane badge & server settings counts.
+    ctrl.process_runtime_event(
+        RuntimeEvent::ControlEvent {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            seq: 11,
+            event: Box::new(ServerEvent::SessionEvent {
+                session_id: "session:t3".into(),
+                event: rex_proto::types::SessionEvent::BlockEvent(
+                    rex_proto::types::BlockEventPayload {
+                        block_id: "block:1".into(),
+                        creator_name: Some("com.superlogical.terminal".into()),
+                        name: "program_resume_changed".into(),
+                        payload: serde_json::json!({
+                            "reason": "report",
+                            "records": [{
+                                "owner": {"pid": 4242, "name": "claude"},
+                                "program": "claude",
+                                "cwd": "/home/mike/Work/omarex",
+                                "reported_at": "2026-11-27T12:00:00Z",
+                                "chosen": true,
+                                "trusted": true,
+                                "rule": "claude"
+                            }]
+                        }),
+                    },
+                ),
+            }),
+        },
+        now,
+    );
+
+    // Also verify hydrated records containing secret argv flags never leak into diagnostics/debug bundle.
+    ctrl.process_runtime_event(
+        RuntimeEvent::SessionMetadataHydrated {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            session_id: "session:t3".into(),
+            blocks: vec![crate::workspace::HydratedBlockMeta {
+                block_id: "block:1".into(),
+                program_statuses: Vec::new(),
+                program_resume_records: Some(vec![rex_proto::types::ProgramResumeRecord {
+                    owner: Some(rex_proto::types::ProcessOwner {
+                        pid: 4242,
+                        name: "claude".into(),
+                    }),
+                    program: "claude".into(),
+                    cwd: Some("/home/mike/Work/omarex".into()),
+                    reported_at: "2026-11-27T12:00:00Z".into(),
+                    chosen: true,
+                    trusted: true,
+                    rule: Some("claude".into()),
+                    untrusted_reason: None,
+                    command: vec![
+                        "claude".into(),
+                        "--resume".into(),
+                        "015d3962-6f9e-45c3-92bc-c7cef5068215".into(),
+                        "--system-prompt".into(),
+                        "SUPER_SECRET_FLAG_VALUE".into(),
+                    ],
+                    reported_command: Vec::new(),
+                }]),
+                pwd: None,
+                foreground_process: None,
+                title: None,
+            }],
+        },
+        now,
+    );
+
+    let frame = ctrl.build_ui_frame_input(now);
+    let pane_meta = frame
+        .pane_metas
+        .iter()
+        .find(|m| m.block_id == "block:1")
+        .expect("pane meta for block:1");
+    let badge = pane_meta
+        .resume_badge
+        .as_ref()
+        .expect("trusted OSC 7577 resume badge");
+    assert_eq!(badge.program, "claude");
+    assert!(badge.trusted);
+    assert_eq!(badge.rule.as_deref(), Some("claude"));
+
+    let diag = ctrl.build_diagnostics_snapshot();
+    assert_eq!(diag.resume_records.len(), 1);
+    assert!(diag.resume_records[0].contains("claude"));
+    assert!(diag.resume_records[0].contains("trusted: rule=claude"));
+    let bundle = ctrl.format_debug_bundle();
+    assert!(bundle.contains("Program Resume (OSC 7577): 1"));
+    assert!(
+        !bundle.contains("SUPER_SECRET_FLAG_VALUE"),
+        "debug bundle must NEVER leak OSC 7577 command argv: {bundle}"
+    );
+
+    // 2. Open Settings -> Server via ClientCommand::OpenServerSettings and test lifecycle commands.
+    ctrl.process_runtime_event(
+        RuntimeEvent::ServerVersionLoaded {
+            host_id: LOCAL_HOST_ID.to_owned(),
+            version: rex_proto::types::ServerVersionResponse {
+                rex_version: "0.1.0-preview.25".into(),
+                platform: "linux_amd64".into(),
+                commit: Some("b070aae".into()),
+                built_at: None,
+                dirty: false,
+                api_revision: Some(24),
+                api_min_revision: Some(0),
+            },
+        },
+        now,
+    );
+    ctrl.execute_client_command(LOCAL_HOST_ID, ClientCommand::OpenServerSettings, now);
+    match ctrl.ui.modal.as_ref().map(|m| &m.content) {
+        Some(ModalContent::Settings {
+            category, snapshot, ..
+        }) => {
+            assert_eq!(*category, ui_chrome::SettingsCategory::Server);
+            assert_eq!(snapshot.server.state, ui_chrome::LocalServerState::Running);
+            assert_eq!(snapshot.server.version.as_deref(), Some("0.1.0-preview.25"));
+            assert_eq!(snapshot.server.resumable_trusted_count, 1);
+            assert_eq!(snapshot.server.resumable_untrusted_count, 0);
+        }
+        other => panic!("expected Settings::Server modal, got {other:?}"),
+    }
+    ctrl.drain_pending_commands();
+
+    ctrl.dispatch_ui_action(UiAction::UpdateSetting(SettingChange::ServerRestart), now);
+    assert!(ctrl.drain_pending_commands().iter().any(|c| matches!(
+        c,
+        HostCommand::RestartLocalServer { host_id } if host_id == LOCAL_HOST_ID
+    )));
+
+    ctrl.dispatch_ui_action(UiAction::UpdateSetting(SettingChange::ServerStop), now);
+    assert!(ctrl.drain_pending_commands().iter().any(|c| matches!(
+        c,
+        HostCommand::StopLocalServer {
+            host_id,
+            if_idle: false
+        } if host_id == LOCAL_HOST_ID
+    )));
+
+    ctrl.dispatch_ui_action(UiAction::UpdateSetting(SettingChange::ServerStart), now);
+    assert!(ctrl.drain_pending_commands().iter().any(|c| matches!(
+        c,
+        HostCommand::StartLocalServer { host_id } if host_id == LOCAL_HOST_ID
+    )));
+
+    ctrl.dispatch_ui_action(
+        UiAction::UpdateSetting(SettingChange::ServerReloadConfig),
+        now,
+    );
+    assert!(ctrl.drain_pending_commands().iter().any(|c| matches!(
+        c,
+        HostCommand::ReloadConfig { host_id } if host_id == LOCAL_HOST_ID
+    )));
+
+    if let Some(parent) = ctrl.settings_path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
