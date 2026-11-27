@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::atlas::{CellMetrics, GlyphAtlas};
+use crate::atlas::{CellMetrics, GlyphAtlas, ShapedRunCell};
 use crate::draw_list::{
     ClipRect, Color, CornerRadii, DrawList, GlyphInstance, QuadInstance, Rect, layers,
 };
@@ -201,9 +201,17 @@ struct ActiveStrikeSpan {
     color: Color,
 }
 
+/// Reusable per-row shaping scratch buffers owned by [`TerminalPaneCache`] (0 steady-state allocs).
+#[derive(Default)]
+struct RowScratch {
+    run_text: String,
+    run_cells: Vec<ShapedRunCell>,
+}
+
 /// Per-pane incremental terminal instance cache keyed by stable `RowId`.
 pub struct TerminalPaneCache {
     rows: HashMap<[u64; 2], CachedRow>,
+    row_scratch: RowScratch,
     frame_counter: u64,
     last_atlas_generation: u64,
     last_scale_bits: u32,
@@ -213,7 +221,10 @@ pub struct TerminalPaneCache {
     last_cols: u16,
     last_rows: u16,
     last_default_bg: Color,
+    last_default_fg: Color,
     last_selection_bg: Color,
+    last_selection_fg: Option<Color>,
+    last_hyperlink_color: Color,
     max_cached_rows: usize,
 }
 
@@ -227,6 +238,10 @@ impl TerminalPaneCache {
     pub fn new() -> Self {
         Self {
             rows: HashMap::with_capacity(96),
+            row_scratch: RowScratch {
+                run_text: String::with_capacity(128),
+                run_cells: Vec::with_capacity(64),
+            },
             frame_counter: 0,
             last_atlas_generation: 0,
             last_scale_bits: 0,
@@ -236,7 +251,10 @@ impl TerminalPaneCache {
             last_cols: 0,
             last_rows: 0,
             last_default_bg: Color::TRANSPARENT,
+            last_default_fg: Color::TRANSPARENT,
             last_selection_bg: Color::TRANSPARENT,
+            last_selection_fg: None,
+            last_hyperlink_color: Color::TRANSPARENT,
             max_cached_rows: 512,
         }
     }
@@ -316,11 +334,12 @@ impl TerminalPaneCache {
                     font_size_px,
                     scale,
                     viewport,
+                    &mut self.row_scratch,
                 );
                 source.visit_row_cells(idx, &mut |cell| {
                     row_builder.push_cell(cell, atlas, queue, &mut row_cache);
                 });
-                row_builder.finish(&mut row_cache);
+                row_builder.finish(atlas, queue, &mut row_cache);
 
                 self.rows.insert(row_key, row_cache);
                 stats.rebuilt_rows += 1;
@@ -377,6 +396,22 @@ impl TerminalPaneCache {
         queue: &wgpu::Queue,
         draw_list: &mut DrawList,
     ) -> Result<TerminalBuildStats, vt_engine::VtError> {
+        self.build_from_vt_render_state_with_cursor_override(
+            state, viewport, atlas, queue, draw_list, None,
+        )
+    }
+
+    /// Same as [`Self::build_from_vt_render_state`], but allows suppressing or overriding the live
+    /// PTY cursor (e.g. for Vim Copy Mode).
+    pub fn build_from_vt_render_state_with_cursor_override(
+        &mut self,
+        state: &mut vt_engine::RenderState,
+        viewport: &TerminalViewport,
+        atlas: &mut GlyphAtlas,
+        queue: &wgpu::Queue,
+        draw_list: &mut DrawList,
+        cursor_override: Option<TerminalCursor>,
+    ) -> Result<TerminalBuildStats, vt_engine::VtError> {
         self.frame_counter = self.frame_counter.saturating_add(1);
         let scale = viewport.metrics.scale_factor.max(0.5);
         self.invalidate_if_metrics_changed(atlas.generation(), viewport, scale);
@@ -410,6 +445,7 @@ impl TerminalPaneCache {
         let mut stats = TerminalBuildStats::default();
         let frame_counter = self.frame_counter;
         let rows_cache = &mut self.rows;
+        let row_scratch = &mut self.row_scratch;
 
         state.for_each_row(|dirty_row| {
             stats.total_rows += 1;
@@ -438,6 +474,7 @@ impl TerminalPaneCache {
                     font_size_px,
                     scale,
                     viewport,
+                    row_scratch,
                 );
 
                 let mut utf8_buf = [0u8; 4];
@@ -480,7 +517,7 @@ impl TerminalPaneCache {
                         &mut row_cache,
                     );
                 }
-                row_builder.finish(&mut row_cache);
+                row_builder.finish(atlas, queue, &mut row_cache);
 
                 rows_cache.insert(row_key, row_cache);
                 stats.rebuilt_rows += 1;
@@ -503,7 +540,23 @@ impl TerminalPaneCache {
             }
         })?;
 
-        if vt_cursor.visible
+        if let Some(override_cursor) = cursor_override {
+            if override_cursor.visible {
+                emit_cursor(
+                    override_cursor,
+                    origin_x_px,
+                    origin_y_px,
+                    scroll_px,
+                    cell_w_px,
+                    cell_h_px,
+                    scale,
+                    clip_px,
+                    dim,
+                    draw_list,
+                    &mut stats,
+                );
+            }
+        } else if vt_cursor.visible
             && let Some((col, row)) = vt_cursor.viewport_pos
         {
             let shape = match vt_cursor.style {
@@ -557,7 +610,10 @@ impl TerminalPaneCache {
             || self.last_cols != viewport.cols
             || self.last_rows != viewport.rows
             || self.last_default_bg != viewport.default_bg
+            || self.last_default_fg != viewport.default_fg
             || self.last_selection_bg != viewport.selection_bg
+            || self.last_selection_fg != viewport.selection_fg
+            || self.last_hyperlink_color != viewport.hyperlink_color
         {
             self.rows.clear();
             self.last_atlas_generation = atlas_generation;
@@ -568,7 +624,10 @@ impl TerminalPaneCache {
             self.last_cols = viewport.cols;
             self.last_rows = viewport.rows;
             self.last_default_bg = viewport.default_bg;
+            self.last_default_fg = viewport.default_fg;
             self.last_selection_bg = viewport.selection_bg;
+            self.last_selection_fg = viewport.selection_fg;
+            self.last_hyperlink_color = viewport.hyperlink_color;
         }
     }
 
@@ -637,6 +696,50 @@ fn convert_vt_flags(vt: vt_engine::CellFlags, underline: vt_engine::UnderlineSty
     out
 }
 
+#[inline]
+fn is_ligature_candidate_ascii(ch: char) -> bool {
+    matches!(
+        ch,
+        '!' | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '*'
+            | '+'
+            | '-'
+            | '.'
+            | '/'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '\\'
+            | '^'
+            | '_'
+            | '|'
+            | '~'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ActiveTextRunStyle {
+    fg: Color,
+    bold: bool,
+    italic: bool,
+    selected: bool,
+    is_ascii_punct: bool,
+    last_end_col: u16,
+}
+
 struct RowSpanBuilder<'v> {
     cell_w_px: f32,
     cell_h_px: f32,
@@ -650,6 +753,8 @@ struct RowSpanBuilder<'v> {
     bg_span: Option<ActiveBgSpan>,
     ul_span: Option<ActiveUnderlineSpan>,
     strike_span: Option<ActiveStrikeSpan>,
+    text_run: Option<ActiveTextRunStyle>,
+    scratch: &'v mut RowScratch,
 }
 
 impl<'v> RowSpanBuilder<'v> {
@@ -664,7 +769,10 @@ impl<'v> RowSpanBuilder<'v> {
         font_size_px: f32,
         scale: f32,
         viewport: &'v TerminalViewport,
+        scratch: &'v mut RowScratch,
     ) -> Self {
+        scratch.run_text.clear();
+        scratch.run_cells.clear();
         Self {
             cell_w_px,
             cell_h_px,
@@ -678,6 +786,8 @@ impl<'v> RowSpanBuilder<'v> {
             bg_span: None,
             ul_span: None,
             strike_span: None,
+            text_run: None,
+            scratch,
         }
     }
 
@@ -823,26 +933,168 @@ impl<'v> RowSpanBuilder<'v> {
             );
         }
 
-        // Rasterize/cache glyph unless invisible or whitespace.
-        if !cell.flags.contains(CellFlags::INVISIBLE) && !cell.text.is_empty() && cell.text != " " {
-            let cell_x_px = f32::from(col) * self.cell_w_px;
-            atlas.emit_terminal_grapheme(
-                cell.text,
-                cell_x_px,
-                self.cell_w_px * f32::from(span_cols),
+        // Segment row text into:
+        // 1) Pure non-ligature ASCII runs -> `emit_terminal_ascii_glyph` fastpath
+        // 2) Procedural box/block/Powerline single chars -> `emit_procedural_terminal_glyph`
+        // 3) Contiguous ASCII operator/ligature runs & non-ASCII/complex runs -> `emit_terminal_shaped_run`
+        if cell.flags.contains(CellFlags::INVISIBLE) || cell.text.is_empty() || cell.text == " " {
+            self.flush_text_run(atlas, queue, row_cache);
+            return;
+        }
+
+        let bold = cell.flags.contains(CellFlags::BOLD);
+        let italic = cell.flags.contains(CellFlags::ITALIC);
+        let mut chars = cell.text.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            if crate::atlas::is_procedural_box_or_block(ch) {
+                self.flush_text_run(atlas, queue, row_cache);
+                atlas.emit_procedural_terminal_glyph(
+                    ch,
+                    f32::from(col) * self.cell_w_px,
+                    self.cell_w_px * f32::from(span_cols),
+                    self.cell_h_px,
+                    fg,
+                    queue,
+                    &mut row_cache.glyphs,
+                );
+                return;
+            }
+            if ch.is_ascii() {
+                if !is_ligature_candidate_ascii(ch) {
+                    self.flush_text_run(atlas, queue, row_cache);
+                    atlas.emit_terminal_ascii_glyph(
+                        ch,
+                        f32::from(col) * self.cell_w_px,
+                        self.baseline_px,
+                        self.font_size_px,
+                        bold,
+                        italic,
+                        fg,
+                        queue,
+                        &mut row_cache.glyphs,
+                    );
+                    return;
+                }
+                let can_extend = matches!(
+                    self.text_run,
+                    Some(s)
+                        if s.is_ascii_punct
+                            && s.last_end_col == col
+                            && s.fg == fg
+                            && s.bold == bold
+                            && s.italic == italic
+                            && s.selected == is_selected
+                );
+                if can_extend {
+                    if let Some(ref mut s) = self.text_run {
+                        s.last_end_col = end_col;
+                    }
+                } else {
+                    self.flush_text_run(atlas, queue, row_cache);
+                    self.text_run = Some(ActiveTextRunStyle {
+                        fg,
+                        bold,
+                        italic,
+                        selected: is_selected,
+                        is_ascii_punct: true,
+                        last_end_col: end_col,
+                    });
+                }
+                self.scratch.run_cells.push(ShapedRunCell {
+                    byte_start: self.scratch.run_text.len() as u32,
+                    col,
+                    span_cols: span_cols.min(u16::from(u8::MAX)) as u8,
+                });
+                self.scratch.run_text.push(ch);
+                return;
+            }
+        }
+
+        // Non-ASCII or multi-codepoint grapheme cluster run.
+        let can_extend = matches!(
+            self.text_run,
+            Some(s)
+                if !s.is_ascii_punct
+                    && s.last_end_col == col
+                    && s.fg == fg
+                    && s.bold == bold
+                    && s.italic == italic
+                    && s.selected == is_selected
+        );
+        if can_extend {
+            if let Some(ref mut s) = self.text_run {
+                s.last_end_col = end_col;
+            }
+        } else {
+            self.flush_text_run(atlas, queue, row_cache);
+            self.text_run = Some(ActiveTextRunStyle {
+                fg,
+                bold,
+                italic,
+                selected: is_selected,
+                is_ascii_punct: false,
+                last_end_col: end_col,
+            });
+        }
+        self.scratch.run_cells.push(ShapedRunCell {
+            byte_start: self.scratch.run_text.len() as u32,
+            col,
+            span_cols: span_cols.min(u16::from(u8::MAX)) as u8,
+        });
+        self.scratch.run_text.push_str(cell.text);
+    }
+
+    fn flush_text_run(
+        &mut self,
+        atlas: &mut GlyphAtlas,
+        queue: &wgpu::Queue,
+        row_cache: &mut CachedRow,
+    ) {
+        let Some(style) = self.text_run.take() else {
+            return;
+        };
+        if self.scratch.run_cells.is_empty() {
+            self.scratch.run_text.clear();
+            return;
+        }
+        if style.is_ascii_punct
+            && self.scratch.run_cells.len() == 1
+            && self.scratch.run_text.len() == 1
+        {
+            let ch = self.scratch.run_text.as_bytes()[0] as char;
+            let col = self.scratch.run_cells[0].col;
+            atlas.emit_terminal_ascii_glyph(
+                ch,
+                f32::from(col) * self.cell_w_px,
+                self.baseline_px,
+                self.font_size_px,
+                style.bold,
+                style.italic,
+                style.fg,
+                queue,
+                &mut row_cache.glyphs,
+            );
+        } else {
+            atlas.emit_terminal_shaped_run(
+                &self.scratch.run_text,
+                &self.scratch.run_cells,
+                self.cell_w_px,
                 self.cell_h_px,
                 self.baseline_px,
                 self.font_size_px,
-                cell.flags.contains(CellFlags::BOLD),
-                cell.flags.contains(CellFlags::ITALIC),
-                fg,
+                style.bold,
+                style.italic,
+                style.fg,
                 queue,
                 &mut row_cache.glyphs,
             );
         }
+        self.scratch.run_text.clear();
+        self.scratch.run_cells.clear();
     }
 
-    fn finish(mut self, row_cache: &mut CachedRow) {
+    fn finish(mut self, atlas: &mut GlyphAtlas, queue: &wgpu::Queue, row_cache: &mut CachedRow) {
+        self.flush_text_run(atlas, queue, row_cache);
         flush_bg_span(
             &mut self.bg_span,
             self.cell_w_px,
@@ -1243,5 +1495,95 @@ mod tests {
             !flags.contains(CellFlags::INVERSE),
             "vt_engine already swaps fg/bg for SGR 7; forwarding INVERSE double-swaps it back"
         );
+    }
+
+    #[test]
+    fn set_mono_family_bumps_generation_and_color_changes_invalidate_terminal_cache() {
+        let shared =
+            crate::GpuShared::new_headless(&crate::GpuConfig::default()).expect("headless GPU");
+        let mut cache = TerminalPaneCache::new();
+        let mut snap = TerminalGridSnapshot::new();
+        snap.push_styled_row(
+            1,
+            0,
+            true,
+            [
+                ("hello ", Color::WHITE, None, CellFlags::NONE),
+                (
+                    "link",
+                    Color::WHITE,
+                    None,
+                    CellFlags::HYPERLINK | CellFlags::SELECTED,
+                ),
+            ],
+        );
+
+        let mut atlas = shared.atlas();
+        let metrics1 = atlas.measure_monospace_cell(14.0, 1.0);
+        let mut vp = TerminalViewport {
+            rect: Rect::new(0.0, 0.0, 400.0, 100.0),
+            clip_rect: ClipRect::UNBOUNDED,
+            cols: 40,
+            rows: 4,
+            metrics: metrics1,
+            scroll_offset_y: 0.0,
+            default_bg: Color::from_hex(0x121212),
+            default_fg: Color::from_hex(0xffffff),
+            selection_bg: Color::from_hex(0x2a2a2a),
+            selection_fg: Some(Color::from_hex(0xf0f0f0)),
+            hyperlink_color: Color::from_hex(0x4ea1ff),
+            dim_alpha: 1.0,
+        };
+
+        let mut dl = DrawList::new(400, 100, 1.0);
+        let stats1 = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        assert_eq!(stats1.rebuilt_rows, 1);
+        assert_eq!(stats1.cached_rows, 0);
+
+        // Clean row hits cache when nothing changes.
+        snap.mark_all_clean();
+        let mut dl = DrawList::new(400, 100, 1.0);
+        let stats_hit = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        assert_eq!(stats_hit.rebuilt_rows, 0);
+        assert_eq!(stats_hit.cached_rows, 1);
+
+        // Switching mono font family (even with identical cell metrics) must bump generation & invalidate cache.
+        let gen_before = atlas.generation();
+        let same_name = atlas.mono_family_name().to_owned();
+        atlas.set_mono_family(same_name);
+        assert_eq!(
+            atlas.generation(),
+            gen_before,
+            "setting identical mono family should be a no-op"
+        );
+        atlas.set_mono_family("Liberation Mono");
+        assert_eq!(atlas.generation(), gen_before + 1);
+        vp.metrics = atlas.measure_monospace_cell(14.0, 1.0);
+
+        let mut dl = DrawList::new(400, 100, 1.0);
+        let stats_after_font = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        assert_eq!(stats_after_font.rebuilt_rows, 1);
+        assert_eq!(stats_after_font.cached_rows, 0);
+
+        // Changing selection_fg invalidates cache.
+        vp.selection_fg = Some(Color::from_hex(0x111111));
+        let mut dl = DrawList::new(400, 100, 1.0);
+        let stats_sel_fg = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        assert_eq!(stats_sel_fg.rebuilt_rows, 1);
+        assert_eq!(stats_sel_fg.cached_rows, 0);
+
+        // Changing hyperlink_color invalidates cache.
+        vp.hyperlink_color = Color::from_hex(0xff8800);
+        let mut dl = DrawList::new(400, 100, 1.0);
+        let stats_link = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        assert_eq!(stats_link.rebuilt_rows, 1);
+        assert_eq!(stats_link.cached_rows, 0);
+
+        // Changing default_fg invalidates cache.
+        vp.default_fg = Color::from_hex(0xcccccc);
+        let mut dl = DrawList::new(400, 100, 1.0);
+        let stats_fg = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        assert_eq!(stats_fg.rebuilt_rows, 1);
+        assert_eq!(stats_fg.cached_rows, 0);
     }
 }

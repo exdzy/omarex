@@ -11,17 +11,20 @@ pub mod draw_list;
 pub mod image_pass;
 pub mod terminal_pass;
 
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
+use parking_lot::{Mutex, MutexGuard};
 
 pub use atlas::{CellMetrics, GlyphAtlas};
 pub use context::{
     AcquiredFrame, AdapterSummary, GpuConfig, GpuContext, OffscreenTarget, PresentModePreference,
-    RenderError, save_rgba_png,
+    RenderError, SurfaceState, save_rgba_png,
 };
 pub use draw_list::{
     ClipRect, Color, CornerRadii, DrawList, FontFamily, FontStyle, FontWeight, GLYPH_MODE_COLOR,
@@ -114,7 +117,6 @@ impl<T: Pod> DynamicInstanceBuffer<T> {
 }
 
 struct PipelineSet {
-    target_format: wgpu::TextureFormat,
     quad_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
@@ -334,7 +336,6 @@ impl PipelineSet {
         });
 
         Self {
-            target_format,
             quad_pipeline,
             glyph_pipeline,
             image_pipeline,
@@ -342,50 +343,104 @@ impl PipelineSet {
     }
 }
 
-/// Top-level unified GPU renderer supporting both windowed surfaces and headless PNG readback.
-pub struct GpuRenderer {
-    ctx: GpuContext,
-    globals_bgl: wgpu::BindGroupLayout,
+/// Reusable per-window / per-pass GPU staging buffers and uniform bindings.
+///
+/// Each OS window (`SurfaceRenderer`) or offscreen pass owns its own [`FramePassResources`]
+/// while sharing the underlying [`GpuShared`] device, pipelines, glyph atlas, and image cache.
+pub struct FramePassResources {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
-    pipelines: PipelineSet,
-    offscreen_pipelines: Option<PipelineSet>,
-
     quad_buffer: DynamicInstanceBuffer<QuadInstance>,
     glyph_buffer: DynamicInstanceBuffer<GlyphInstance>,
     image_buffer: DynamicInstanceBuffer<ImageInstance>,
-
-    atlas: GlyphAtlas,
-    images: ImageTextureCache,
-
-    // Reusable per-frame staging vectors (zero steady-state heap growth).
     staged_quads: Vec<QuadInstance>,
     staged_glyphs: Vec<GlyphInstance>,
     staged_images: Vec<ImageInstance>,
     staged_commands: Vec<DrawCommand>,
 }
 
-impl GpuRenderer {
-    /// Creates a headless GPU renderer (no window / display server required).
-    pub fn new_headless(config: GpuConfig) -> Result<Self, RenderError> {
-        let ctx = GpuContext::new_headless(&config)?;
-        Ok(Self::from_context(ctx, &config))
+impl FramePassResources {
+    /// Allocates reusable uniform, instance, and CPU staging buffers for a render target.
+    pub fn new(shared: &GpuShared) -> Self {
+        let device = shared.device();
+        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("omarex-globals-ubo"),
+            size: size_of::<GlobalsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("omarex-globals-bg"),
+            layout: &shared.globals_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buffer.as_entire_binding(),
+            }],
+        });
+        Self {
+            globals_buffer,
+            globals_bind_group,
+            quad_buffer: DynamicInstanceBuffer::new(device, "omarex-quad-instances", 2048),
+            glyph_buffer: DynamicInstanceBuffer::new(device, "omarex-glyph-instances", 8192),
+            image_buffer: DynamicInstanceBuffer::new(device, "omarex-image-instances", 64),
+            staged_quads: Vec::with_capacity(2048),
+            staged_glyphs: Vec::with_capacity(8192),
+            staged_images: Vec::with_capacity(64),
+            staged_commands: Vec::with_capacity(64),
+        }
+    }
+}
+
+/// Process-wide shared `wgpu` GPU resources shared across all OS windows and offscreen targets.
+///
+/// Lock ordering invariant: whenever both `atlas` and `images` locks are held simultaneously,
+/// callers MUST acquire `atlas()` BEFORE `images()`.
+pub struct GpuShared {
+    ctx: GpuContext,
+    globals_bgl: wgpu::BindGroupLayout,
+    atlas_bgl: wgpu::BindGroupLayout,
+    image_bgl: wgpu::BindGroupLayout,
+    atlas: Mutex<GlyphAtlas>,
+    images: Mutex<ImageTextureCache>,
+    pipelines: Mutex<HashMap<wgpu::TextureFormat, Arc<PipelineSet>>>,
+}
+
+impl GpuShared {
+    /// Initializes a headless shared GPU context (no window / display server required).
+    pub fn new_headless(config: &GpuConfig) -> Result<Arc<Self>, RenderError> {
+        let ctx = GpuContext::new_headless(config)?;
+        Ok(Self::from_headless_context(ctx, config))
     }
 
-    /// Creates a GPU renderer bound to a native window surface (e.g. `Arc<winit::window::Window>`).
-    pub fn new_with_surface(
+    /// Initializes shared GPU resources alongside the first windowed [`SurfaceRenderer`].
+    pub fn new_with_initial_surface(
         surface_target: impl Into<wgpu::SurfaceTarget<'static>>,
         width: u32,
         height: u32,
         scale_factor: f32,
-        config: GpuConfig,
-    ) -> Result<Self, RenderError> {
-        let ctx =
-            GpuContext::new_with_surface(surface_target, width, height, scale_factor, &config)?;
-        Ok(Self::from_context(ctx, &config))
+        config: &GpuConfig,
+    ) -> Result<(Arc<Self>, SurfaceRenderer), RenderError> {
+        let (ctx, surface_state) = GpuContext::new_for_initial_surface(
+            surface_target,
+            width,
+            height,
+            scale_factor,
+            config,
+        )?;
+        let shared = Self::from_headless_context(ctx, config);
+        let _ = shared.pipeline_for_format(surface_state.format());
+        let pass = FramePassResources::new(&shared);
+        Ok((
+            Arc::clone(&shared),
+            SurfaceRenderer {
+                surface: surface_state,
+                pass,
+                shared,
+            },
+        ))
     }
 
-    fn from_context(ctx: GpuContext, config: &GpuConfig) -> Self {
+    fn from_headless_context(ctx: GpuContext, config: &GpuConfig) -> Arc<Self> {
         let globals_bgl = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -402,54 +457,69 @@ impl GpuRenderer {
                 }],
             });
 
-        let globals_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("omarex-globals-ubo"),
-            size: size_of::<GlobalsUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let globals_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("omarex-globals-bg"),
-            layout: &globals_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
-            }],
-        });
-
         let atlas = GlyphAtlas::new(&ctx.device);
         let images = ImageTextureCache::new(&ctx.device, config.image_cache_budget_bytes);
+        let atlas_bgl = atlas.bind_group_layout().clone();
+        let image_bgl = images.bind_group_layout().clone();
 
-        let pipelines = PipelineSet::new(
+        let initial_format = ctx.target_format;
+        let initial_pipelines = Arc::new(PipelineSet::new(
             &ctx.device,
-            ctx.target_format,
+            initial_format,
             &globals_bgl,
-            atlas.bind_group_layout(),
-            images.bind_group_layout(),
-        );
+            &atlas_bgl,
+            &image_bgl,
+        ));
+        let mut pipelines = HashMap::new();
+        pipelines.insert(initial_format, initial_pipelines);
 
-        let quad_buffer = DynamicInstanceBuffer::new(&ctx.device, "omarex-quad-instances", 2048);
-        let glyph_buffer = DynamicInstanceBuffer::new(&ctx.device, "omarex-glyph-instances", 8192);
-        let image_buffer = DynamicInstanceBuffer::new(&ctx.device, "omarex-image-instances", 64);
-
-        Self {
+        Arc::new(Self {
             ctx,
             globals_bgl,
-            globals_buffer,
-            globals_bind_group,
-            pipelines,
-            offscreen_pipelines: None,
-            quad_buffer,
-            glyph_buffer,
-            image_buffer,
-            atlas,
-            images,
-            staged_quads: Vec::with_capacity(2048),
-            staged_glyphs: Vec::with_capacity(8192),
-            staged_images: Vec::with_capacity(64),
-            staged_commands: Vec::with_capacity(64),
+            atlas_bgl,
+            image_bgl,
+            atlas: Mutex::new(atlas),
+            images: Mutex::new(images),
+            pipelines: Mutex::new(pipelines),
+        })
+    }
+
+    /// Creates a new per-window [`SurfaceRenderer`] sharing this [`GpuShared`] device,
+    /// glyph atlas, image texture cache, and compiled pipelines.
+    pub fn create_surface_renderer(
+        self: &Arc<Self>,
+        surface_target: impl Into<wgpu::SurfaceTarget<'static>>,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        config: &GpuConfig,
+    ) -> Result<SurfaceRenderer, RenderError> {
+        let surface_state =
+            self.ctx
+                .create_surface_state(surface_target, width, height, scale_factor, config)?;
+        let _ = self.pipeline_for_format(surface_state.format());
+        let pass = FramePassResources::new(self);
+        Ok(SurfaceRenderer {
+            surface: surface_state,
+            pass,
+            shared: Arc::clone(self),
+        })
+    }
+
+    fn pipeline_for_format(&self, target_format: wgpu::TextureFormat) -> Arc<PipelineSet> {
+        let mut map = self.pipelines.lock();
+        if let Some(existing) = map.get(&target_format) {
+            return Arc::clone(existing);
         }
+        let created = Arc::new(PipelineSet::new(
+            &self.ctx.device,
+            target_format,
+            &self.globals_bgl,
+            &self.atlas_bgl,
+            &self.image_bgl,
+        ));
+        map.insert(target_format, Arc::clone(&created));
+        created
     }
 
     pub fn context(&self) -> &GpuContext {
@@ -468,39 +538,22 @@ impl GpuRenderer {
         &self.ctx.queue
     }
 
-    pub fn atlas(&self) -> &GlyphAtlas {
-        &self.atlas
+    pub fn atlas(&self) -> MutexGuard<'_, GlyphAtlas> {
+        self.atlas.lock()
     }
 
-    pub fn atlas_mut(&mut self) -> &mut GlyphAtlas {
-        &mut self.atlas
-    }
-
-    pub fn images(&self) -> &ImageTextureCache {
-        &self.images
-    }
-
-    pub fn images_mut(&mut self) -> &mut ImageTextureCache {
-        &mut self.images
+    pub fn images(&self) -> MutexGuard<'_, ImageTextureCache> {
+        self.images.lock()
     }
 
     /// Uploads or updates a Kitty / hover preview image in the bounded VRAM texture cache.
-    pub fn upload_image(&mut self, upload: ImageUpload<'_>) -> Result<bool, RenderError> {
+    pub fn upload_image(&self, upload: ImageUpload<'_>) -> Result<bool, RenderError> {
         self.images
+            .lock()
             .upload_or_update(&self.ctx.device, &self.ctx.queue, upload)
     }
 
-    /// Resizes the windowed swapchain and updates DPI scale factor.
-    pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
-        self.ctx.resize(width, height, scale_factor);
-    }
-
-    /// Switches swapchain presentation mode (`Fifo` vs `Mailbox`).
-    pub fn set_present_mode(&mut self, mode: PresentModePreference) {
-        self.ctx.set_present_mode(mode);
-    }
-
-    /// Creates a reusable offscreen render target for headless screenshots or visual tests.
+    /// Creates a reusable offscreen render target for headless screenshots or multi-target tests.
     pub fn create_offscreen_target(
         &self,
         width: u32,
@@ -509,66 +562,227 @@ impl GpuRenderer {
         OffscreenTarget::new(&self.ctx.device, width, height)
     }
 
+    /// Reads tightly packed RGBA8 pixels from an [`OffscreenTarget`] after rendering.
+    pub fn readback_offscreen(&self, target: &OffscreenTarget) -> Result<Vec<u8>, RenderError> {
+        self.ctx.readback_offscreen(target)
+    }
+
+    /// Renders `frame` into `target_view` using caller-owned [`FramePassResources`].
+    pub fn render_to_view_with_pass(
+        &self,
+        frame: &SceneFrame,
+        target_view: &wgpu::TextureView,
+        target_format: wgpu::TextureFormat,
+        pass: &mut FramePassResources,
+    ) -> Result<FrameStats, RenderError> {
+        render_into_view_shared(self, frame, target_view, target_format, pass, None)
+    }
+
+    /// Renders `frame` into an [`OffscreenTarget`] using caller-owned [`FramePassResources`].
+    pub fn render_to_offscreen_with_pass(
+        &self,
+        frame: &SceneFrame,
+        target: &OffscreenTarget,
+        pass: &mut FramePassResources,
+    ) -> Result<FrameStats, RenderError> {
+        render_into_view_shared(self, frame, &target.view, target.format, pass, Some(target))
+    }
+
+    /// Convenience helper rendering `frame` into an [`OffscreenTarget`] with temporary pass buffers.
+    pub fn render_to_offscreen(
+        &self,
+        frame: &SceneFrame,
+        target: &OffscreenTarget,
+    ) -> Result<FrameStats, RenderError> {
+        let mut pass = FramePassResources::new(self);
+        self.render_to_offscreen_with_pass(frame, target, &mut pass)
+    }
+
+    /// Convenience helper rendering `frame` offscreen and reading back tightly packed sRGB RGBA8 pixels.
+    pub fn render_to_rgba(&self, frame: &SceneFrame) -> Result<(Vec<u8>, FrameStats), RenderError> {
+        let target = OffscreenTarget::new(
+            &self.ctx.device,
+            frame.physical_width,
+            frame.physical_height,
+        )?;
+        let stats = self.render_to_offscreen(frame, &target)?;
+        let rgba = self.readback_offscreen(&target)?;
+        Ok((rgba, stats))
+    }
+
+    /// Convenience helper rendering `frame` offscreen and saving as PNG.
+    pub fn render_to_png(
+        &self,
+        frame: &SceneFrame,
+        path: impl AsRef<Path>,
+    ) -> Result<FrameStats, RenderError> {
+        let (rgba, stats) = self.render_to_rgba(frame)?;
+        save_rgba_png(path, frame.physical_width, frame.physical_height, &rgba)?;
+        Ok(stats)
+    }
+}
+
+/// Per-window swapchain surface renderer backed by a process-wide [`Arc<GpuShared>`].
+///
+/// Field drop order is critical on Wayland/Vulkan: `surface` (`VkSurfaceKHR`) MUST drop
+/// before `shared` (`wgpu::Device` / `wgpu::Instance`).
+pub struct SurfaceRenderer {
+    surface: SurfaceState,
+    pass: FramePassResources,
+    shared: Arc<GpuShared>,
+}
+
+impl SurfaceRenderer {
+    pub fn shared(&self) -> &Arc<GpuShared> {
+        &self.shared
+    }
+
+    pub fn surface_size(&self) -> (u32, u32) {
+        self.surface.size()
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.surface.scale_factor
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.surface.format()
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
+        self.surface
+            .resize(&self.shared.ctx.device, width, height, scale_factor);
+    }
+
+    pub fn set_present_mode(&mut self, mode: PresentModePreference) {
+        self.surface.set_present_mode(&self.shared.ctx.device, mode);
+    }
+
+    pub fn render_to_surface(
+        &mut self,
+        frame: &SceneFrame,
+    ) -> Result<Option<FrameStats>, RenderError> {
+        render_surface_state(&self.shared, &mut self.surface, &mut self.pass, frame)
+    }
+}
+
+/// Top-level unified GPU renderer supporting both windowed surfaces and headless PNG readback.
+///
+/// Internally wraps [`Arc<GpuShared>`] + optional [`SurfaceState`] + [`FramePassResources`] so
+/// existing single-window, benchmark, and headless callers keep working unchanged.
+pub struct GpuRenderer {
+    surface: Option<SurfaceState>,
+    pass: FramePassResources,
+    shared: Arc<GpuShared>,
+}
+
+impl GpuRenderer {
+    /// Creates a headless GPU renderer (no window / display server required).
+    pub fn new_headless(config: GpuConfig) -> Result<Self, RenderError> {
+        let shared = GpuShared::new_headless(&config)?;
+        let pass = FramePassResources::new(&shared);
+        Ok(Self {
+            surface: None,
+            pass,
+            shared,
+        })
+    }
+
+    /// Creates a GPU renderer bound to a native window surface (e.g. `Arc<winit::window::Window>`).
+    pub fn new_with_surface(
+        surface_target: impl Into<wgpu::SurfaceTarget<'static>>,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        config: GpuConfig,
+    ) -> Result<Self, RenderError> {
+        let (shared, surface_renderer) = GpuShared::new_with_initial_surface(
+            surface_target,
+            width,
+            height,
+            scale_factor,
+            &config,
+        )?;
+        Ok(Self {
+            surface: Some(surface_renderer.surface),
+            pass: surface_renderer.pass,
+            shared,
+        })
+    }
+
+    pub fn shared(&self) -> &Arc<GpuShared> {
+        &self.shared
+    }
+
+    pub fn context(&self) -> &GpuContext {
+        &self.shared.ctx
+    }
+
+    pub fn adapter_summary(&self) -> &AdapterSummary {
+        self.shared.adapter_summary()
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        self.shared.device()
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        self.shared.queue()
+    }
+
+    pub fn atlas(&self) -> MutexGuard<'_, GlyphAtlas> {
+        self.shared.atlas()
+    }
+
+    pub fn atlas_mut(&mut self) -> MutexGuard<'_, GlyphAtlas> {
+        self.shared.atlas()
+    }
+
+    pub fn images(&self) -> MutexGuard<'_, ImageTextureCache> {
+        self.shared.images()
+    }
+
+    pub fn images_mut(&mut self) -> MutexGuard<'_, ImageTextureCache> {
+        self.shared.images()
+    }
+
+    /// Uploads or updates a Kitty / hover preview image in the bounded VRAM texture cache.
+    pub fn upload_image(&mut self, upload: ImageUpload<'_>) -> Result<bool, RenderError> {
+        self.shared.upload_image(upload)
+    }
+
+    /// Resizes the windowed swapchain and updates DPI scale factor.
+    pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
+        if let Some(surf) = self.surface.as_mut() {
+            surf.resize(&self.shared.ctx.device, width, height, scale_factor);
+        }
+    }
+
+    /// Switches swapchain presentation mode (`Fifo` vs `Mailbox`).
+    pub fn set_present_mode(&mut self, mode: PresentModePreference) {
+        if let Some(surf) = self.surface.as_mut() {
+            surf.set_present_mode(&self.shared.ctx.device, mode);
+        }
+    }
+
+    /// Creates a reusable offscreen render target for headless screenshots or visual tests.
+    pub fn create_offscreen_target(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<OffscreenTarget, RenderError> {
+        self.shared.create_offscreen_target(width, height)
+    }
+
     /// Renders `frame` to the active windowed surface and presents it.
     pub fn render_to_surface(
         &mut self,
         frame: &SceneFrame,
     ) -> Result<Option<FrameStats>, RenderError> {
-        if frame.physical_width > 0 && frame.physical_height > 0 {
-            let needs_resize = self.ctx.surface_size()
-                != Some((frame.physical_width, frame.physical_height))
-                || (self.ctx.scale_factor() - frame.scale_factor.max(0.5)).abs() > f32::EPSILON;
-            if needs_resize {
-                self.ctx.resize(
-                    frame.physical_width,
-                    frame.physical_height,
-                    frame.scale_factor,
-                );
-            }
-        }
-
-        let (surface_tex, suboptimal) = match self.ctx.acquire_surface_frame()? {
-            AcquiredFrame::Ready {
-                texture,
-                suboptimal,
-            } => (texture, suboptimal),
-            AcquiredFrame::Reconfigured => match self.ctx.acquire_surface_frame()? {
-                AcquiredFrame::Ready {
-                    texture,
-                    suboptimal,
-                } => (texture, suboptimal),
-                AcquiredFrame::Skipped | AcquiredFrame::Reconfigured => return Ok(None),
-            },
-            AcquiredFrame::Skipped => return Ok(None),
+        let Some(surf) = self.surface.as_mut() else {
+            return Err(RenderError::NoSurface);
         };
-
-        // Guard against stale swapchain images whose dimensions lag behind a Hyprland resize.
-        if frame.physical_width > 0
-            && frame.physical_height > 0
-            && (surface_tex.texture.width() != frame.physical_width
-                || surface_tex.texture.height() != frame.physical_height)
-        {
-            drop(surface_tex);
-            self.ctx.resize(
-                frame.physical_width,
-                frame.physical_height,
-                frame.scale_factor,
-            );
-            return Ok(None);
-        }
-
-        let view = surface_tex
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let format = self.ctx.target_format;
-        let stats = self.render_into_view(frame, &view, format, None)?;
-        self.ctx.queue.present(surface_tex);
-
-        if suboptimal {
-            self.ctx.reconfigure_surface();
-            return Ok(None);
-        }
-        Ok(Some(stats))
+        render_surface_state(&self.shared, surf, &mut self.pass, frame)
     }
 
     /// Renders `frame` into an arbitrary caller-provided `wgpu::TextureView` (no staging readback).
@@ -578,7 +792,8 @@ impl GpuRenderer {
         target_view: &wgpu::TextureView,
         target_format: wgpu::TextureFormat,
     ) -> Result<FrameStats, RenderError> {
-        self.render_into_view(frame, target_view, target_format, None)
+        self.shared
+            .render_to_view_with_pass(frame, target_view, target_format, &mut self.pass)
     }
 
     /// Renders `frame` into a caller-managed [`OffscreenTarget`] and copies the result into its
@@ -588,7 +803,8 @@ impl GpuRenderer {
         frame: &SceneFrame,
         target: &OffscreenTarget,
     ) -> Result<FrameStats, RenderError> {
-        self.render_into_view(frame, &target.view, target.format, Some(target))
+        self.shared
+            .render_to_offscreen_with_pass(frame, target, &mut self.pass)
     }
 
     /// Renders `frame` offscreen and reads back tightly packed sRGB RGBA8 pixels.
@@ -597,12 +813,12 @@ impl GpuRenderer {
         frame: &SceneFrame,
     ) -> Result<(Vec<u8>, FrameStats), RenderError> {
         let target = OffscreenTarget::new(
-            &self.ctx.device,
+            &self.shared.ctx.device,
             frame.physical_width,
             frame.physical_height,
         )?;
         let stats = self.render_to_offscreen(frame, &target)?;
-        let rgba = self.ctx.readback_offscreen(&target)?;
+        let rgba = self.shared.readback_offscreen(&target)?;
         Ok((rgba, stats))
     }
 
@@ -616,249 +832,311 @@ impl GpuRenderer {
         save_rgba_png(path, frame.physical_width, frame.physical_height, &rgba)?;
         Ok(stats)
     }
+}
 
-    fn render_into_view(
-        &mut self,
-        frame: &SceneFrame,
-        target_view: &wgpu::TextureView,
-        target_format: wgpu::TextureFormat,
-        offscreen_copy: Option<&OffscreenTarget>,
-    ) -> Result<FrameStats, RenderError> {
-        if frame.physical_width == 0 || frame.physical_height == 0 {
-            return Err(RenderError::InvalidDimensions {
-                width: frame.physical_width,
-                height: frame.physical_height,
-            });
+fn render_surface_state(
+    shared: &GpuShared,
+    surface: &mut SurfaceState,
+    pass: &mut FramePassResources,
+    frame: &SceneFrame,
+) -> Result<Option<FrameStats>, RenderError> {
+    if frame.physical_width > 0 && frame.physical_height > 0 {
+        let needs_resize = surface.size() != (frame.physical_width, frame.physical_height)
+            || (surface.scale_factor - frame.scale_factor.max(0.5)).abs() > f32::EPSILON;
+        if needs_resize {
+            surface.resize(
+                &shared.ctx.device,
+                frame.physical_width,
+                frame.physical_height,
+                frame.scale_factor,
+            );
+        }
+    }
+
+    let (surface_tex, suboptimal) = match surface.acquire_frame(&shared.ctx.device)? {
+        AcquiredFrame::Ready {
+            texture,
+            suboptimal,
+        } => (texture, suboptimal),
+        AcquiredFrame::Reconfigured => match surface.acquire_frame(&shared.ctx.device)? {
+            AcquiredFrame::Ready {
+                texture,
+                suboptimal,
+            } => (texture, suboptimal),
+            AcquiredFrame::Skipped | AcquiredFrame::Reconfigured => return Ok(None),
+        },
+        AcquiredFrame::Skipped => return Ok(None),
+    };
+
+    // Guard against stale swapchain images whose dimensions lag behind a Hyprland resize.
+    if frame.physical_width > 0
+        && frame.physical_height > 0
+        && (surface_tex.texture.width() != frame.physical_width
+            || surface_tex.texture.height() != frame.physical_height)
+    {
+        drop(surface_tex);
+        surface.resize(
+            &shared.ctx.device,
+            frame.physical_width,
+            frame.physical_height,
+            frame.scale_factor,
+        );
+        return Ok(None);
+    }
+
+    let view = surface_tex
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let format = surface.format();
+    let stats = render_into_view_shared(shared, frame, &view, format, pass, None)?;
+    shared.ctx.queue.present(surface_tex);
+
+    if suboptimal {
+        surface.reconfigure(&shared.ctx.device);
+        return Ok(None);
+    }
+    Ok(Some(stats))
+}
+
+fn render_into_view_shared(
+    shared: &GpuShared,
+    frame: &SceneFrame,
+    target_view: &wgpu::TextureView,
+    target_format: wgpu::TextureFormat,
+    pass_res: &mut FramePassResources,
+    offscreen_copy: Option<&OffscreenTarget>,
+) -> Result<FrameStats, RenderError> {
+    if frame.physical_width == 0 || frame.physical_height == 0 {
+        return Err(RenderError::InvalidDimensions {
+            width: frame.physical_width,
+            height: frame.physical_height,
+        });
+    }
+
+    let t_start = Instant::now();
+    let pipelines = shared.pipeline_for_format(target_format);
+
+    // Strict lock order: `atlas` first, then `images`.
+    let mut atlas = shared.atlas.lock();
+    let mut images = shared.images.lock();
+    images.begin_frame();
+
+    // Flatten all Z-layers into contiguous GPU instance buffers + compact draw commands.
+    pass_res.staged_quads.clear();
+    pass_res.staged_glyphs.clear();
+    pass_res.staged_images.clear();
+    pass_res.staged_commands.clear();
+
+    let scale = frame.scale_factor.max(0.5);
+    for layer in frame.layers.values() {
+        // 1. Quads (backgrounds, rounded cards, borders, shadows, underlines, cursors)
+        if !layer.quads.is_empty() {
+            let start = pass_res.staged_quads.len() as u32;
+            pass_res.staged_quads.extend_from_slice(&layer.quads);
+            let end = pass_res.staged_quads.len() as u32;
+            pass_res
+                .staged_commands
+                .push(DrawCommand::Quads(start..end));
         }
 
-        let t_start = Instant::now();
-        self.images.begin_frame();
-
-        // Ensure pipeline matches target format (e.g. surface Bgra8UnormSrgb vs offscreen Rgba8UnormSrgb).
-        let use_offscreen_pipelines = if self.pipelines.target_format == target_format {
-            false
-        } else {
-            let needs_create = self
-                .offscreen_pipelines
-                .as_ref()
-                .is_none_or(|p| p.target_format != target_format);
-            if needs_create {
-                self.offscreen_pipelines = Some(PipelineSet::new(
-                    &self.ctx.device,
-                    target_format,
-                    &self.globals_bgl,
-                    self.atlas.bind_group_layout(),
-                    self.images.bind_group_layout(),
-                ));
-            }
-            true
-        };
-
-        // Flatten all Z-layers into contiguous GPU instance buffers + compact draw commands.
-        self.staged_quads.clear();
-        self.staged_glyphs.clear();
-        self.staged_images.clear();
-        self.staged_commands.clear();
-
-        let scale = frame.scale_factor.max(0.5);
-        for layer in frame.layers.values() {
-            // 1. Quads (backgrounds, rounded cards, borders, shadows, underlines, cursors)
-            if !layer.quads.is_empty() {
-                let start = self.staged_quads.len() as u32;
-                self.staged_quads.extend_from_slice(&layer.quads);
-                let end = self.staged_quads.len() as u32;
-                self.staged_commands.push(DrawCommand::Quads(start..end));
-            }
-
-            // 2. Textured images (Kitty layers / previews), batched by consecutive image_id
-            if !layer.images.is_empty() {
-                let mut current_batch: Option<(u64, u32)> = None;
-                for img in &layer.images {
-                    if self.images.touch_and_get(img.image_id).is_none() {
-                        continue;
-                    }
-                    let inst = ImageInstance {
-                        bounds: img.bounds.scale(scale).to_array(),
-                        uv_bounds: img.uv_bounds,
-                        clip_rect: img.clip_rect.scale(scale).to_array(),
-                        params: [
-                            img.opacity.clamp(0.0, 1.0),
-                            (img.corner_radius * scale).max(0.0),
-                            0.0,
-                            0.0,
-                        ],
-                    };
-                    match current_batch {
-                        Some((id, _)) if id == img.image_id => {
-                            self.staged_images.push(inst);
-                        }
-                        Some((prev_id, start)) => {
-                            let end = self.staged_images.len() as u32;
-                            self.staged_commands.push(DrawCommand::Images {
-                                image_id: prev_id,
-                                range: start..end,
-                            });
-                            let next_start = self.staged_images.len() as u32;
-                            self.staged_images.push(inst);
-                            current_batch = Some((img.image_id, next_start));
-                        }
-                        None => {
-                            let next_start = self.staged_images.len() as u32;
-                            self.staged_images.push(inst);
-                            current_batch = Some((img.image_id, next_start));
-                        }
-                    }
+        // 2. Textured images (Kitty layers / previews), batched by consecutive image_id
+        if !layer.images.is_empty() {
+            let mut current_batch: Option<(u64, u32)> = None;
+            for img in &layer.images {
+                if images.touch_and_get(img.image_id).is_none() {
+                    continue;
                 }
-                if let Some((prev_id, start)) = current_batch {
-                    let end = self.staged_images.len() as u32;
-                    if end > start {
-                        self.staged_commands.push(DrawCommand::Images {
+                let inst = ImageInstance {
+                    bounds: img.bounds.scale(scale).to_array(),
+                    uv_bounds: img.uv_bounds,
+                    clip_rect: img.clip_rect.scale(scale).to_array(),
+                    params: [
+                        img.opacity.clamp(0.0, 1.0),
+                        (img.corner_radius * scale).max(0.0),
+                        0.0,
+                        0.0,
+                    ],
+                };
+                match current_batch {
+                    Some((id, _)) if id == img.image_id => {
+                        pass_res.staged_images.push(inst);
+                    }
+                    Some((prev_id, start)) => {
+                        let end = pass_res.staged_images.len() as u32;
+                        pass_res.staged_commands.push(DrawCommand::Images {
                             image_id: prev_id,
                             range: start..end,
                         });
+                        let next_start = pass_res.staged_images.len() as u32;
+                        pass_res.staged_images.push(inst);
+                        current_batch = Some((img.image_id, next_start));
+                    }
+                    None => {
+                        let next_start = pass_res.staged_images.len() as u32;
+                        pass_res.staged_images.push(inst);
+                        current_batch = Some((img.image_id, next_start));
                     }
                 }
             }
-
-            // 3. Glyphs (pre-shaped terminal glyphs + UI text runs + cached SVG icons)
-            let glyph_start = self.staged_glyphs.len() as u32;
-            if !layer.raw_glyphs.is_empty() {
-                self.staged_glyphs.extend_from_slice(&layer.raw_glyphs);
-            }
-            for text_run in &layer.text_runs {
-                self.atlas.shape_text_run(
-                    text_run,
-                    scale,
-                    &self.ctx.queue,
-                    &mut self.staged_glyphs,
-                );
-            }
-            for icon in &layer.icons {
-                self.atlas
-                    .emit_icon(icon, scale, &self.ctx.queue, &mut self.staged_glyphs);
-            }
-            let glyph_end = self.staged_glyphs.len() as u32;
-            if glyph_end > glyph_start {
-                self.staged_commands
-                    .push(DrawCommand::Glyphs(glyph_start..glyph_end));
+            if let Some((prev_id, start)) = current_batch {
+                let end = pass_res.staged_images.len() as u32;
+                if end > start {
+                    pass_res.staged_commands.push(DrawCommand::Images {
+                        image_id: prev_id,
+                        range: start..end,
+                    });
+                }
             }
         }
 
-        let t_prepared = Instant::now();
-
-        // Update uniform buffer and upload contiguous instance buffers.
-        let target_is_srgb = target_format.is_srgb();
-        let mut flags = 0u32;
-        if target_is_srgb {
-            flags |= 1;
+        // 3. Glyphs (pre-shaped terminal glyphs + UI text runs + cached SVG icons)
+        let glyph_start = pass_res.staged_glyphs.len() as u32;
+        if !layer.raw_glyphs.is_empty() {
+            pass_res.staged_glyphs.extend_from_slice(&layer.raw_glyphs);
         }
-        if frame.is_light_mode {
-            flags |= 2;
+        for text_run in &layer.text_runs {
+            atlas.shape_text_run(
+                text_run,
+                scale,
+                &shared.ctx.queue,
+                &mut pass_res.staged_glyphs,
+            );
         }
-        let globals = GlobalsUniform {
-            viewport_size: [frame.physical_width as f32, frame.physical_height as f32],
-            scale_factor: scale,
-            flags,
-        };
-        self.ctx
-            .queue
-            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        for icon in &layer.icons {
+            atlas.emit_icon(icon, scale, &shared.ctx.queue, &mut pass_res.staged_glyphs);
+        }
+        let glyph_end = pass_res.staged_glyphs.len() as u32;
+        if glyph_end > glyph_start {
+            pass_res
+                .staged_commands
+                .push(DrawCommand::Glyphs(glyph_start..glyph_end));
+        }
+    }
 
-        self.quad_buffer
-            .upload(&self.ctx.device, &self.ctx.queue, &self.staged_quads);
-        self.glyph_buffer
-            .upload(&self.ctx.device, &self.ctx.queue, &self.staged_glyphs);
-        self.image_buffer
-            .upload(&self.ctx.device, &self.ctx.queue, &self.staged_images);
+    let t_prepared = Instant::now();
 
-        let pipelines = if use_offscreen_pipelines {
-            self.offscreen_pipelines.as_ref().unwrap_or(&self.pipelines)
-        } else {
-            &self.pipelines
-        };
+    // Update uniform buffer and upload contiguous instance buffers.
+    let target_is_srgb = target_format.is_srgb();
+    let mut flags = 0u32;
+    if target_is_srgb {
+        flags |= 1;
+    }
+    if frame.is_light_mode {
+        flags |= 2;
+    }
+    let globals = GlobalsUniform {
+        viewport_size: [frame.physical_width as f32, frame.physical_height as f32],
+        scale_factor: scale,
+        flags,
+    };
+    shared
+        .ctx
+        .queue
+        .write_buffer(&pass_res.globals_buffer, 0, bytemuck::bytes_of(&globals));
 
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("omarex-frame-encoder"),
-            });
+    pass_res.quad_buffer.upload(
+        &shared.ctx.device,
+        &shared.ctx.queue,
+        &pass_res.staged_quads,
+    );
+    pass_res.glyph_buffer.upload(
+        &shared.ctx.device,
+        &shared.ctx.queue,
+        &pass_res.staged_glyphs,
+    );
+    pass_res.image_buffer.upload(
+        &shared.ctx.device,
+        &shared.ctx.queue,
+        &pass_res.staged_images,
+    );
 
-        let mut draw_calls = 0u32;
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("omarex-unified-render-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(frame.clear_color.to_wgpu_clear(target_is_srgb)),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+    let mut encoder = shared
+        .ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("omarex-frame-encoder"),
+        });
 
-            for cmd in &self.staged_commands {
-                match cmd {
-                    DrawCommand::Quads(range) => {
-                        pass.set_pipeline(&pipelines.quad_pipeline);
-                        pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.quad_buffer.slice(self.staged_quads.len()));
-                        pass.draw(0..6, range.clone());
-                        draw_calls += 1;
-                    }
-                    DrawCommand::Glyphs(range) => {
-                        pass.set_pipeline(&pipelines.glyph_pipeline);
-                        pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                        pass.set_bind_group(1, self.atlas.bind_group(), &[]);
+    let mut draw_calls = 0u32;
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("omarex-unified-render-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(frame.clear_color.to_wgpu_clear(target_is_srgb)),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        for cmd in &pass_res.staged_commands {
+            match cmd {
+                DrawCommand::Quads(range) => {
+                    pass.set_pipeline(&pipelines.quad_pipeline);
+                    pass.set_bind_group(0, &pass_res.globals_bind_group, &[]);
+                    pass.set_vertex_buffer(
+                        0,
+                        pass_res.quad_buffer.slice(pass_res.staged_quads.len()),
+                    );
+                    pass.draw(0..6, range.clone());
+                    draw_calls += 1;
+                }
+                DrawCommand::Glyphs(range) => {
+                    pass.set_pipeline(&pipelines.glyph_pipeline);
+                    pass.set_bind_group(0, &pass_res.globals_bind_group, &[]);
+                    pass.set_bind_group(1, atlas.bind_group(), &[]);
+                    pass.set_vertex_buffer(
+                        0,
+                        pass_res.glyph_buffer.slice(pass_res.staged_glyphs.len()),
+                    );
+                    pass.draw(0..6, range.clone());
+                    draw_calls += 1;
+                }
+                DrawCommand::Images { image_id, range } => {
+                    if let Some(cached) = images.get(*image_id) {
+                        pass.set_pipeline(&pipelines.image_pipeline);
+                        pass.set_bind_group(0, &pass_res.globals_bind_group, &[]);
+                        pass.set_bind_group(1, &cached.bind_group, &[]);
                         pass.set_vertex_buffer(
                             0,
-                            self.glyph_buffer.slice(self.staged_glyphs.len()),
+                            pass_res.image_buffer.slice(pass_res.staged_images.len()),
                         );
                         pass.draw(0..6, range.clone());
                         draw_calls += 1;
                     }
-                    DrawCommand::Images { image_id, range } => {
-                        if let Some(cached) = self.images.get(*image_id) {
-                            pass.set_pipeline(&pipelines.image_pipeline);
-                            pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                            pass.set_bind_group(1, &cached.bind_group, &[]);
-                            pass.set_vertex_buffer(
-                                0,
-                                self.image_buffer.slice(self.staged_images.len()),
-                            );
-                            pass.draw(0..6, range.clone());
-                            draw_calls += 1;
-                        }
-                    }
                 }
             }
         }
-
-        if let Some(offscreen) = offscreen_copy {
-            offscreen.encode_copy_to_staging(&mut encoder);
-        }
-
-        self.ctx.queue.submit(Some(encoder.finish()));
-        let t_end = Instant::now();
-
-        Ok(FrameStats {
-            cpu_prepare_us: t_prepared.duration_since(t_start).as_micros() as u64,
-            gpu_encode_submit_us: t_end.duration_since(t_prepared).as_micros() as u64,
-            total_us: t_end.duration_since(t_start).as_micros() as u64,
-            draw_calls,
-            quad_count: self.staged_quads.len() as u32,
-            glyph_count: self.staged_glyphs.len() as u32,
-            image_count: self.staged_images.len() as u32,
-            adapter_name: self.ctx.adapter_summary.name.clone(),
-            backend: self.ctx.adapter_summary.backend,
-        })
     }
+
+    if let Some(offscreen) = offscreen_copy {
+        offscreen.encode_copy_to_staging(&mut encoder);
+    }
+
+    drop(images);
+    drop(atlas);
+
+    shared.ctx.queue.submit(Some(encoder.finish()));
+    let t_end = Instant::now();
+
+    Ok(FrameStats {
+        cpu_prepare_us: t_prepared.duration_since(t_start).as_micros() as u64,
+        gpu_encode_submit_us: t_end.duration_since(t_prepared).as_micros() as u64,
+        total_us: t_end.duration_since(t_start).as_micros() as u64,
+        draw_calls,
+        quad_count: pass_res.staged_quads.len() as u32,
+        glyph_count: pass_res.staged_glyphs.len() as u32,
+        image_count: pass_res.staged_images.len() as u32,
+        adapter_name: shared.ctx.adapter_summary.name.clone(),
+        backend: shared.ctx.adapter_summary.backend,
+    })
 }
 
 #[cfg(test)]
@@ -947,11 +1225,12 @@ mod tests {
                 .expect("upload B")
         );
 
-        assert_eq!(renderer.images().len(), 1);
-        assert!(renderer.images().get(1).is_none());
-        assert!(renderer.images().get(2).is_some());
-        assert_eq!(renderer.images().eviction_count(), 1);
-        assert!(renderer.images().total_vram_bytes() <= renderer.images().max_vram_bytes());
+        let images = renderer.images();
+        assert_eq!(images.len(), 1);
+        assert!(images.get(1).is_none());
+        assert!(images.get(2).is_some());
+        assert_eq!(images.eviction_count(), 1);
+        assert!(images.total_vram_bytes() <= images.max_vram_bytes());
     }
 
     #[test]
@@ -1018,12 +1297,13 @@ mod tests {
         }));
 
         let mut cache = TerminalPaneCache::new();
+        let queue = renderer.queue().clone();
         let mut dl1 = DrawList::new(800, 400, 1.0);
         let stats1 = cache.build_pane(
             &grid,
             &viewport,
-            &mut renderer.atlas,
-            &renderer.ctx.queue,
+            &mut renderer.atlas_mut(),
+            &queue,
             &mut dl1,
         );
         assert_eq!(stats1.rebuilt_rows, 3);
@@ -1037,8 +1317,8 @@ mod tests {
         let stats2 = cache.build_pane(
             &grid,
             &viewport,
-            &mut renderer.atlas,
-            &renderer.ctx.queue,
+            &mut renderer.atlas_mut(),
+            &queue,
             &mut dl2,
         );
         assert_eq!(stats2.rebuilt_rows, 0);
@@ -1051,8 +1331,8 @@ mod tests {
         let stats3 = cache.build_pane(
             &grid,
             &viewport,
-            &mut renderer.atlas,
-            &renderer.ctx.queue,
+            &mut renderer.atlas_mut(),
+            &queue,
             &mut dl3,
         );
         assert_eq!(stats3.rebuilt_rows, 1);
@@ -1092,13 +1372,14 @@ mod tests {
         };
 
         let mut cache = TerminalPaneCache::new();
+        let queue = renderer.queue().clone();
         let mut dl = DrawList::new(800, 480, 1.0);
         let stats = cache
             .build_from_vt_render_state(
                 &mut render_state,
                 &viewport,
-                &mut renderer.atlas,
-                &renderer.ctx.queue,
+                &mut renderer.atlas_mut(),
+                &queue,
                 &mut dl,
             )
             .expect("build from real libghostty-vt RenderState");
@@ -1120,8 +1401,8 @@ mod tests {
             .build_from_vt_render_state(
                 &mut render_state,
                 &viewport,
-                &mut renderer.atlas,
-                &renderer.ctx.queue,
+                &mut renderer.atlas_mut(),
+                &queue,
                 &mut dl2,
             )
             .expect("second build from clean RenderState");
@@ -1169,14 +1450,15 @@ mod tests {
         };
 
         let mut cache = TerminalPaneCache::new();
+        let queue = renderer.queue().clone();
         let mut dl = DrawList::new(400, 140, 1.0);
         dl.set_clear_color(viewport.default_bg);
         let stats = cache
             .build_from_vt_render_state(
                 &mut render_state,
                 &viewport,
-                &mut renderer.atlas,
-                &renderer.ctx.queue,
+                &mut renderer.atlas_mut(),
+                &queue,
                 &mut dl,
             )
             .expect("build inverted VT row");
@@ -1737,13 +2019,8 @@ mod tests {
                 visible: true,
             }));
 
-            cache.build_pane(
-                &grid,
-                &viewport,
-                &mut renderer.atlas,
-                &renderer.ctx.queue,
-                &mut dl,
-            );
+            let queue = renderer.queue().clone();
+            cache.build_pane(&grid, &viewport, &mut renderer.atlas_mut(), &queue, &mut dl);
 
             // --- Embedded Kitty Image Placement (ABOVE_TEXT) ---
             let mut kitty_placements = vec![KittyPlacement {
@@ -2002,5 +2279,162 @@ mod tests {
         renderer.atlas_mut().reset_mono_plane();
         assert_eq!(renderer.atlas().generation(), gen_before + 1);
         assert_eq!(renderer.atlas().reset_count(), 1);
+    }
+
+    #[test]
+    fn terminal_run_shaping_ligatures_preserve_grid_and_row_id_cache() {
+        let mut renderer =
+            GpuRenderer::new_headless(GpuConfig::default()).expect("headless renderer");
+        let line = "fn arrow(a: i32) -> bool { a !== 0 && a => b :: c |> d <!-- --> }";
+
+        for &scale in &[1.0f32, 2.0f32] {
+            let metrics = renderer.atlas_mut().measure_monospace_cell(13.0, scale);
+            let cols = 80u16;
+            let phys_w = (f32::from(cols) * metrics.cell_width * scale).ceil() as u32;
+            let phys_h = (metrics.cell_height * 3.0 * scale).ceil() as u32;
+
+            let viewport = TerminalViewport {
+                rect: Rect::new(
+                    0.0,
+                    0.0,
+                    f32::from(cols) * metrics.cell_width,
+                    metrics.cell_height * 3.0,
+                ),
+                clip_rect: ClipRect::UNBOUNDED,
+                cols,
+                rows: 3,
+                metrics,
+                scroll_offset_y: 0.0,
+                default_bg: Color::from_hex(0x0e0e0e),
+                default_fg: Color::from_hex(0xe8e8e8),
+                selection_bg: Color::from_hex(0x3a4862),
+                selection_fg: None,
+                hyperlink_color: Color::from_hex(0x61afef),
+                dim_alpha: 1.0,
+            };
+
+            let mut snap = TerminalGridSnapshot::new();
+            snap.push_styled_row(
+                100,
+                0,
+                true,
+                [(line, viewport.default_fg, None, CellFlags::NONE)],
+            );
+            snap.push_styled_row(
+                101,
+                1,
+                true,
+                [(
+                    "\u{E0B0}\u{E0D6}\u{E0B6}\u{E0B4} \u{2598}\u{259B}\u{25E2}",
+                    viewport.default_fg,
+                    None,
+                    CellFlags::NONE,
+                )],
+            );
+
+            let mut pane_cache = TerminalPaneCache::new();
+            let queue = renderer.queue().clone();
+            let mut dl1 = DrawList::new(phys_w, phys_h, scale);
+            let s1 = pane_cache.build_pane(
+                &snap,
+                &viewport,
+                &mut renderer.atlas_mut(),
+                &queue,
+                &mut dl1,
+            );
+            assert_eq!(s1.rebuilt_rows, 2);
+            assert!(s1.glyphs > 30);
+
+            let frame1 = dl1.finish();
+            let layer_fg = frame1.layers.get(&layers::TERMINAL_FG).expect("fg layer");
+
+            // Check that 'd' near end of line (after ->, !==, &&, =>, ::, |>) has zero grid drift:
+            // Compare its emitted X against an un-ligated reference line with 'd' at the same column!
+            let d_col = line.find("d <!--").expect("d col") as f32;
+            let cell_w_px = (metrics.cell_width * scale).round().max(1.0);
+            let min_expected_x = d_col * cell_w_px - cell_w_px * 0.5;
+            let max_expected_x = (d_col + 1.5) * cell_w_px;
+            assert!(
+                layer_fg
+                    .raw_glyphs
+                    .iter()
+                    .any(|g| g.bounds[0] >= min_expected_x && g.bounds[0] <= max_expected_x),
+                "expected glyph near column {d_col} (x in {min_expected_x}..{max_expected_x})"
+            );
+
+            let (rgba, _) = renderer
+                .render_to_rgba(&frame1)
+                .expect("render shaped ligature frame");
+            assert!(
+                rgba.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|px| px[0] > 40 || px[1] > 40 || px[2] > 40)
+            );
+
+            // Second clean frame must reuse RowId cache completely (rebuilt_rows == 0).
+            snap.mark_all_clean();
+            let mut dl2 = DrawList::new(phys_w, phys_h, scale);
+            let s2 = pane_cache.build_pane(
+                &snap,
+                &viewport,
+                &mut renderer.atlas_mut(),
+                &queue,
+                &mut dl2,
+            );
+            assert_eq!(s2.rebuilt_rows, 0);
+            assert_eq!(s2.cached_rows, 2);
+            assert_eq!(s2.glyphs, s1.glyphs);
+        }
+    }
+
+    #[test]
+    fn copy_shine_quad_renders_diagonal_sweep_and_fades_out() {
+        let mut renderer =
+            GpuRenderer::new_headless(GpuConfig::default()).expect("headless renderer");
+        let bg = Color::from_hex(0x10141c);
+        let shine_rect = Rect::new(20.0, 20.0, 180.0, 32.0);
+        let shine_color = Color::rgba(0.60, 0.85, 1.0, 0.55);
+
+        let render_at_progress = |renderer: &mut GpuRenderer, progress: Option<f32>| -> Vec<u8> {
+            let mut dl = DrawList::new(240, 80, 1.0);
+            dl.set_clear_color(bg);
+            dl.with_layer(layers::TERMINAL_BG, |dl| {
+                dl.push_rect(Rect::new(0.0, 0.0, 240.0, 80.0), bg);
+            });
+            if let Some(p) = progress {
+                dl.with_layer(layers::KITTY_ABOVE_TEXT + 5, |dl| {
+                    dl.push_copy_shine(shine_rect, CornerRadii::uniform(3.0), shine_color, p);
+                });
+            }
+            let frame = dl.finish();
+            renderer.render_to_rgba(&frame).expect("render shine").0
+        };
+
+        let baseline = render_at_progress(&mut renderer, None);
+        let mid = render_at_progress(&mut renderer, Some(0.50));
+        let ended = render_at_progress(&mut renderer, Some(1.00));
+
+        // Midpoint (progress = 0.5) must brighten pixels inside `shine_rect` vs baseline.
+        let mut max_diff = 0u8;
+        for y in 24..48usize {
+            for x in 24..196usize {
+                let idx = (y * 240 + x) * 4;
+                max_diff = max_diff
+                    .max(mid[idx].saturating_sub(baseline[idx]))
+                    .max(mid[idx + 1].saturating_sub(baseline[idx + 1]))
+                    .max(mid[idx + 2].saturating_sub(baseline[idx + 2]));
+            }
+        }
+        assert!(
+            max_diff >= 30,
+            "expected visible diagonal shine sweep at progress=0.5, max_diff={max_diff}"
+        );
+
+        // At progress = 1.0, shader envelope fades alpha to 0 (identical to baseline).
+        assert_eq!(
+            ended, baseline,
+            "expired shine at progress=1.0 must produce 0 diff"
+        );
     }
 }

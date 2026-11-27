@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
-    Wrap,
+    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Family, FontSystem, Metrics, Shaping,
+    SwashCache, SwashContent, Wrap,
 };
 use etagere::{BucketedAtlasAllocator, size2};
 use tracing::{debug, info, warn};
@@ -74,6 +74,35 @@ struct CachedAsciiGlyph {
     /// Offset from cell baseline in physical pixels (`top` already stored in `entry`).
     x_offset_px: f32,
 }
+
+/// Mapping from a UTF-8 byte offset inside a shaped terminal run back to its grid cell column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapedRunCell {
+    pub byte_start: u32,
+    pub col: u16,
+    pub span_cols: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TerminalRunStyleKey {
+    bold: bool,
+    italic: bool,
+    font_size_bits: u32,
+    cell_w_bits: u32,
+    cell_h_bits: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedTerminalRunGlyph {
+    cluster_byte: u32,
+    px_dx: i32,
+    py_dy: i32,
+    is_rtl: bool,
+    rtl_x_px: f32,
+    entry: AtlasEntry,
+}
+
+const MAX_TERMINAL_RUN_CACHE_ENTRIES: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IconCacheKey {
@@ -249,6 +278,8 @@ pub struct GlyphAtlas {
     glyph_cache: HashMap<CacheKey, Option<AtlasEntry>>,
     ascii_cache: HashMap<AsciiCellKey, CachedAsciiGlyph>,
     box_drawing_cache: HashMap<BoxDrawingKey, Option<AtlasEntry>>,
+    terminal_run_cache: HashMap<TerminalRunStyleKey, HashMap<String, Vec<CachedTerminalRunGlyph>>>,
+    terminal_run_entries: usize,
     shaped_run_cache: HashMap<ShapedRunStyleKey, HashMap<String, Vec<RelativeGlyph>>>,
     shaped_run_entries: usize,
     icon_sources: HashMap<String, Vec<u8>>,
@@ -384,6 +415,8 @@ impl GlyphAtlas {
             glyph_cache: HashMap::with_capacity(512),
             ascii_cache: HashMap::with_capacity(256),
             box_drawing_cache: HashMap::with_capacity(128),
+            terminal_run_cache: HashMap::with_capacity(16),
+            terminal_run_entries: 0,
             shaped_run_cache: HashMap::with_capacity(32),
             shaped_run_entries: 0,
             icon_sources: HashMap::new(),
@@ -430,17 +463,29 @@ impl GlyphAtlas {
 
     /// Overrides the preferred monospace font family (e.g. from Ghostty/Omarchy config).
     pub fn set_mono_family(&mut self, family: impl Into<String>) {
-        self.mono_family = family.into();
+        let family = family.into();
+        if self.mono_family == family {
+            return;
+        }
+        self.mono_family = family;
         self.ascii_cache.clear();
+        self.terminal_run_cache.clear();
+        self.terminal_run_entries = 0;
         self.shaped_run_cache.clear();
         self.shaped_run_entries = 0;
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// Overrides the preferred UI sans-serif font family.
     pub fn set_sans_family(&mut self, family: impl Into<String>) {
-        self.sans_family = family.into();
+        let family = family.into();
+        if self.sans_family == family {
+            return;
+        }
+        self.sans_family = family;
         self.shaped_run_cache.clear();
         self.shaped_run_entries = 0;
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// Registers an SVG document by icon name (overwriting any previous definition).
@@ -567,6 +612,35 @@ impl GlyphAtlas {
             total_h = total_h.max(run.line_top + run.line_height);
         }
         (max_w, total_h.max(line_height))
+    }
+
+    /// Measures exact logical horizontal advance of `text`, including leading/trailing whitespace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn measure_text_advance(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        family: &FontFamily,
+        weight: FontWeight,
+        style: FontStyle,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let with_sentinel = format!("{text}|");
+        let (w_all, _) = self.measure_text(
+            &with_sentinel,
+            font_size,
+            line_height,
+            family,
+            weight,
+            style,
+            None,
+        );
+        let (w_pipe, _) =
+            self.measure_text("|", font_size, line_height, family, weight, style, None);
+        (w_all - w_pipe).max(0.0)
     }
 
     /// Shapes a high-level [`TextRun`] and emits physical-pixel [`GlyphInstance`]s into `out`.
@@ -848,6 +922,230 @@ impl GlyphAtlas {
         }
     }
 
+    /// Emits a crisp procedural box-drawing, block-element, or Powerline glyph at row-local physical coords.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_procedural_terminal_glyph(
+        &mut self,
+        ch: char,
+        cell_x_px: f32,
+        cell_w_px: f32,
+        cell_h_px: f32,
+        color: Color,
+        queue: &wgpu::Queue,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        if let Some(entry) = self.get_or_rasterize_box_drawing(
+            ch,
+            cell_w_px.round().max(1.0) as u32,
+            cell_h_px.round().max(1.0) as u32,
+            queue,
+        ) {
+            out.push(GlyphInstance {
+                bounds: [
+                    cell_x_px.round(),
+                    0.0,
+                    entry.width_px as f32,
+                    entry.height_px as f32,
+                ],
+                uv_bounds: entry.uv_bounds,
+                clip_rect: ClipRect::UNBOUNDED.to_array(),
+                color: color.to_array(),
+                mode: GLYPH_MODE_MONO,
+                _pad: [0; 3],
+            });
+        }
+    }
+
+    /// Shapes a contiguous terminal run (ASCII operator/ligature sequence or complex/non-ASCII run)
+    /// and anchors every glyph cluster back to its exact grid column `col * cell_w_px` so ligatures
+    /// and wide characters produce zero cumulative horizontal drift.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_terminal_shaped_run(
+        &mut self,
+        text: &str,
+        run_cells: &[ShapedRunCell],
+        cell_w_px: f32,
+        cell_h_px: f32,
+        baseline_y_px: f32,
+        font_size_px: f32,
+        bold: bool,
+        italic: bool,
+        color: Color,
+        queue: &wgpu::Queue,
+        out: &mut Vec<GlyphInstance>,
+    ) {
+        if text.is_empty() || run_cells.is_empty() {
+            return;
+        }
+        let style_key = TerminalRunStyleKey {
+            bold,
+            italic,
+            font_size_bits: font_size_px.to_bits(),
+            cell_w_bits: cell_w_px.to_bits(),
+            cell_h_bits: cell_h_px.to_bits(),
+        };
+
+        if let Some(cached) = self
+            .terminal_run_cache
+            .get(&style_key)
+            .and_then(|bucket| bucket.get(text))
+        {
+            emit_cached_terminal_run(cached, run_cells, cell_w_px, baseline_y_px, color, out);
+            return;
+        }
+
+        let family =
+            resolve_cosmic_family(&self.mono_family, &self.sans_family, &FontFamily::Monospace);
+        let weight = if bold {
+            cosmic_text::Weight::BOLD
+        } else {
+            cosmic_text::Weight::NORMAL
+        };
+        let style = if italic {
+            cosmic_text::Style::Italic
+        } else {
+            cosmic_text::Style::Normal
+        };
+
+        let mut shaped_keys: Vec<(u32, i32, i32, bool, f32, CacheKey)> = Vec::new();
+        let mut shaped_via_harfrust = false;
+
+        // Fast HarfBuzz path directly via `cosmic_text::harfrust` for contiguous ASCII operator runs
+        // (`->`, `=>`, `!==`, `===`, `::`, `|>`, `<!--`, etc.), avoiding `unicode_linebreak` splitting.
+        if text.is_ascii()
+            && let Some(font_id) = self.font_system.db().query(&cosmic_text::fontdb::Query {
+                families: &[family, Family::Monospace],
+                weight,
+                stretch: cosmic_text::Stretch::Normal,
+                style,
+            })
+            && let Some(font) = self.font_system.get_font(font_id, weight)
+        {
+            let mut flags = CacheKeyFlags::empty();
+            if italic
+                && self
+                    .font_system
+                    .db()
+                    .face(font_id)
+                    .is_some_and(|f| f.style == cosmic_text::Style::Normal)
+            {
+                flags |= CacheKeyFlags::FAKE_ITALIC;
+            }
+
+            let mut hb_buf = cosmic_text::harfrust::UnicodeBuffer::new();
+            hb_buf.push_str(text);
+            hb_buf.guess_segment_properties();
+            let glyph_buf = font.shaper().shape(hb_buf, &[]);
+            let infos = glyph_buf.glyph_infos();
+            let positions = glyph_buf.glyph_positions();
+
+            if !infos.is_empty()
+                && infos
+                    .iter()
+                    .all(|info| info.glyph_id != 0 && u16::try_from(info.glyph_id).is_ok())
+            {
+                let upem = f32::from(font.metrics().units_per_em).max(1.0);
+                let scale_em = font_size_px / upem;
+                let mut pen_x_px = 0.0f32;
+                let mut prev_cluster: Option<u32> = None;
+                let mut cluster_base_x = 0.0f32;
+
+                shaped_keys.reserve(infos.len());
+                for (info, pos) in infos.iter().zip(positions.iter()) {
+                    if prev_cluster != Some(info.cluster) {
+                        prev_cluster = Some(info.cluster);
+                        cluster_base_x = pen_x_px;
+                    }
+                    let dx_px = (pen_x_px - cluster_base_x) + (pos.x_offset as f32) * scale_em;
+                    let dy_px = (pos.y_offset as f32) * scale_em;
+                    pen_x_px += (pos.x_advance as f32) * scale_em;
+
+                    let (cache_key, px_dx, py_dy) = CacheKey::new(
+                        font.id(),
+                        info.glyph_id as u16,
+                        font_size_px,
+                        (dx_px, -dy_px),
+                        weight,
+                        flags,
+                    );
+                    shaped_keys.push((info.cluster, px_dx, py_dy, false, 0.0, cache_key));
+                }
+                shaped_via_harfrust = true;
+            }
+        }
+
+        // Complex / non-ASCII / fallback path via `cosmic_text::Buffer` (`Shaping::Advanced`).
+        if !shaped_via_harfrust {
+            let attrs = Attrs::new().family(family).weight(weight).style(style);
+            self.scratch_buffer
+                .set_metrics(Metrics::new(font_size_px, cell_h_px.max(font_size_px)));
+            self.scratch_buffer.set_size(None, None);
+            self.scratch_buffer.set_wrap(Wrap::None);
+            self.scratch_buffer
+                .set_text(text, &attrs, Shaping::Advanced, None);
+            self.scratch_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+
+            for run in self.scratch_buffer.layout_runs() {
+                let mut prev_start: Option<usize> = None;
+                let mut cluster_base_x = 0.0f32;
+                for g in run.glyphs {
+                    let is_rtl = g.level.is_rtl();
+                    if is_rtl {
+                        let phys = g.physical((0.0, 0.0), 1.0);
+                        let rtl_x = g.x + g.font_size * g.x_offset;
+                        shaped_keys.push((g.start as u32, 0, phys.y, true, rtl_x, phys.cache_key));
+                    } else {
+                        if prev_start != Some(g.start) {
+                            prev_start = Some(g.start);
+                            cluster_base_x = g.x;
+                        }
+                        let dx_px = (g.x - cluster_base_x) + g.font_size * g.x_offset;
+                        let dy_px = g.font_size * g.y_offset;
+                        let (cache_key, px_dx, py_dy) = CacheKey::new(
+                            g.font_id,
+                            g.glyph_id,
+                            g.font_size,
+                            (dx_px, -dy_px),
+                            g.font_weight,
+                            g.cache_key_flags,
+                        );
+                        shaped_keys.push((g.start as u32, px_dx, py_dy, false, 0.0, cache_key));
+                    }
+                }
+            }
+        }
+
+        let gen_before = self.generation;
+        let mut cached_run = Vec::with_capacity(shaped_keys.len());
+        for (cluster_byte, px_dx, py_dy, is_rtl, rtl_x_px, cache_key) in shaped_keys {
+            if let Some(entry) = self.get_or_rasterize_glyph(cache_key, queue) {
+                cached_run.push(CachedTerminalRunGlyph {
+                    cluster_byte,
+                    px_dx,
+                    py_dy,
+                    is_rtl,
+                    rtl_x_px,
+                    entry,
+                });
+            }
+        }
+
+        emit_cached_terminal_run(&cached_run, run_cells, cell_w_px, baseline_y_px, color, out);
+
+        if self.generation == gen_before {
+            if self.terminal_run_entries >= MAX_TERMINAL_RUN_CACHE_ENTRIES {
+                self.terminal_run_cache.clear();
+                self.terminal_run_entries = 0;
+            }
+            self.terminal_run_cache
+                .entry(style_key)
+                .or_default()
+                .insert(text.to_owned(), cached_run);
+            self.terminal_run_entries += 1;
+        }
+    }
+
     /// Shapes an arbitrary terminal grapheme cluster or ligature span at row-local physical coords.
     ///
     /// Uses crisp procedural geometric rasterization for box-drawing (`U+2500..=U+257F`) and
@@ -888,27 +1186,10 @@ impl GlyphAtlas {
                 );
                 return;
             }
-            if is_procedural_box_or_block(ch)
-                && let Some(entry) = self.get_or_rasterize_box_drawing(
-                    ch,
-                    cell_w_px.round().max(1.0) as u32,
-                    cell_h_px.round().max(1.0) as u32,
-                    queue,
-                )
-            {
-                out.push(GlyphInstance {
-                    bounds: [
-                        cell_x_px.round(),
-                        0.0,
-                        entry.width_px as f32,
-                        entry.height_px as f32,
-                    ],
-                    uv_bounds: entry.uv_bounds,
-                    clip_rect: ClipRect::UNBOUNDED.to_array(),
-                    color: color.to_array(),
-                    mode: GLYPH_MODE_MONO,
-                    _pad: [0; 3],
-                });
+            if is_procedural_box_or_block(ch) {
+                self.emit_procedural_terminal_glyph(
+                    ch, cell_x_px, cell_w_px, cell_h_px, color, queue, out,
+                );
                 return;
             }
         }
@@ -1154,6 +1435,8 @@ impl GlyphAtlas {
             .retain(|_, v| v.is_some_and(|entry| entry.is_color));
         self.ascii_cache.clear();
         self.box_drawing_cache.clear();
+        self.terminal_run_cache.clear();
+        self.terminal_run_entries = 0;
         self.shaped_run_cache.clear();
         self.shaped_run_entries = 0;
         self.icon_cache.retain(|k, _| !k.mono_mask);
@@ -1165,6 +1448,8 @@ impl GlyphAtlas {
         self.color_plane.clear();
         self.glyph_cache
             .retain(|_, v| v.is_some_and(|entry| !entry.is_color));
+        self.terminal_run_cache.clear();
+        self.terminal_run_entries = 0;
         self.shaped_run_cache.clear();
         self.shaped_run_entries = 0;
         self.icon_cache.retain(|k, _| k.mono_mask);
@@ -1207,6 +1492,44 @@ impl GlyphAtlas {
             self.icon_sources
                 .insert(name.to_owned(), svg.as_bytes().to_vec());
         }
+    }
+}
+
+fn emit_cached_terminal_run(
+    cached: &[CachedTerminalRunGlyph],
+    run_cells: &[ShapedRunCell],
+    cell_w_px: f32,
+    baseline_y_px: f32,
+    color: Color,
+    out: &mut Vec<GlyphInstance>,
+) {
+    let base_y = baseline_y_px.round() as i32;
+    let start_col_x = f32::from(run_cells[0].col) * cell_w_px;
+    let color_arr = color.to_array();
+    out.reserve(cached.len());
+    for g in cached {
+        let anchor_x_px = if g.is_rtl {
+            (start_col_x + g.rtl_x_px).round() as i32
+        } else {
+            let idx = run_cells
+                .partition_point(|c| c.byte_start <= g.cluster_byte)
+                .saturating_sub(1);
+            (f32::from(run_cells[idx].col) * cell_w_px).round() as i32 + g.px_dx
+        };
+        let x = (anchor_x_px + g.entry.left_px) as f32;
+        let y = (base_y + g.py_dy - g.entry.top_px) as f32;
+        out.push(GlyphInstance {
+            bounds: [x, y, g.entry.width_px as f32, g.entry.height_px as f32],
+            uv_bounds: g.entry.uv_bounds,
+            clip_rect: ClipRect::UNBOUNDED.to_array(),
+            color: color_arr,
+            mode: if g.entry.is_color {
+                GLYPH_MODE_COLOR
+            } else {
+                GLYPH_MODE_MONO
+            },
+            _pad: [0; 3],
+        });
     }
 }
 
@@ -1331,7 +1654,7 @@ fn has_family(font_system: &FontSystem, target: &str) -> bool {
     })
 }
 
-/// Returns `true` if `ch` is handled by our crisp procedural box-drawing / block-element rasterizer.
+/// Returns `true` if `ch` is handled by our crisp procedural box-drawing / block-element / Powerline rasterizer.
 pub fn is_procedural_box_or_block(ch: char) -> bool {
     matches!(
         ch,
@@ -1381,6 +1704,16 @@ pub fn is_procedural_box_or_block(ch: char) -> bool {
             | '▓'
             | '▁'..='▇'
             | '▉'..='▏'
+            | '▔'
+            | '▕'
+            | '▖'..='▟'
+            | '◢'..='◥'
+            | '\u{E0B0}'..='\u{E0C8}'
+            | '\u{E0CA}'
+            | '\u{E0CC}'..='\u{E0D2}'
+            | '\u{E0D4}'
+            | '\u{E0D6}'
+            | '\u{E0D7}'
     )
 }
 
@@ -1453,6 +1786,67 @@ fn rasterize_box_or_block_mask(ch: char, w: u32, h: u32) -> Option<Vec<u8>> {
             let bar_w = ((w * eighths) + 4) / 8;
             fill_rect(&mut buf, 0, 0, bar_w, h, 255);
             return Some(buf);
+        }
+        '▔' => {
+            let bar_h = ((h + 4) / 8).max(1);
+            fill_rect(&mut buf, 0, 0, w, bar_h, 255);
+            return Some(buf);
+        }
+        '▕' => {
+            let bar_w = ((w + 4) / 8).max(1);
+            fill_rect(&mut buf, w.saturating_sub(bar_w), 0, w, h, 255);
+            return Some(buf);
+        }
+        '▖'..='▟' => {
+            let hw = w / 2;
+            let hh = h / 2;
+            let (tl, tr, bl, br) = match ch {
+                '▖' => (false, false, true, false),
+                '▗' => (false, false, false, true),
+                '▘' => (true, false, false, false),
+                '▙' => (true, false, true, true),
+                '▚' => (true, false, false, true),
+                '▛' => (true, true, true, false),
+                '▜' => (true, true, false, true),
+                '▝' => (false, true, false, false),
+                '▞' => (false, true, true, false),
+                _ => (false, true, true, true), // '▟'
+            };
+            if tl {
+                fill_rect(&mut buf, 0, 0, hw, hh, 255);
+            }
+            if tr {
+                fill_rect(&mut buf, hw, 0, w, hh, 255);
+            }
+            if bl {
+                fill_rect(&mut buf, 0, hh, hw, h, 255);
+            }
+            if br {
+                fill_rect(&mut buf, hw, hh, w, h, 255);
+            }
+            return Some(buf);
+        }
+        '◢' | '◣' | '◤' | '◥' => {
+            let wf = w as f32;
+            let hf = h as f32;
+            let verts = match ch {
+                '◢' => [(wf, 0.0), (wf, hf), (0.0, hf)],
+                '◣' => [(0.0, 0.0), (wf, hf), (0.0, hf)],
+                '◤' => [(0.0, 0.0), (wf, 0.0), (0.0, hf)],
+                _ => [(0.0, 0.0), (wf, 0.0), (wf, hf)],
+            };
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                (0.5 - sd_polygon((px, py), &verts)).clamp(0.0, 1.0)
+            });
+            return Some(buf);
+        }
+        '\u{E0B0}'..='\u{E0C8}'
+        | '\u{E0CA}'
+        | '\u{E0CC}'..='\u{E0D2}'
+        | '\u{E0D4}'
+        | '\u{E0D6}'
+        | '\u{E0D7}' => {
+            return Some(rasterize_powerline_mask(ch, w, h));
         }
         _ => {}
     }
@@ -1688,4 +2082,402 @@ fn rasterize_box_or_block_mask(ch: char, w: u32, h: u32) -> Option<Vec<u8>> {
     }
 
     Some(buf)
+}
+
+#[inline]
+fn rasterize_sdf_mask(buf: &mut [u8], w: u32, h: u32, mut cov_fn: impl FnMut(f32, f32) -> f32) {
+    for y in 0..h {
+        let py = y as f32 + 0.5;
+        let row = (y * w) as usize;
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            let cov = cov_fn(px, py).clamp(0.0, 1.0);
+            buf[row + x as usize] = (cov * 255.0).round() as u8;
+        }
+    }
+}
+
+#[inline]
+fn sd_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let pax = p.0 - a.0;
+    let pay = p.1 - a.1;
+    let bax = b.0 - a.0;
+    let bay = b.1 - a.1;
+    let denom = (bax * bax + bay * bay).max(1e-6);
+    let h = ((pax * bax + pay * bay) / denom).clamp(0.0, 1.0);
+    (pax - bax * h).hypot(pay - bay * h)
+}
+
+fn sd_polygon(p: (f32, f32), verts: &[(f32, f32)]) -> f32 {
+    let n = verts.len();
+    let mut d = (p.0 - verts[0].0) * (p.0 - verts[0].0) + (p.1 - verts[0].1) * (p.1 - verts[0].1);
+    let mut s = 1.0f32;
+    for i in 0..n {
+        let j = if i == 0 { n - 1 } else { i - 1 };
+        let vi = verts[i];
+        let vj = verts[j];
+        let ex = vj.0 - vi.0;
+        let ey = vj.1 - vi.1;
+        let wx = p.0 - vi.0;
+        let wy = p.1 - vi.1;
+        let denom = (ex * ex + ey * ey).max(1e-6);
+        let t = ((wx * ex + wy * ey) / denom).clamp(0.0, 1.0);
+        let bx = wx - ex * t;
+        let by = wy - ey * t;
+        d = d.min(bx * bx + by * by);
+        let c0 = p.1 >= vi.1;
+        let c1 = p.1 < vj.1;
+        let c2 = ex * wy > ey * wx;
+        if (c0 && c1 && c2) || (!c0 && !c1 && !c2) {
+            s = -s;
+        }
+    }
+    s * d.sqrt()
+}
+
+#[inline]
+fn sd_ellipse(p: (f32, f32), center: (f32, f32), rx: f32, ry: f32) -> f32 {
+    let rx = rx.max(1e-3);
+    let ry = ry.max(1e-3);
+    let dx = (p.0 - center.0).abs();
+    let dy = (p.1 - center.1).abs();
+    let len = (dx / rx).hypot(dy / ry);
+    if len < 1e-4 {
+        return -rx.min(ry);
+    }
+    (len - 1.0) * (rx * ry) / ((dy * rx).hypot(dx * ry).max(1e-4))
+}
+
+#[inline]
+fn sd_box(p: (f32, f32), center: (f32, f32), half_w: f32, half_h: f32) -> f32 {
+    let dx = (p.0 - center.0).abs() - half_w;
+    let dy = (p.1 - center.1).abs() - half_h;
+    dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0)
+}
+
+#[inline]
+fn sd_hexagon(p: (f32, f32), center: (f32, f32), r: f32) -> f32 {
+    // Pointy-top regular hexagon SDF.
+    let mut px = (p.0 - center.0).abs();
+    let mut py = (p.1 - center.1).abs();
+    let kx = -0.866_025_4_f32;
+    let ky = 0.5_f32;
+    let kz = 0.577_350_26_f32;
+    let dot = 2.0 * (kx * px + ky * py).min(0.0);
+    px -= dot * kx;
+    py -= dot * ky;
+    px -= px.clamp(-kz * r, kz * r);
+    py -= r;
+    px.hypot(py) * py.signum()
+}
+
+fn rasterize_powerline_mask(ch: char, w: u32, h: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; (w * h) as usize];
+    let wf = w as f32;
+    let hf = h as f32;
+    let stroke = (wf.min(hf) * 0.12).max(1.0);
+    let half_stroke = stroke * 0.5 + 0.5;
+
+    match ch {
+        // Exact complementary inverse hard dividers (`E0D6` complements `E0B0`, `E0D7` complements `E0B2`).
+        '\u{E0D6}' => {
+            let base = rasterize_powerline_mask('\u{E0B0}', w, h);
+            for (dst, src) in buf.iter_mut().zip(base.iter()) {
+                *dst = 255 - *src;
+            }
+            return buf;
+        }
+        '\u{E0D7}' => {
+            let base = rasterize_powerline_mask('\u{E0B2}', w, h);
+            for (dst, src) in buf.iter_mut().zip(base.iter()) {
+                *dst = 255 - *src;
+            }
+            return buf;
+        }
+        // Hard triangles (`E0B0`, `E0B2`)
+        '\u{E0B0}' | '\u{E0B2}' => {
+            let mirror = ch == '\u{E0B2}';
+            let verts = [(0.0, 0.0), (wf, hf * 0.5), (0.0, hf)];
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let x = if mirror { wf - px } else { px };
+                (0.5 - sd_polygon((x, py), &verts)).clamp(0.0, 1.0)
+            });
+        }
+        // Soft chevrons (`E0B1`, `E0B3`)
+        '\u{E0B1}' | '\u{E0B3}' => {
+            let mirror = ch == '\u{E0B3}';
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let x = if mirror { wf - px } else { px };
+                let d1 = sd_segment((x, py), (0.0, 0.0), (wf, hf * 0.5));
+                let d2 = sd_segment((x, py), (wf, hf * 0.5), (0.0, hf));
+                (half_stroke - d1.min(d2)).clamp(0.0, 1.0)
+            });
+        }
+        // Half circles (`E0B4`..=`E0B7`)
+        '\u{E0B4}' | '\u{E0B5}' | '\u{E0B6}' | '\u{E0B7}' => {
+            let left_side = matches!(ch, '\u{E0B6}' | '\u{E0B7}');
+            let thin = matches!(ch, '\u{E0B5}' | '\u{E0B7}');
+            let center = (if left_side { wf } else { 0.0 }, hf * 0.5);
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let sdf = sd_ellipse((px, py), center, wf, hf * 0.5);
+                if thin {
+                    (half_stroke - sdf.abs()).clamp(0.0, 1.0)
+                } else {
+                    (0.5 - sdf).clamp(0.0, 1.0)
+                }
+            });
+        }
+        // Corner triangles & diagonal slashes (`E0B8`..=`E0BF`)
+        '\u{E0B8}' | '\u{E0BA}' | '\u{E0BC}' | '\u{E0BE}' => {
+            let verts = match ch {
+                '\u{E0B8}' => [(0.0, 0.0), (wf, hf), (0.0, hf)],
+                '\u{E0BA}' => [(wf, 0.0), (wf, hf), (0.0, hf)],
+                '\u{E0BC}' => [(0.0, 0.0), (wf, 0.0), (0.0, hf)],
+                _ => [(0.0, 0.0), (wf, 0.0), (wf, hf)],
+            };
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                (0.5 - sd_polygon((px, py), &verts)).clamp(0.0, 1.0)
+            });
+        }
+        '\u{E0B9}' | '\u{E0BF}' => {
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let d = sd_segment((px, py), (0.0, 0.0), (wf, hf));
+                (half_stroke - d).clamp(0.0, 1.0)
+            });
+        }
+        '\u{E0BB}' | '\u{E0BD}' => {
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let d = sd_segment((px, py), (wf, 0.0), (0.0, hf));
+                (half_stroke - d).clamp(0.0, 1.0)
+            });
+        }
+        // Flames (`E0C0`..=`E0C3`)
+        '\u{E0C0}' | '\u{E0C1}' | '\u{E0C2}' | '\u{E0C3}' => {
+            let mirror = matches!(ch, '\u{E0C2}' | '\u{E0C3}');
+            let thin = matches!(ch, '\u{E0C1}' | '\u{E0C3}');
+            let verts = [
+                (0.0, 0.0),
+                (wf * 0.58, hf * 0.06),
+                (wf * 0.88, hf * 0.17),
+                (wf * 0.44, hf * 0.29),
+                (wf * 0.98, hf * 0.45),
+                (wf * 0.56, hf * 0.58),
+                (wf * 0.90, hf * 0.74),
+                (wf * 0.48, hf * 0.86),
+                (wf * 0.66, hf * 0.96),
+                (0.0, hf),
+            ];
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let x = if mirror { wf - px } else { px };
+                let sdf = sd_polygon((x, py), &verts);
+                if thin {
+                    (half_stroke - sdf.abs()).clamp(0.0, 1.0)
+                } else {
+                    (0.5 - sdf).clamp(0.0, 1.0)
+                }
+            });
+        }
+        // Pixelated squares (`E0C4`..=`E0C7`)
+        '\u{E0C4}' | '\u{E0C5}' => {
+            let mirror = ch == '\u{E0C5}';
+            for y in 0..h {
+                let row = ((y * 8) / h.max(1)).min(7);
+                let out_row = (y * w) as usize;
+                for x in 0..w {
+                    let col_raw = ((x * 4) / w.max(1)).min(3);
+                    let col = if mirror { 3 - col_raw } else { col_raw };
+                    let on = match col {
+                        0 => true,
+                        1 => row.is_multiple_of(2) || row.is_multiple_of(3),
+                        2 => (row + 1).is_multiple_of(2),
+                        _ => row % 4 == 1,
+                    };
+                    if on {
+                        buf[out_row + x as usize] = 255;
+                    }
+                }
+            }
+        }
+        '\u{E0C6}' | '\u{E0C7}' => {
+            let mirror = ch == '\u{E0C7}';
+            for y in 0..h {
+                let row = ((y * 4) / h.max(1)).min(3);
+                let out_row = (y * w) as usize;
+                for x in 0..w {
+                    let col_raw = ((x * 2) / w.max(1)).min(1);
+                    let col = if mirror { 1 - col_raw } else { col_raw };
+                    let on = col == 0 || row.is_multiple_of(2);
+                    if on {
+                        buf[out_row + x as usize] = 255;
+                    }
+                }
+            }
+        }
+        // Ice waveform (`E0C8`, `E0CA`)
+        '\u{E0C8}' | '\u{E0CA}' => {
+            let mirror = ch == '\u{E0CA}';
+            let verts = [
+                (0.0, 0.0),
+                (wf * 0.85, hf * 0.14),
+                (wf * 0.45, hf * 0.28),
+                (wf, hf * 0.46),
+                (wf * 0.50, hf * 0.64),
+                (wf * 0.90, hf * 0.82),
+                (0.0, hf),
+            ];
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let x = if mirror { wf - px } else { px };
+                (0.5 - sd_polygon((x, py), &verts)).clamp(0.0, 1.0)
+            });
+        }
+        // Honeycomb (`E0CC` filled, `E0CD` outline)
+        '\u{E0CC}' | '\u{E0CD}' => {
+            let outline = ch == '\u{E0CD}';
+            let r = (wf * 0.34).min(hf * 0.22).max(1.5);
+            let c1 = (wf * 0.32, hf * 0.25);
+            let c2 = (wf * 0.68, hf * 0.50);
+            let c3 = (wf * 0.32, hf * 0.75);
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let d = sd_hexagon((px, py), c1, r)
+                    .min(sd_hexagon((px, py), c2, r))
+                    .min(sd_hexagon((px, py), c3, r));
+                if outline {
+                    (half_stroke - d.abs()).clamp(0.0, 1.0)
+                } else {
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+            });
+        }
+        // Lego separator & bricks (`E0CE`..=`E0D1`)
+        '\u{E0CE}' | '\u{E0CF}' => {
+            let outline = ch == '\u{E0CF}';
+            let verts = [
+                (0.0, 0.0),
+                (wf * 0.62, 0.0),
+                (wf * 0.62, hf * 0.16),
+                (wf, hf * 0.16),
+                (wf, hf * 0.38),
+                (wf * 0.62, hf * 0.38),
+                (wf * 0.62, hf * 0.62),
+                (wf, hf * 0.62),
+                (wf, hf * 0.84),
+                (wf * 0.62, hf * 0.84),
+                (wf * 0.62, hf),
+                (0.0, hf),
+            ];
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let d = sd_polygon((px, py), &verts);
+                if outline {
+                    (half_stroke - d.abs()).clamp(0.0, 1.0)
+                } else {
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+            });
+        }
+        '\u{E0D0}' => {
+            // Facing Lego block with 2 circular studs
+            let r = (wf.min(hf) * 0.18).max(1.2);
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let outer = sd_box((px, py), (wf * 0.5, hf * 0.5), wf * 0.44, hf * 0.42);
+                let border = (half_stroke - outer.abs()).clamp(0.0, 1.0);
+                let s1 = ((px - wf * 0.5).hypot(py - hf * 0.30) - r).abs();
+                let s2 = ((px - wf * 0.5).hypot(py - hf * 0.70) - r).abs();
+                let studs = (half_stroke - s1.min(s2)).clamp(0.0, 1.0);
+                border.max(studs)
+            });
+        }
+        '\u{E0D1}' => {
+            // Sideways Lego block with left base and 2 projecting studs
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let body = sd_box((px, py), (wf * 0.32, hf * 0.5), wf * 0.26, hf * 0.42);
+                let stud1 = sd_box((px, py), (wf * 0.74, hf * 0.28), wf * 0.18, hf * 0.12);
+                let stud2 = sd_box((px, py), (wf * 0.74, hf * 0.72), wf * 0.18, hf * 0.12);
+                (0.5 - body.min(stud1).min(stud2)).clamp(0.0, 1.0)
+            });
+        }
+        // Trapezoid arrows (`E0D2`, `E0D4`)
+        '\u{E0D2}' | '\u{E0D4}' => {
+            let mirror = ch == '\u{E0D4}';
+            let verts = [
+                (0.0, 0.0),
+                (wf * 0.62, 0.0),
+                (wf, hf * 0.5),
+                (wf * 0.62, hf),
+                (0.0, hf),
+            ];
+            rasterize_sdf_mask(&mut buf, w, h, |px, py| {
+                let x = if mirror { wf - px } else { px };
+                (0.5 - sd_polygon((x, py), &verts)).clamp(0.0, 1.0)
+            });
+        }
+        _ => {}
+    }
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procedural_powerline_and_blocks_flush_to_cell_edges_and_complements() {
+        let valid_powerline: &[char] = &[
+            '\u{E0B0}', '\u{E0B1}', '\u{E0B2}', '\u{E0B3}', '\u{E0B4}', '\u{E0B5}', '\u{E0B6}',
+            '\u{E0B7}', '\u{E0B8}', '\u{E0B9}', '\u{E0BA}', '\u{E0BB}', '\u{E0BC}', '\u{E0BD}',
+            '\u{E0BE}', '\u{E0BF}', '\u{E0C0}', '\u{E0C1}', '\u{E0C2}', '\u{E0C3}', '\u{E0C4}',
+            '\u{E0C5}', '\u{E0C6}', '\u{E0C7}', '\u{E0C8}', '\u{E0CA}', '\u{E0CC}', '\u{E0CD}',
+            '\u{E0CE}', '\u{E0CF}', '\u{E0D0}', '\u{E0D1}', '\u{E0D2}', '\u{E0D4}', '\u{E0D6}',
+            '\u{E0D7}',
+        ];
+        assert_eq!(valid_powerline.len(), 36);
+        for &ch in valid_powerline {
+            assert!(
+                is_procedural_box_or_block(ch),
+                "expected Powerline U+{:04X} to be procedural",
+                ch as u32
+            );
+        }
+        for &unassigned in &['\u{E0C9}', '\u{E0CB}', '\u{E0D3}', '\u{E0D5}'] {
+            assert!(
+                !is_procedural_box_or_block(unassigned),
+                "unassigned U+{:04X} must NOT be intercepted",
+                unassigned as u32
+            );
+        }
+
+        for &(w, h) in &[(8u32, 18u32), (15u32, 32u32)] {
+            for &ch in valid_powerline {
+                let mask = rasterize_box_or_block_mask(ch, w, h)
+                    .unwrap_or_else(|| panic!("missing mask for U+{:04X}", ch as u32));
+                assert_eq!(mask.len(), (w * h) as usize);
+                assert!(
+                    mask.iter().any(|&v| v > 0),
+                    "blank mask for U+{:04X} at {w}x{h}",
+                    ch as u32
+                );
+            }
+
+            // Verify flush left edge on E0B0 and right edge on E0B2 at middle row.
+            let m_e0b0 = rasterize_box_or_block_mask('\u{E0B0}', w, h).unwrap();
+            let m_e0b2 = rasterize_box_or_block_mask('\u{E0B2}', w, h).unwrap();
+            let mid_y = (h / 2) as usize;
+            assert_eq!(m_e0b0[mid_y * w as usize], 255);
+            assert_eq!(m_e0b2[mid_y * w as usize + (w as usize - 1)], 255);
+
+            // Verify exact pixel complements for E0B0+E0D6 and E0B2+E0D7.
+            let m_e0d6 = rasterize_box_or_block_mask('\u{E0D6}', w, h).unwrap();
+            let m_e0d7 = rasterize_box_or_block_mask('\u{E0D7}', w, h).unwrap();
+            for i in 0..(w * h) as usize {
+                assert_eq!(u16::from(m_e0b0[i]) + u16::from(m_e0d6[i]), 255);
+                assert_eq!(u16::from(m_e0b2[i]) + u16::from(m_e0d7[i]), 255);
+            }
+
+            // Extra blocks & corner triangles
+            for ch in ('\u{2594}'..='\u{259F}').chain('\u{25E2}'..='\u{25E5}') {
+                assert!(is_procedural_box_or_block(ch));
+                let mask = rasterize_box_or_block_mask(ch, w, h).unwrap();
+                assert!(mask.contains(&255));
+            }
+        }
+    }
 }

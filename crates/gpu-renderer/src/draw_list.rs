@@ -359,6 +359,7 @@ impl QuadInstance {
     pub const MODE_CURLY_UNDERLINE: f32 = -1.0;
     pub const MODE_DOTTED_UNDERLINE: f32 = -2.0;
     pub const MODE_DASHED_UNDERLINE: f32 = -3.0;
+    pub const MODE_SHINE: f32 = -4.0;
 
     /// Constructs a solid or bordered rounded rectangle in physical pixel space.
     #[inline]
@@ -470,6 +471,32 @@ impl QuadInstance {
                 Self::MODE_DASHED_UNDERLINE,
                 period.max(6.0),
                 0.0,
+            ],
+        }
+    }
+
+    /// Constructs a diagonal GPU copy-shine sweep in physical pixel space.
+    #[inline]
+    pub fn copy_shine(
+        bounds: [f32; 4],
+        clip_rect: [f32; 4],
+        color: Color,
+        corner_radii: [f32; 4],
+        progress: f32,
+        band_width: f32,
+        tilt: f32,
+    ) -> Self {
+        Self {
+            bounds,
+            clip_rect,
+            fill_color: color.to_array(),
+            border_color: [0.0; 4],
+            corner_radii,
+            params: [
+                band_width.clamp(0.08, 1.0),
+                Self::MODE_SHINE,
+                progress.clamp(0.0, 1.0),
+                tilt.max(0.0),
             ],
         }
     }
@@ -887,6 +914,25 @@ impl DrawList {
             thickness * s,
             wavelength * s,
             amplitude * s,
+        );
+        self.layer_mut().quads.push(quad);
+    }
+
+    /// Pushes a 220 ms diagonal GPU shine sweep quad over copied text (logical pixels).
+    pub fn push_copy_shine(&mut self, rect: Rect, radii: CornerRadii, color: Color, progress: f32) {
+        let clip = self.current_clip();
+        if clip.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 || color.a <= 0.001 {
+            return;
+        }
+        let s = self.scale_factor;
+        let quad = QuadInstance::copy_shine(
+            rect.scale(s).to_array(),
+            clip.scale(s).to_array(),
+            color,
+            radii.scale(s).to_array(),
+            progress,
+            0.32,
+            0.45,
         );
         self.layer_mut().quads.push(quad);
     }

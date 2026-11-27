@@ -608,7 +608,7 @@ fn main() {
             cache.build_pane(
                 &grid,
                 &single_viewport,
-                renderer.atlas_mut(),
+                &mut renderer.atlas_mut(),
                 &queue,
                 &mut dl,
             );
@@ -634,7 +634,8 @@ fn main() {
                     );
                 });
                 let queue = r.queue().clone();
-                let st = cache.build_pane(&grid, &single_viewport, r.atlas_mut(), &queue, &mut dl);
+                let st =
+                    cache.build_pane(&grid, &single_viewport, &mut r.atlas_mut(), &queue, &mut dl);
                 (dl.finish(), st.rebuilt_rows, st.cached_rows)
             },
         );
@@ -650,7 +651,7 @@ fn main() {
             cache.build_pane(
                 &grid,
                 &single_viewport,
-                renderer.atlas_mut(),
+                &mut renderer.atlas_mut(),
                 &queue,
                 &mut dl,
             );
@@ -678,7 +679,8 @@ fn main() {
                     );
                 });
                 let queue = r.queue().clone();
-                let st = cache.build_pane(&grid, &single_viewport, r.atlas_mut(), &queue, &mut dl);
+                let st =
+                    cache.build_pane(&grid, &single_viewport, &mut r.atlas_mut(), &queue, &mut dl);
                 (dl.finish(), st.rebuilt_rows, st.cached_rows)
             },
         );
@@ -708,7 +710,8 @@ fn main() {
                     );
                 });
                 let queue = r.queue().clone();
-                let st = cache.build_pane(&grid, &single_viewport, r.atlas_mut(), &queue, &mut dl);
+                let st =
+                    cache.build_pane(&grid, &single_viewport, &mut r.atlas_mut(), &queue, &mut dl);
                 (dl.finish(), st.rebuilt_rows, st.cached_rows)
             },
         );
@@ -775,7 +778,7 @@ fn main() {
                     let st = caches[p].build_pane(
                         &grids[p],
                         &viewports[p],
-                        r.atlas_mut(),
+                        &mut r.atlas_mut(),
                         &queue,
                         &mut dl,
                     );

@@ -10,6 +10,7 @@
 //       == -1.0 => curly sine-wave underline (wavelength in `params.z`)
 //       == -2.0 => dotted underline (period in `params.z`)
 //       == -3.0 => dashed underline (period in `params.z`)
+//       == -4.0 => diagonal copy shine (band in `params.x`, progress in `params.z`, tilt in `params.w`)
 //   z = shadow_offset_x (or wave/dash period in physical pixels)
 //   w = shadow_offset_y (or wave amplitude in physical pixels)
 
@@ -161,6 +162,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 1D Gaussian CDF across SDF edge produces silky, CSS-accurate shadow falloff.
         let coverage = 0.5 * (1.0 - erf_approx(dist / (sigma * 1.41421356)));
         let alpha = clamp(coverage, 0.0, 1.0) * in.fill_color.a;
+        if (alpha <= 0.001) {
+            discard;
+        }
+        return vec4<f32>(encode_target_color(in.fill_color.rgb), alpha);
+    }
+
+    // Diagonal Copy Shine sweep mode (mode == -4.0).
+    if (mode < -3.5) {
+        let p = in.pixel_pos - center;
+        let dist = sd_rounded_box(p, half_size, in.corner_radii);
+        let box_cov = clamp(0.5 - dist, 0.0, 1.0);
+        if (box_cov <= 0.001) {
+            discard;
+        }
+        let progress = clamp(in.params.z, 0.0, 1.0);
+        let band = max(in.params.x, 0.08);
+        let tilt = max(in.params.w, 0.0);
+        let diag_span = max(size.x + size.y * tilt, 1.0);
+        let diag_pos = ((in.pixel_pos.x - in.bounds.x) + (in.pixel_pos.y - in.bounds.y) * tilt) / diag_span;
+        let sweep_center = mix(-band, 1.0 + band, progress);
+        let beam = pow(clamp(1.0 - abs(diag_pos - sweep_center) / band, 0.0, 1.0), 1.8);
+        let env = smoothstep(0.0, 0.12, progress) * (1.0 - smoothstep(0.72, 1.0, progress));
+        let base_flash = sin(progress * 3.14159265) * 0.22;
+        let intensity = clamp(beam * 0.85 + base_flash, 0.0, 1.0) * env;
+        let alpha = box_cov * intensity * in.fill_color.a;
         if (alpha <= 0.001) {
             discard;
         }

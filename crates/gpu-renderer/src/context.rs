@@ -99,7 +99,7 @@ pub enum AcquiredFrame {
     Reconfigured,
 }
 
-/// Windowed swapchain state attached to a [`GpuContext`].
+/// Windowed swapchain state attached to a [`GpuContext`] or `SurfaceRenderer`.
 pub struct SurfaceState {
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
@@ -107,6 +107,115 @@ pub struct SurfaceState {
     pub present_mode_pref: PresentModePreference,
     pub transparent_surface: bool,
     pub scale_factor: f32,
+}
+
+impl SurfaceState {
+    /// Configures a `wgpu::Surface` for presentation with the given adapter and device.
+    pub(crate) fn configure_new(
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        config: &GpuConfig,
+    ) -> Result<Self, RenderError> {
+        let capabilities = surface.get_capabilities(adapter);
+        if capabilities.formats.is_empty() {
+            return Err(RenderError::CreateSurface(
+                "adapter does not support window surface (no supported formats)".to_owned(),
+            ));
+        }
+        let format = pick_surface_format(&capabilities);
+        let present_mode = pick_present_mode(&capabilities, config.present_mode);
+        let alpha_mode = pick_alpha_mode(&capabilities, config.transparent_surface);
+
+        let safe_w = width.max(1);
+        let safe_h = height.max(1);
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: safe_w,
+            height: safe_h,
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+        };
+        surface.configure(device, &surface_config);
+
+        Ok(Self {
+            surface,
+            config: surface_config,
+            capabilities,
+            present_mode_pref: config.present_mode,
+            transparent_surface: config.transparent_surface,
+            scale_factor: scale_factor.max(0.5),
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32, scale_factor: f32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let clamped_scale = scale_factor.max(0.5);
+        if self.config.width == width
+            && self.config.height == height
+            && (self.scale_factor - clamped_scale).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.scale_factor = clamped_scale;
+        self.surface.configure(device, &self.config);
+    }
+
+    pub fn set_present_mode(&mut self, device: &wgpu::Device, pref: PresentModePreference) {
+        self.present_mode_pref = pref;
+        let next = pick_present_mode(&self.capabilities, pref);
+        if self.config.present_mode != next {
+            self.config.present_mode = next;
+            self.surface.configure(device, &self.config);
+        }
+    }
+
+    pub fn acquire_frame(&mut self, device: &wgpu::Device) -> Result<AcquiredFrame, RenderError> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => Ok(AcquiredFrame::Ready {
+                texture,
+                suboptimal: false,
+            }),
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Ok(AcquiredFrame::Ready {
+                texture,
+                suboptimal: true,
+            }),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                Ok(AcquiredFrame::Skipped)
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                warn!("swapchain outdated/lost; reconfiguring surface");
+                self.surface.configure(device, &self.config);
+                Ok(AcquiredFrame::Reconfigured)
+            }
+            wgpu::CurrentSurfaceTexture::Validation => Err(RenderError::Surface(
+                "surface validation error while acquiring texture".to_owned(),
+            )),
+        }
+    }
+
+    pub fn reconfigure(&mut self, device: &wgpu::Device) {
+        self.surface.configure(device, &self.config);
+    }
 }
 
 /// Reusable offscreen RGBA8 render target + aligned readback staging buffer for PNG export & tests.
@@ -230,6 +339,21 @@ impl GpuContext {
         scale_factor: f32,
         config: &GpuConfig,
     ) -> Result<Self, RenderError> {
+        let (mut ctx, surface_state) =
+            Self::new_for_initial_surface(surface_target, width, height, scale_factor, config)?;
+        ctx.surface = Some(surface_state);
+        Ok(ctx)
+    }
+
+    /// Initializes a device-wide `GpuContext` alongside the first configured `SurfaceState`
+    /// without storing the `SurfaceState` inside `GpuContext`.
+    pub(crate) fn new_for_initial_surface(
+        surface_target: impl Into<wgpu::SurfaceTarget<'static>>,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        config: &GpuConfig,
+    ) -> Result<(Self, SurfaceState), RenderError> {
         // Prefer Vulkan first; GLES fallback requires a separate instance creation if Vulkan fails.
         let target = surface_target.into();
         let instance_vk = create_instance(wgpu::Backends::VULKAN);
@@ -241,49 +365,59 @@ impl GpuContext {
             .ok_or(RenderError::NoAdapter)?;
 
         let (device, queue, adapter_summary) = request_device(&adapter)?;
-        let capabilities = surface_vk.get_capabilities(&adapter);
-        let format = pick_surface_format(&capabilities);
-        let present_mode = pick_present_mode(&capabilities, config.present_mode);
-        let alpha_mode = pick_alpha_mode(&capabilities, config.transparent_surface);
+        let surface_state = SurfaceState::configure_new(
+            &adapter,
+            &device,
+            surface_vk,
+            width,
+            height,
+            scale_factor,
+            config,
+        )?;
+        let format = surface_state.format();
 
-        let safe_w = width.max(1);
-        let safe_h = height.max(1);
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: safe_w,
-            height: safe_h,
-            present_mode,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
-        };
-        surface_vk.configure(&device, &surface_config);
+        Ok((
+            Self {
+                instance: instance_vk,
+                adapter,
+                device,
+                queue,
+                adapter_summary,
+                target_format: format,
+                surface: None,
+            },
+            surface_state,
+        ))
+    }
 
-        Ok(Self {
-            instance: instance_vk,
-            adapter,
-            device,
-            queue,
-            adapter_summary,
-            target_format: format,
-            surface: Some(SurfaceState {
-                surface: surface_vk,
-                config: surface_config,
-                capabilities,
-                present_mode_pref: config.present_mode,
-                transparent_surface: config.transparent_surface,
-                scale_factor: scale_factor.max(0.5),
-            }),
-        })
+    /// Creates and configures an additional `SurfaceState` sharing this context's `Instance`,
+    /// `Adapter`, `Device`, and `Queue`.
+    pub(crate) fn create_surface_state(
+        &self,
+        surface_target: impl Into<wgpu::SurfaceTarget<'static>>,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        config: &GpuConfig,
+    ) -> Result<SurfaceState, RenderError> {
+        let surface = self
+            .instance
+            .create_surface(surface_target.into())
+            .map_err(|e| RenderError::CreateSurface(e.to_string()))?;
+        SurfaceState::configure_new(
+            &self.adapter,
+            &self.device,
+            surface,
+            width,
+            height,
+            scale_factor,
+            config,
+        )
     }
 
     /// Returns the active surface physical dimensions `(width, height)`, if a surface is attached.
     pub fn surface_size(&self) -> Option<(u32, u32)> {
-        self.surface
-            .as_ref()
-            .map(|s| (s.config.width, s.config.height))
+        self.surface.as_ref().map(SurfaceState::size)
     }
 
     /// Returns the current DPI scale factor (`1.0` when headless).
@@ -293,35 +427,15 @@ impl GpuContext {
 
     /// Reconfigures the swapchain after window resize or HiDPI scale factor change.
     pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
-        let Some(surf) = self.surface.as_mut() else {
-            return;
-        };
-        if width == 0 || height == 0 {
-            return;
+        if let Some(surf) = self.surface.as_mut() {
+            surf.resize(&self.device, width, height, scale_factor);
         }
-        let clamped_scale = scale_factor.max(0.5);
-        if surf.config.width == width
-            && surf.config.height == height
-            && (surf.scale_factor - clamped_scale).abs() < f32::EPSILON
-        {
-            return;
-        }
-        surf.config.width = width;
-        surf.config.height = height;
-        surf.scale_factor = clamped_scale;
-        surf.surface.configure(&self.device, &surf.config);
     }
 
     /// Switches swapchain presentation mode (`Fifo` VSync vs `Mailbox` low-latency) live.
     pub fn set_present_mode(&mut self, pref: PresentModePreference) {
-        let Some(surf) = self.surface.as_mut() else {
-            return;
-        };
-        surf.present_mode_pref = pref;
-        let next = pick_present_mode(&surf.capabilities, pref);
-        if surf.config.present_mode != next {
-            surf.config.present_mode = next;
-            surf.surface.configure(&self.device, &surf.config);
+        if let Some(surf) = self.surface.as_mut() {
+            surf.set_present_mode(&self.device, pref);
         }
     }
 
@@ -330,33 +444,13 @@ impl GpuContext {
         let Some(surf) = self.surface.as_mut() else {
             return Err(RenderError::NoSurface);
         };
-        match surf.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture) => Ok(AcquiredFrame::Ready {
-                texture,
-                suboptimal: false,
-            }),
-            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Ok(AcquiredFrame::Ready {
-                texture,
-                suboptimal: true,
-            }),
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                Ok(AcquiredFrame::Skipped)
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                warn!("swapchain outdated/lost; reconfiguring surface");
-                surf.surface.configure(&self.device, &surf.config);
-                Ok(AcquiredFrame::Reconfigured)
-            }
-            wgpu::CurrentSurfaceTexture::Validation => Err(RenderError::Surface(
-                "surface validation error while acquiring texture".to_owned(),
-            )),
-        }
+        surf.acquire_frame(&self.device)
     }
 
     /// Reconfigures the active surface using its existing settings (e.g. after a suboptimal frame).
     pub fn reconfigure_surface(&mut self) {
         if let Some(surf) = self.surface.as_mut() {
-            surf.surface.configure(&self.device, &surf.config);
+            surf.reconfigure(&self.device);
         }
     }
 
