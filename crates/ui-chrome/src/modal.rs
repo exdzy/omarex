@@ -11,8 +11,8 @@ use tr3x_bridge::keymap::WhichKeyHint;
 use tr3x_bridge::prompts::{ClientReplyPayload, PromptKind, PromptSession};
 
 use crate::draw::{
-    FontKind, FontWeight, HitTarget, ModalKind, SettingChange, ShadowSpec, TextAlign, UiAction,
-    UiDrawList, UiInteraction, cap_radius, z_layer,
+    FontKind, FontWeight, HitTarget, ModalKind, SettingChange, SettingsCategory, ShadowSpec,
+    TextAlign, UiAction, UiDrawList, UiInteraction, cap_radius, z_layer,
 };
 use crate::icons::IconId;
 use crate::layout::{
@@ -30,6 +30,7 @@ pub enum ModalKey {
     PageDown,
     Enter,
     CtrlEnter,
+    Tab,
     Space,
     Escape,
     Backspace,
@@ -54,7 +55,7 @@ pub enum ModalKeyOutcome {
 }
 
 /// Interactive settings snapshot displayed inside the Settings modal (`Ctrl+Shift+,`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SettingsViewSnapshot {
     pub toolbar_position: ToolbarPosition,
     pub toolbar_behavior: ToolbarBehavior,
@@ -64,6 +65,12 @@ pub struct SettingsViewSnapshot {
     pub highlight_active_border: bool,
     pub fade_inactive_panes: bool,
     pub adaptive_rounding: bool,
+    pub program_color_header: bool,
+    pub theme_name: Option<String>,
+    pub font_family: String,
+    pub font_size_pt: f32,
+    pub chime_enabled: bool,
+    pub desktop_notifications: bool,
 }
 
 impl SettingsViewSnapshot {
@@ -73,6 +80,7 @@ impl SettingsViewSnapshot {
         material: MaterialStyle,
         highlight_active_border: bool,
         fade_inactive_panes: bool,
+        program_color_header: bool,
     ) -> Self {
         Self {
             toolbar_position: cfg.toolbar_position,
@@ -83,8 +91,77 @@ impl SettingsViewSnapshot {
             highlight_active_border,
             fade_inactive_panes,
             adaptive_rounding: cfg.hyprland_rounding.is_some(),
+            program_color_header,
+            theme_name: None,
+            font_family: "JetBrainsMono Nerd Font".to_owned(),
+            font_size_pt: 13.0,
+            chime_enabled: true,
+            desktop_notifications: true,
         }
     }
+
+    #[must_use]
+    pub fn with_extras(
+        mut self,
+        theme_name: Option<String>,
+        font_family: impl Into<String>,
+        font_size_pt: f32,
+        chime_enabled: bool,
+        desktop_notifications: bool,
+    ) -> Self {
+        self.theme_name = theme_name;
+        self.font_family = font_family.into();
+        self.font_size_pt = font_size_pt;
+        self.chime_enabled = chime_enabled;
+        self.desktop_notifications = desktop_notifications;
+        self
+    }
+}
+
+/// Purpose of the File/Dir Picker modal (`InsertPath` vs `GoToDirectory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerPurpose {
+    InsertPath,
+    GoToDirectory,
+}
+
+/// Entry displayed inside `ModalContent::FilePicker`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePickerEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+/// Host + Tailscale + stream health row shown in the Diagnostics HUD modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsHostRow {
+    pub label: String,
+    pub status: String,
+    pub tailscale_summary: String,
+    pub dropped_events: u64,
+    pub active_streams: usize,
+}
+
+/// Telemetry snapshot displayed inside the Rich Diagnostics & Telemetry HUD (`Ctrl+Alt+,`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagnosticsSnapshot {
+    pub app_version: String,
+    pub vt_version: String,
+    pub gpu_adapter: String,
+    pub gpu_backend: String,
+    pub frame_times_us: Vec<u32>,
+    pub avg_frame_ms: f32,
+    pub p95_frame_ms: f32,
+    pub max_frame_ms: f32,
+    pub last_draw_calls: u32,
+    pub last_quads: u32,
+    pub last_glyphs: u32,
+    pub hosts: Vec<DiagnosticsHostRow>,
+    pub keymap_warnings: Vec<String>,
+    pub active_ports: Vec<String>,
+    pub active_tunnels: Vec<String>,
 }
 
 /// Active modal content backing `FocusTarget::Modal(ModalKind)`.
@@ -100,6 +177,29 @@ pub enum ModalContent {
         selected_row: usize,
         scroll_row: usize,
     },
+    FilePicker {
+        purpose: FilePickerPurpose,
+        current_dir: String,
+        remote_host: Option<String>,
+        loading: bool,
+        error: Option<String>,
+        input: TextInput,
+        entries: Vec<FilePickerEntry>,
+        filtered_indices: Vec<usize>,
+        selected_row: usize,
+        scroll_row: usize,
+    },
+    ThemePicker {
+        input: TextInput,
+        items: Vec<PaletteItem>,
+        matches: Vec<ScoredMatch>,
+        selected_row: usize,
+        scroll_row: usize,
+    },
+    Diagnostics {
+        snapshot: DiagnosticsSnapshot,
+        scroll_row: usize,
+    },
     RexPrompt {
         session: PromptSession,
         input: TextInput,
@@ -107,6 +207,7 @@ pub enum ModalContent {
     },
     Settings {
         snapshot: SettingsViewSnapshot,
+        category: SettingsCategory,
         selected_row: usize,
     },
     Rename {
@@ -178,7 +279,119 @@ impl ModalState {
         Self {
             content: ModalContent::Settings {
                 snapshot,
+                category: SettingsCategory::Workspace,
                 selected_row: 0,
+            },
+            matcher: PaletteMatcher::new(),
+        }
+    }
+
+    /// Opens the remote-capable File/Directory Picker (`InsertPath` / `GoToDirectory`).
+    #[must_use]
+    pub fn open_file_picker(
+        purpose: FilePickerPurpose,
+        current_dir: impl Into<String>,
+        remote_host: Option<String>,
+        entries: Vec<FilePickerEntry>,
+        loading: bool,
+    ) -> Self {
+        let filtered_indices: Vec<usize> = (0..entries.len()).collect();
+        let placeholder = match purpose {
+            FilePickerPurpose::InsertPath => "Filter files or dirs · Tab descend · Enter insert",
+            FilePickerPurpose::GoToDirectory => "Filter directories · Tab descend · Enter cd",
+        };
+        Self {
+            content: ModalContent::FilePicker {
+                purpose,
+                current_dir: current_dir.into(),
+                remote_host,
+                loading,
+                error: None,
+                input: TextInput::new(placeholder),
+                entries,
+                filtered_indices,
+                selected_row: 0,
+                scroll_row: 0,
+            },
+            matcher: PaletteMatcher::new(),
+        }
+    }
+
+    /// Updates entries inside an open `FilePicker` modal (e.g., on remote `list_dir` response).
+    pub fn set_file_picker_entries(
+        &mut self,
+        current_dir: impl Into<String>,
+        entries: Vec<FilePickerEntry>,
+        error: Option<String>,
+    ) {
+        if let ModalContent::FilePicker {
+            current_dir: dir,
+            loading,
+            error: err_slot,
+            input,
+            entries: list,
+            filtered_indices,
+            selected_row,
+            scroll_row,
+            ..
+        } = &mut self.content
+        {
+            let next_dir = current_dir.into();
+            if error.is_none() && *dir != next_dir {
+                input.clear();
+            }
+            *dir = next_dir;
+            *loading = false;
+            *err_slot = error;
+            *list = entries;
+            *filtered_indices = filter_file_picker_entries(input.text(), list);
+            *selected_row = 0;
+            *scroll_row = 0;
+        }
+    }
+
+    /// Surfaces an error inside an open `FilePicker` modal while preserving the prior
+    /// `current_dir` and `entries`.
+    pub fn set_file_picker_error(&mut self, error: impl Into<String>) {
+        if let ModalContent::FilePicker {
+            loading,
+            error: err_slot,
+            ..
+        } = &mut self.content
+        {
+            *loading = false;
+            *err_slot = Some(error.into());
+        }
+    }
+
+    /// Opens the live-preview Theme Switcher modal (`ChangeTheme`).
+    #[must_use]
+    pub fn open_theme_picker(items: Vec<PaletteItem>, active_name: Option<&str>) -> Self {
+        let mut matcher = PaletteMatcher::new();
+        let matches = matcher.filter("", &items);
+        let selected_row = active_name
+            .and_then(|active| matches.iter().position(|m| items[m.index].id == active))
+            .unwrap_or(0);
+        let scroll_row = selected_row.saturating_sub(4);
+        Self {
+            content: ModalContent::ThemePicker {
+                input: TextInput::new("Filter themes… (↑/↓ live preview, Enter apply, Esc revert)"),
+                items,
+                matches,
+                selected_row,
+                scroll_row,
+            },
+            matcher,
+        }
+    }
+
+    /// Opens the Rich Diagnostics & Telemetry HUD (`Ctrl+Alt+,`).
+    #[must_use]
+    pub fn open_diagnostics(snapshot: DiagnosticsSnapshot) -> Self {
+        Self {
+            content: ModalContent::Diagnostics {
+                snapshot,
+                scroll_row: 0,
             },
             matcher: PaletteMatcher::new(),
         }
@@ -227,6 +440,9 @@ impl ModalState {
     pub fn kind(&self) -> ModalKind {
         match &self.content {
             ModalContent::List { kind, .. } => *kind,
+            ModalContent::FilePicker { .. } => ModalKind::FilePicker,
+            ModalContent::ThemePicker { .. } => ModalKind::ThemePicker,
+            ModalContent::Diagnostics { .. } => ModalKind::Diagnostics,
             ModalContent::RexPrompt { .. } => ModalKind::RexPrompt,
             ModalContent::Settings { .. } => ModalKind::Settings,
             ModalContent::Rename { .. } => ModalKind::Rename,
@@ -290,6 +506,164 @@ impl ModalState {
                     ModalKeyOutcome::Consumed
                 }
             },
+            ModalContent::FilePicker {
+                purpose: _,
+                current_dir,
+                input,
+                entries,
+                filtered_indices,
+                selected_row,
+                scroll_row,
+                ..
+            } => match key {
+                ModalKey::Escape => ModalKeyOutcome::Closed,
+                ModalKey::Up => {
+                    if !filtered_indices.is_empty() {
+                        *selected_row =
+                            (*selected_row + filtered_indices.len() - 1) % filtered_indices.len();
+                        ensure_row_visible(*selected_row, scroll_row, 8);
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::Down => {
+                    if !filtered_indices.is_empty() {
+                        *selected_row = (*selected_row + 1) % filtered_indices.len();
+                        ensure_row_visible(*selected_row, scroll_row, 8);
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::PageUp => {
+                    *selected_row = selected_row.saturating_sub(6);
+                    ensure_row_visible(*selected_row, scroll_row, 8);
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::PageDown => {
+                    if !filtered_indices.is_empty() {
+                        *selected_row = (*selected_row + 6).min(filtered_indices.len() - 1);
+                        ensure_row_visible(*selected_row, scroll_row, 8);
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::Tab => {
+                    if let Some(&entry_idx) = filtered_indices.get(*selected_row)
+                        && let Some(entry) = entries.get(entry_idx)
+                        && entry.is_dir
+                    {
+                        return ModalKeyOutcome::Action(UiAction::FilePickerDescend {
+                            path: entry.path.clone(),
+                        });
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::Backspace if input.text().is_empty() => {
+                    ModalKeyOutcome::Action(UiAction::FilePickerParent)
+                }
+                ModalKey::Enter | ModalKey::CtrlEnter => {
+                    let chosen = filtered_indices
+                        .get(*selected_row)
+                        .and_then(|&idx| entries.get(idx))
+                        .map(|e| e.path.clone())
+                        .unwrap_or_else(|| current_dir.clone());
+                    ModalKeyOutcome::Action(UiAction::FilePickerAccept { path: chosen })
+                }
+                other => {
+                    if apply_text_key(input, other) {
+                        *filtered_indices = filter_file_picker_entries(input.text(), entries);
+                        *selected_row = 0;
+                        *scroll_row = 0;
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+            },
+            ModalContent::ThemePicker {
+                input,
+                items,
+                matches,
+                selected_row,
+                scroll_row,
+            } => match key {
+                ModalKey::Escape => ModalKeyOutcome::Action(UiAction::ThemePickerCancel),
+                ModalKey::Up => {
+                    if !matches.is_empty() {
+                        *selected_row = (*selected_row + matches.len() - 1) % matches.len();
+                        ensure_row_visible(*selected_row, scroll_row, 8);
+                        if let Some(m) = matches.get(*selected_row) {
+                            return ModalKeyOutcome::Action(UiAction::ThemePickerPreview {
+                                name: items[m.index].id.clone(),
+                            });
+                        }
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::Down => {
+                    if !matches.is_empty() {
+                        *selected_row = (*selected_row + 1) % matches.len();
+                        ensure_row_visible(*selected_row, scroll_row, 8);
+                        if let Some(m) = matches.get(*selected_row) {
+                            return ModalKeyOutcome::Action(UiAction::ThemePickerPreview {
+                                name: items[m.index].id.clone(),
+                            });
+                        }
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::PageUp => {
+                    *selected_row = selected_row.saturating_sub(6);
+                    ensure_row_visible(*selected_row, scroll_row, 8);
+                    if let Some(m) = matches.get(*selected_row) {
+                        return ModalKeyOutcome::Action(UiAction::ThemePickerPreview {
+                            name: items[m.index].id.clone(),
+                        });
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::PageDown => {
+                    if !matches.is_empty() {
+                        *selected_row = (*selected_row + 6).min(matches.len() - 1);
+                        ensure_row_visible(*selected_row, scroll_row, 8);
+                        if let Some(m) = matches.get(*selected_row) {
+                            return ModalKeyOutcome::Action(UiAction::ThemePickerPreview {
+                                name: items[m.index].id.clone(),
+                            });
+                        }
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::Enter | ModalKey::CtrlEnter => {
+                    if let Some(m) = matches.get(*selected_row) {
+                        ModalKeyOutcome::Action(UiAction::ThemePickerCommit {
+                            name: items[m.index].id.clone(),
+                        })
+                    } else {
+                        ModalKeyOutcome::Action(UiAction::ThemePickerCancel)
+                    }
+                }
+                other => {
+                    if apply_text_key(input, other) {
+                        *matches = self.matcher.filter(input.text(), items);
+                        *selected_row = 0;
+                        *scroll_row = 0;
+                        if let Some(m) = matches.first() {
+                            return ModalKeyOutcome::Action(UiAction::ThemePickerPreview {
+                                name: items[m.index].id.clone(),
+                            });
+                        }
+                    }
+                    ModalKeyOutcome::Consumed
+                }
+            },
+            ModalContent::Diagnostics { scroll_row, .. } => match key {
+                ModalKey::Escape | ModalKey::Enter => ModalKeyOutcome::Closed,
+                ModalKey::Up => {
+                    *scroll_row = scroll_row.saturating_sub(1);
+                    ModalKeyOutcome::Consumed
+                }
+                ModalKey::Down => {
+                    *scroll_row = scroll_row.saturating_add(1);
+                    ModalKeyOutcome::Consumed
+                }
+                _ => ModalKeyOutcome::Consumed,
+            },
             ModalContent::RexPrompt {
                 session,
                 input,
@@ -344,21 +718,33 @@ impl ModalState {
             },
             ModalContent::Settings {
                 snapshot,
+                category,
                 selected_row,
             } => {
-                const ROW_COUNT: usize = 8;
+                let row_count = settings_category_row_count(*category).max(1);
                 match key {
                     ModalKey::Escape => ModalKeyOutcome::Closed,
+                    ModalKey::Left { .. } => {
+                        *category = prev_settings_category(*category);
+                        *selected_row = 0;
+                        ModalKeyOutcome::Consumed
+                    }
+                    ModalKey::Right { .. } | ModalKey::Tab => {
+                        *category = next_settings_category(*category);
+                        *selected_row = 0;
+                        ModalKeyOutcome::Consumed
+                    }
                     ModalKey::Up => {
-                        *selected_row = (*selected_row + ROW_COUNT - 1) % ROW_COUNT;
+                        *selected_row = (*selected_row + row_count - 1) % row_count;
                         ModalKeyOutcome::Consumed
                     }
                     ModalKey::Down => {
-                        *selected_row = (*selected_row + 1) % ROW_COUNT;
+                        *selected_row = (*selected_row + 1) % row_count;
                         ModalKeyOutcome::Consumed
                     }
                     ModalKey::Enter | ModalKey::Space => {
-                        if let Some(change) = cycle_setting_row(*snapshot, *selected_row) {
+                        if let Some(change) = cycle_setting_row(snapshot, *category, *selected_row)
+                        {
                             apply_setting_to_snapshot(snapshot, &change);
                             ModalKeyOutcome::Action(UiAction::UpdateSetting(change))
                         } else {
@@ -438,6 +824,44 @@ impl ModalState {
                     ModalKeyOutcome::Consumed
                 }
             }
+            ModalContent::FilePicker {
+                entries,
+                filtered_indices,
+                selected_row,
+                ..
+            } => {
+                if let Some(&entry_idx) = filtered_indices.get(row_index)
+                    && let Some(entry) = entries.get(entry_idx)
+                {
+                    *selected_row = row_index;
+                    if entry.is_dir {
+                        ModalKeyOutcome::Action(UiAction::FilePickerDescend {
+                            path: entry.path.clone(),
+                        })
+                    } else {
+                        ModalKeyOutcome::Action(UiAction::FilePickerAccept {
+                            path: entry.path.clone(),
+                        })
+                    }
+                } else {
+                    ModalKeyOutcome::Consumed
+                }
+            }
+            ModalContent::ThemePicker {
+                items,
+                matches,
+                selected_row,
+                ..
+            } => {
+                if let Some(m) = matches.get(row_index) {
+                    *selected_row = row_index;
+                    ModalKeyOutcome::Action(UiAction::ThemePickerCommit {
+                        name: items[m.index].id.clone(),
+                    })
+                } else {
+                    ModalKeyOutcome::Consumed
+                }
+            }
             ModalContent::RexPrompt { session, .. } => {
                 session.focused_row = row_index;
                 if let Some(reply) = session.submit_enter() {
@@ -448,10 +872,11 @@ impl ModalState {
             }
             ModalContent::Settings {
                 snapshot,
+                category,
                 selected_row,
             } => {
                 *selected_row = row_index;
-                if let Some(change) = cycle_setting_row(*snapshot, row_index) {
+                if let Some(change) = cycle_setting_row(snapshot, *category, row_index) {
                     apply_setting_to_snapshot(snapshot, &change);
                     ModalKeyOutcome::Action(UiAction::UpdateSetting(change))
                 } else {
@@ -476,18 +901,37 @@ impl ModalState {
 
     /// Activates a Settings row by its stable key (called when clicking `HitTarget::SettingsToggle`).
     pub fn activate_setting_key(&mut self, key: &str) -> ModalKeyOutcome {
-        let row_index = match key {
-            "toolbar_position" => 0,
-            "toolbar_behavior" => 1,
-            "pane_density" => 2,
-            "pane_headers" => 3,
-            "material" => 4,
-            "active_border" => 5,
-            "fade_inactive" => 6,
-            "adaptive_rounding" => 7,
-            _ => return ModalKeyOutcome::Consumed,
-        };
-        self.activate_row(row_index)
+        if let ModalContent::Settings {
+            snapshot,
+            category,
+            selected_row,
+        } = &mut self.content
+        {
+            let Some((cat, row_idx, change)) = setting_change_for_key(snapshot, key) else {
+                return ModalKeyOutcome::Consumed;
+            };
+            *category = cat;
+            *selected_row = row_idx;
+            apply_setting_to_snapshot(snapshot, &change);
+            return ModalKeyOutcome::Action(UiAction::UpdateSetting(change));
+        }
+        ModalKeyOutcome::Consumed
+    }
+
+    /// Switches the active Settings category tab.
+    pub fn select_settings_category(&mut self, next: SettingsCategory) -> bool {
+        if let ModalContent::Settings {
+            category,
+            selected_row,
+            ..
+        } = &mut self.content
+        {
+            let changed = *category != next;
+            *category = next;
+            *selected_row = 0;
+            return changed;
+        }
+        false
     }
 
     /// Scrolls a scrollable modal list by `delta_rows` (`> 0` scrolls down, `< 0` scrolls up).
@@ -497,8 +941,33 @@ impl ModalState {
                 matches,
                 scroll_row,
                 ..
+            }
+            | ModalContent::ThemePicker {
+                matches,
+                scroll_row,
+                ..
             } => {
                 let max_scroll = matches.len().saturating_sub(8);
+                let next =
+                    (*scroll_row as isize + delta_rows).clamp(0, max_scroll as isize) as usize;
+                let changed = next != *scroll_row;
+                *scroll_row = next;
+                changed
+            }
+            ModalContent::FilePicker {
+                filtered_indices,
+                scroll_row,
+                ..
+            } => {
+                let max_scroll = filtered_indices.len().saturating_sub(8);
+                let next =
+                    (*scroll_row as isize + delta_rows).clamp(0, max_scroll as isize) as usize;
+                let changed = next != *scroll_row;
+                *scroll_row = next;
+                changed
+            }
+            ModalContent::Diagnostics { scroll_row, .. } => {
+                let max_scroll = 12usize;
                 let next =
                     (*scroll_row as isize + delta_rows).clamp(0, max_scroll as isize) as usize;
                 let changed = next != *scroll_row;
@@ -551,6 +1020,164 @@ fn apply_setting_to_snapshot(snapshot: &mut SettingsViewSnapshot, change: &Setti
         SettingChange::ToggleAdaptiveRounding => {
             snapshot.adaptive_rounding = !snapshot.adaptive_rounding;
         }
+        SettingChange::ToggleProgramColorHeader => {
+            snapshot.program_color_header = !snapshot.program_color_header;
+        }
+        SettingChange::ToggleChimeEnabled => {
+            snapshot.chime_enabled = !snapshot.chime_enabled;
+        }
+        SettingChange::ToggleDesktopNotifications => {
+            snapshot.desktop_notifications = !snapshot.desktop_notifications;
+        }
+        SettingChange::FontSizePt(pt) => {
+            snapshot.font_size_pt = pt;
+        }
+        SettingChange::OpenThemePicker => {}
+    }
+}
+
+fn filter_file_picker_entries(query: &str, entries: &[FilePickerEntry]) -> Vec<usize> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return (0..entries.len()).collect();
+    }
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.name.to_ascii_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+const SETTINGS_CATEGORIES: [(SettingsCategory, &str); 4] = [
+    (SettingsCategory::Workspace, "Workspace"),
+    (SettingsCategory::Appearance, "Appearance"),
+    (SettingsCategory::Terminal, "Terminal"),
+    (SettingsCategory::AudioAlerts, "Audio & Alerts"),
+];
+
+fn next_settings_category(cat: SettingsCategory) -> SettingsCategory {
+    match cat {
+        SettingsCategory::Workspace => SettingsCategory::Appearance,
+        SettingsCategory::Appearance => SettingsCategory::Terminal,
+        SettingsCategory::Terminal => SettingsCategory::AudioAlerts,
+        SettingsCategory::AudioAlerts => SettingsCategory::Workspace,
+    }
+}
+
+fn prev_settings_category(cat: SettingsCategory) -> SettingsCategory {
+    match cat {
+        SettingsCategory::Workspace => SettingsCategory::AudioAlerts,
+        SettingsCategory::Appearance => SettingsCategory::Workspace,
+        SettingsCategory::Terminal => SettingsCategory::Appearance,
+        SettingsCategory::AudioAlerts => SettingsCategory::Terminal,
+    }
+}
+
+fn settings_category_row_count(cat: SettingsCategory) -> usize {
+    match cat {
+        SettingsCategory::Workspace => 4,
+        SettingsCategory::Appearance => 6,
+        SettingsCategory::Terminal => 2,
+        SettingsCategory::AudioAlerts => 2,
+    }
+}
+
+fn setting_change_for_key(
+    s: &SettingsViewSnapshot,
+    key: &str,
+) -> Option<(SettingsCategory, usize, SettingChange)> {
+    match key {
+        "toolbar_position" => Some((
+            SettingsCategory::Workspace,
+            0,
+            SettingChange::ToolbarPosition(match s.toolbar_position {
+                ToolbarPosition::Left => ToolbarPosition::Right,
+                ToolbarPosition::Right => ToolbarPosition::Top,
+                ToolbarPosition::Top => ToolbarPosition::Bottom,
+                ToolbarPosition::Bottom => ToolbarPosition::Left,
+            }),
+        )),
+        "toolbar_behavior" => Some((
+            SettingsCategory::Workspace,
+            1,
+            SettingChange::ToolbarBehavior(match s.toolbar_behavior {
+                ToolbarBehavior::Always => ToolbarBehavior::OnHover,
+                ToolbarBehavior::OnHover => ToolbarBehavior::Hidden,
+                ToolbarBehavior::Hidden => ToolbarBehavior::Always,
+            }),
+        )),
+        "pane_density" => Some((
+            SettingsCategory::Workspace,
+            2,
+            SettingChange::PaneDensity(match s.density {
+                PaneDensity::Comfortable => PaneDensity::Compact,
+                PaneDensity::Compact => PaneDensity::Comfortable,
+            }),
+        )),
+        "pane_headers" => Some((
+            SettingsCategory::Workspace,
+            3,
+            SettingChange::PaneHeaderMode(match s.pane_header_mode {
+                PaneHeaderMode::OnHover => PaneHeaderMode::Always,
+                PaneHeaderMode::Always => PaneHeaderMode::Hidden,
+                PaneHeaderMode::Hidden => PaneHeaderMode::OnHover,
+            }),
+        )),
+        "theme_name" => Some((
+            SettingsCategory::Appearance,
+            0,
+            SettingChange::OpenThemePicker,
+        )),
+        "material" => Some((
+            SettingsCategory::Appearance,
+            1,
+            SettingChange::ToggleTranslucentMaterial,
+        )),
+        "active_border" => Some((
+            SettingsCategory::Appearance,
+            2,
+            SettingChange::ToggleActivePaneBorder,
+        )),
+        "fade_inactive" => Some((
+            SettingsCategory::Appearance,
+            3,
+            SettingChange::ToggleFadeInactivePanes,
+        )),
+        "adaptive_rounding" => Some((
+            SettingsCategory::Appearance,
+            4,
+            SettingChange::ToggleAdaptiveRounding,
+        )),
+        "program_color_header" => Some((
+            SettingsCategory::Appearance,
+            5,
+            SettingChange::ToggleProgramColorHeader,
+        )),
+        "font_size" => {
+            const PRESETS: [f32; 8] = [9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 16.0, 18.0];
+            let next = PRESETS
+                .iter()
+                .copied()
+                .find(|&pt| pt > s.font_size_pt + 0.05)
+                .unwrap_or(PRESETS[0]);
+            Some((
+                SettingsCategory::Terminal,
+                1,
+                SettingChange::FontSizePt(next),
+            ))
+        }
+        "chime_enabled" => Some((
+            SettingsCategory::AudioAlerts,
+            0,
+            SettingChange::ToggleChimeEnabled,
+        )),
+        "desktop_notifications" => Some((
+            SettingsCategory::AudioAlerts,
+            1,
+            SettingChange::ToggleDesktopNotifications,
+        )),
+        _ => None,
     }
 }
 
@@ -603,34 +1230,28 @@ fn apply_text_key(input: &mut TextInput, key: ModalKey) -> bool {
     }
 }
 
-fn cycle_setting_row(s: SettingsViewSnapshot, row: usize) -> Option<SettingChange> {
-    match row {
-        0 => Some(SettingChange::ToolbarPosition(match s.toolbar_position {
-            ToolbarPosition::Left => ToolbarPosition::Right,
-            ToolbarPosition::Right => ToolbarPosition::Top,
-            ToolbarPosition::Top => ToolbarPosition::Bottom,
-            ToolbarPosition::Bottom => ToolbarPosition::Left,
-        })),
-        1 => Some(SettingChange::ToolbarBehavior(match s.toolbar_behavior {
-            ToolbarBehavior::Always => ToolbarBehavior::OnHover,
-            ToolbarBehavior::OnHover => ToolbarBehavior::Hidden,
-            ToolbarBehavior::Hidden => ToolbarBehavior::Always,
-        })),
-        2 => Some(SettingChange::PaneDensity(match s.density {
-            PaneDensity::Comfortable => PaneDensity::Compact,
-            PaneDensity::Compact => PaneDensity::Comfortable,
-        })),
-        3 => Some(SettingChange::PaneHeaderMode(match s.pane_header_mode {
-            PaneHeaderMode::OnHover => PaneHeaderMode::Always,
-            PaneHeaderMode::Always => PaneHeaderMode::Hidden,
-            PaneHeaderMode::Hidden => PaneHeaderMode::OnHover,
-        })),
-        4 => Some(SettingChange::ToggleTranslucentMaterial),
-        5 => Some(SettingChange::ToggleActivePaneBorder),
-        6 => Some(SettingChange::ToggleFadeInactivePanes),
-        7 => Some(SettingChange::ToggleAdaptiveRounding),
-        _ => None,
-    }
+fn cycle_setting_row(
+    s: &SettingsViewSnapshot,
+    category: SettingsCategory,
+    row: usize,
+) -> Option<SettingChange> {
+    let key = match (category, row) {
+        (SettingsCategory::Workspace, 0) => "toolbar_position",
+        (SettingsCategory::Workspace, 1) => "toolbar_behavior",
+        (SettingsCategory::Workspace, 2) => "pane_density",
+        (SettingsCategory::Workspace, 3) => "pane_headers",
+        (SettingsCategory::Appearance, 0) => "theme_name",
+        (SettingsCategory::Appearance, 1) => "material",
+        (SettingsCategory::Appearance, 2) => "active_border",
+        (SettingsCategory::Appearance, 3) => "fade_inactive",
+        (SettingsCategory::Appearance, 4) => "adaptive_rounding",
+        (SettingsCategory::Appearance, 5) => "program_color_header",
+        (SettingsCategory::Terminal, 1) => "font_size",
+        (SettingsCategory::AudioAlerts, 0) => "chime_enabled",
+        (SettingsCategory::AudioAlerts, 1) => "desktop_notifications",
+        _ => return None,
+    };
+    setting_change_for_key(s, key).map(|(_, _, ch)| ch)
 }
 
 /// Renders the centered modal (`460–620px`) over a dimming backdrop scrim.
@@ -896,8 +1517,91 @@ pub fn render_modal(
                 now,
             );
         }
+        ModalContent::FilePicker {
+            purpose,
+            current_dir,
+            remote_host,
+            loading,
+            error,
+            input,
+            entries,
+            filtered_indices,
+            selected_row,
+            scroll_row,
+        } => {
+            render_file_picker_modal(
+                draw_list,
+                left_x,
+                top_y,
+                modal_w,
+                max_h,
+                card_r,
+                shadow,
+                *purpose,
+                current_dir,
+                remote_host.as_deref(),
+                *loading,
+                error.as_deref(),
+                input,
+                entries,
+                filtered_indices,
+                *selected_row,
+                *scroll_row,
+                interaction,
+                &tokens,
+                theme.rounding,
+            );
+        }
+        ModalContent::ThemePicker {
+            input,
+            items,
+            matches,
+            selected_row,
+            scroll_row,
+        } => {
+            render_theme_picker_modal(
+                draw_list,
+                left_x,
+                top_y,
+                modal_w,
+                max_h,
+                card_r,
+                shadow,
+                input,
+                items,
+                matches,
+                *selected_row,
+                *scroll_row,
+                interaction,
+                &tokens,
+                theme.rounding,
+            );
+        }
+        ModalContent::Diagnostics {
+            snapshot,
+            scroll_row,
+        } => {
+            render_diagnostics_modal(
+                draw_list,
+                left_x,
+                top_y,
+                (viewport.w * 0.64)
+                    .clamp(520.0, 740.0)
+                    .min((viewport.w - 32.0).max(240.0)),
+                (viewport.h * 0.78).clamp(320.0, 560.0),
+                viewport,
+                card_r,
+                shadow,
+                snapshot,
+                *scroll_row,
+                interaction,
+                &tokens,
+                theme.rounding,
+            );
+        }
         ModalContent::Settings {
             snapshot,
+            category,
             selected_row,
         } => {
             render_settings_modal(
@@ -907,7 +1611,8 @@ pub fn render_modal(
                 modal_w,
                 card_r,
                 shadow,
-                *snapshot,
+                snapshot,
+                *category,
                 *selected_row,
                 interaction,
                 &tokens,
@@ -975,7 +1680,8 @@ fn render_modal_scrollbar(
         return;
     }
     let track_h = (list_rect.h - 12.0).max(16.0);
-    let thumb_h = ((visible_rows as f32 / total_rows as f32) * track_h).clamp(20.0, track_h);
+    let min_thumb = 20.0_f32.min(track_h);
+    let thumb_h = ((visible_rows as f32 / total_rows as f32) * track_h).clamp(min_thumb, track_h);
     let max_scroll = total_rows.saturating_sub(visible_rows).max(1) as f32;
     let frac = (scroll_row as f32 / max_scroll).clamp(0.0, 1.0);
     let thumb_y = list_rect.y + 6.0 + frac * (track_h - thumb_h);
@@ -1494,6 +2200,787 @@ fn render_modal_search_header(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_file_picker_modal(
+    draw_list: &mut UiDrawList,
+    left_x: f32,
+    top_y: f32,
+    modal_w: f32,
+    max_h: f32,
+    card_r: f32,
+    shadow: ShadowSpec,
+    purpose: FilePickerPurpose,
+    current_dir: &str,
+    remote_host: Option<&str>,
+    loading: bool,
+    error: Option<&str>,
+    input: &TextInput,
+    entries: &[FilePickerEntry],
+    filtered_indices: &[usize],
+    selected_row: usize,
+    scroll_row: usize,
+    interaction: UiInteraction<'_>,
+    tokens: &UiTokens,
+    theme_rounding: f32,
+) {
+    let header_h = 74.0;
+    let footer_h = 28.0;
+    let visible_count = filtered_indices.len().min(8);
+    let body_h = if loading || filtered_indices.is_empty() {
+        56.0
+    } else if error.is_some() {
+        visible_count as f32 * 38.0 + 36.0
+    } else {
+        visible_count as f32 * 38.0 + 12.0
+    };
+    let card_h = (header_h + body_h + footer_h).min(max_h);
+    let card = RectF::new(
+        left_x.round(),
+        top_y.round(),
+        modal_w.round(),
+        card_h.round(),
+    );
+    draw_list.push_rect(
+        card,
+        tokens.surface_modal,
+        Some(tokens.border_modal),
+        1.0,
+        card_r,
+        Some(shadow),
+    );
+
+    let title = match purpose {
+        FilePickerPurpose::InsertPath => "Insert Path",
+        FilePickerPurpose::GoToDirectory => "Go to Directory",
+    };
+    let host_tag = remote_host.map_or_else(String::new, |h| format!("[{h}] "));
+    let crumb = format!("{title} · {host_tag}{current_dir}");
+    draw_list.push_text(
+        RectF::new(card.x + 14.0, card.y + 8.0, (card.w - 28.0).max(0.0), 18.0),
+        crumb,
+        tokens.accent_primary,
+        FontKind::Mono,
+        11.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    render_modal_search_header(
+        draw_list,
+        RectF::new(card.x, card.y + 28.0, card.w, 46.0),
+        input,
+        match purpose {
+            FilePickerPurpose::InsertPath => "Ins",
+            FilePickerPurpose::GoToDirectory => "cd",
+        },
+        tokens,
+        theme_rounding,
+    );
+
+    let list_rect = RectF::new(
+        card.x,
+        card.y + header_h,
+        card.w,
+        (card.h - header_h - footer_h).max(0.0),
+    );
+    draw_list.push_clip(list_rect);
+    if loading {
+        draw_list.push_text(
+            RectF::new(
+                list_rect.x + 16.0,
+                list_rect.y + 16.0,
+                (list_rect.w - 32.0).max(0.0),
+                20.0,
+            ),
+            "Loading directory…",
+            tokens.fg_muted,
+            FontKind::Sans,
+            12.5,
+            FontWeight::Regular,
+            TextAlign::Center,
+            true,
+        );
+    } else if let Some(err) = error
+        && filtered_indices.is_empty()
+    {
+        draw_list.push_text(
+            RectF::new(
+                list_rect.x + 16.0,
+                list_rect.y + 16.0,
+                (list_rect.w - 32.0).max(0.0),
+                20.0,
+            ),
+            err,
+            tokens.status_error,
+            FontKind::Sans,
+            12.0,
+            FontWeight::Regular,
+            TextAlign::Center,
+            true,
+        );
+    } else if filtered_indices.is_empty() {
+        draw_list.push_text(
+            RectF::new(
+                list_rect.x + 16.0,
+                list_rect.y + 16.0,
+                (list_rect.w - 32.0).max(0.0),
+                20.0,
+            ),
+            "Empty directory (Enter selects current dir)",
+            tokens.fg_muted,
+            FontKind::Sans,
+            12.0,
+            FontWeight::Regular,
+            TextAlign::Center,
+            true,
+        );
+    } else {
+        let mut y = list_rect.y + 6.0;
+        if let Some(err) = error {
+            draw_list.push_text(
+                RectF::new(list_rect.x + 14.0, y, (list_rect.w - 28.0).max(0.0), 18.0),
+                err,
+                tokens.status_error,
+                FontKind::Sans,
+                11.5,
+                FontWeight::Medium,
+                TextAlign::Left,
+                true,
+            );
+            y += 24.0;
+        }
+        let row_r = cap_radius(6.0, theme_rounding);
+        for (vis_idx, &entry_idx) in filtered_indices.iter().enumerate().skip(scroll_row).take(8) {
+            let Some(entry) = entries.get(entry_idx) else {
+                continue;
+            };
+            let row_rect = RectF::new(list_rect.x + 6.0, y, (list_rect.w - 12.0).max(0.0), 36.0);
+            let row_target = HitTarget::ModalRow { index: vis_idx };
+            let is_sel = vis_idx == selected_row;
+            let is_hov = interaction.is_hovered(&row_target);
+            if is_sel {
+                draw_list.push_rect(
+                    row_rect,
+                    tokens.surface_row_selected,
+                    Some(tokens.border_subtle),
+                    1.0,
+                    row_r,
+                    None,
+                );
+            } else if is_hov {
+                draw_list.push_rect(
+                    row_rect,
+                    tokens.surface_row_hover,
+                    Some(tokens.border_hairline),
+                    1.0,
+                    row_r,
+                    None,
+                );
+            }
+            let icon = if entry.is_dir {
+                IconId::Folder
+            } else {
+                IconId::Document
+            };
+            draw_list.push_icon(
+                RectF::new(row_rect.x + 10.0, row_rect.y + 10.0, 15.0, 15.0),
+                icon,
+                if entry.is_dir {
+                    tokens.accent_primary
+                } else {
+                    tokens.fg_muted
+                },
+            );
+            let tag = if entry.is_symlink && entry.is_dir {
+                "link → dir"
+            } else if entry.is_symlink {
+                "symlink"
+            } else if entry.is_dir {
+                "dir"
+            } else {
+                "file"
+            };
+            draw_list.push_text(
+                RectF::new(
+                    row_rect.x + 32.0,
+                    row_rect.y + 9.0,
+                    (row_rect.w - 110.0).max(0.0),
+                    18.0,
+                ),
+                &entry.name,
+                if is_sel {
+                    tokens.fg_primary
+                } else {
+                    tokens.fg_secondary
+                },
+                FontKind::Mono,
+                12.5,
+                FontWeight::Medium,
+                TextAlign::Left,
+                true,
+            );
+            draw_list.push_text(
+                RectF::new(
+                    (row_rect.right() - 78.0).max(row_rect.x),
+                    row_rect.y + 10.0,
+                    68.0,
+                    16.0,
+                ),
+                tag,
+                tokens.fg_muted,
+                FontKind::Mono,
+                10.0,
+                FontWeight::Regular,
+                TextAlign::Right,
+                false,
+            );
+            draw_list.push_hit(row_rect, row_target, z_layer::MODAL + 1);
+            y += 38.0;
+        }
+        render_modal_scrollbar(
+            draw_list,
+            list_rect,
+            scroll_row,
+            8,
+            filtered_indices.len(),
+            tokens,
+        );
+    }
+    draw_list.pop_clip();
+
+    draw_list.push_rect(
+        RectF::new(card.x, card.bottom() - footer_h, card.w, 1.0),
+        tokens.border_hairline,
+        None,
+        0.0,
+        0.0,
+        None,
+    );
+    draw_list.push_text(
+        RectF::new(
+            card.x + 12.0,
+            card.bottom() - footer_h + 6.0,
+            (card.w - 24.0).max(0.0),
+            16.0,
+        ),
+        "Tab descend · Backspace parent · Enter select · Esc cancel",
+        tokens.fg_muted,
+        FontKind::Mono,
+        10.0,
+        FontWeight::Regular,
+        TextAlign::Left,
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_theme_picker_modal(
+    draw_list: &mut UiDrawList,
+    left_x: f32,
+    top_y: f32,
+    modal_w: f32,
+    max_h: f32,
+    card_r: f32,
+    shadow: ShadowSpec,
+    input: &TextInput,
+    items: &[PaletteItem],
+    matches: &[ScoredMatch],
+    selected_row: usize,
+    scroll_row: usize,
+    interaction: UiInteraction<'_>,
+    tokens: &UiTokens,
+    theme_rounding: f32,
+) {
+    let visible_count = matches.len().min(8);
+    let list_h = if matches.is_empty() {
+        54.0
+    } else {
+        visible_count as f32 * 44.0 + 12.0
+    };
+    let card_h = (46.0 + list_h).min(max_h);
+    let card = RectF::new(
+        left_x.round(),
+        top_y.round(),
+        modal_w.round(),
+        card_h.round(),
+    );
+    draw_list.push_rect(
+        card,
+        tokens.surface_modal,
+        Some(tokens.border_modal),
+        1.0,
+        card_r,
+        Some(shadow),
+    );
+    render_modal_search_header(
+        draw_list,
+        RectF::new(card.x, card.y, card.w, 46.0),
+        input,
+        "Theme",
+        tokens,
+        theme_rounding,
+    );
+
+    let list_rect = RectF::new(card.x, card.y + 46.0, card.w, (card.h - 46.0).max(0.0));
+    draw_list.push_clip(list_rect);
+    if matches.is_empty() {
+        draw_list.push_text(
+            RectF::new(
+                list_rect.x + 16.0,
+                list_rect.y + 16.0,
+                (list_rect.w - 32.0).max(0.0),
+                20.0,
+            ),
+            "No matching themes",
+            tokens.fg_muted,
+            FontKind::Sans,
+            12.5,
+            FontWeight::Regular,
+            TextAlign::Center,
+            true,
+        );
+    } else {
+        let mut y = list_rect.y + 6.0;
+        let row_r = cap_radius(7.0, theme_rounding);
+        for (vis_idx, m) in matches.iter().enumerate().skip(scroll_row).take(8) {
+            let item = &items[m.index];
+            let row_rect = RectF::new(list_rect.x + 6.0, y, (list_rect.w - 12.0).max(0.0), 42.0);
+            let row_target = HitTarget::ModalRow { index: vis_idx };
+            let is_sel = vis_idx == selected_row;
+            let is_hov = interaction.is_hovered(&row_target);
+            if is_sel {
+                draw_list.push_rect(
+                    row_rect,
+                    tokens.surface_row_selected,
+                    Some(tokens.border_subtle),
+                    1.0,
+                    row_r,
+                    None,
+                );
+            } else if is_hov {
+                draw_list.push_rect(
+                    row_rect,
+                    tokens.surface_row_hover,
+                    Some(tokens.border_hairline),
+                    1.0,
+                    row_r,
+                    None,
+                );
+            }
+
+            let tx = row_rect.x + 12.0;
+            let right_w = item
+                .detail
+                .as_deref()
+                .map_or(0.0, |t| (t.chars().count() as f32 * 6.8 + 16.0).min(120.0));
+            let text_w = (row_rect.right() - tx - right_w - 10.0).max(0.0);
+            let title_y = if item.subtitle.is_some() {
+                row_rect.y + 5.0
+            } else {
+                row_rect.y + 12.0
+            };
+            draw_list.push_text(
+                RectF::new(tx, title_y, text_w, 17.0),
+                &item.title,
+                if is_sel {
+                    tokens.fg_primary
+                } else {
+                    tokens.fg_secondary
+                },
+                FontKind::Sans,
+                13.0,
+                FontWeight::Medium,
+                TextAlign::Left,
+                true,
+            );
+            if let Some(sub) = &item.subtitle {
+                draw_list.push_text(
+                    RectF::new(tx, row_rect.y + 22.0, text_w, 15.0),
+                    sub,
+                    tokens.fg_muted,
+                    FontKind::Sans,
+                    11.0,
+                    FontWeight::Regular,
+                    TextAlign::Left,
+                    true,
+                );
+            }
+            if let Some(badge) = &item.detail {
+                draw_list.push_text(
+                    RectF::new(
+                        (row_rect.right() - right_w - 8.0).max(tx),
+                        row_rect.y + 12.0,
+                        right_w,
+                        18.0,
+                    ),
+                    badge,
+                    tokens.accent_primary,
+                    FontKind::Mono,
+                    10.5,
+                    FontWeight::Medium,
+                    TextAlign::Right,
+                    false,
+                );
+            }
+            draw_list.push_hit(row_rect, row_target, z_layer::MODAL + 1);
+            y += 44.0;
+        }
+        render_modal_scrollbar(draw_list, list_rect, scroll_row, 8, matches.len(), tokens);
+    }
+    draw_list.pop_clip();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_diagnostics_modal(
+    draw_list: &mut UiDrawList,
+    _left_x: f32,
+    _top_y: f32,
+    modal_w: f32,
+    card_h: f32,
+    viewport: RectF,
+    card_r: f32,
+    shadow: ShadowSpec,
+    snap: &DiagnosticsSnapshot,
+    scroll_row: usize,
+    interaction: UiInteraction<'_>,
+    tokens: &UiTokens,
+    theme_rounding: f32,
+) {
+    let left_x = viewport.x + (viewport.w - modal_w) * 0.5;
+    let top_y = (viewport.y + (viewport.h - card_h) * 0.5).max(viewport.y + 16.0);
+    let card = RectF::new(
+        left_x.round(),
+        top_y.round(),
+        modal_w.round(),
+        card_h.round(),
+    );
+    draw_list.push_rect(
+        card,
+        tokens.surface_modal,
+        Some(tokens.border_modal),
+        1.0,
+        card_r,
+        Some(shadow),
+    );
+
+    // Header
+    draw_list.push_icon(
+        RectF::new(card.x + 14.0, card.y + 14.0, 15.0, 15.0),
+        IconId::Activity,
+        tokens.accent_primary,
+    );
+    draw_list.push_text(
+        RectF::new(
+            card.x + 36.0,
+            card.y + 12.0,
+            (card.w - 220.0).max(0.0),
+            20.0,
+        ),
+        "Diagnostics & Telemetry HUD",
+        tokens.fg_primary,
+        FontKind::Sans,
+        14.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    draw_list.push_text(
+        RectF::new(
+            (card.right() - 180.0).max(card.x),
+            card.y + 14.0,
+            166.0,
+            16.0,
+        ),
+        format!("{} · {}", snap.gpu_backend, snap.app_version),
+        tokens.fg_muted,
+        FontKind::Mono,
+        10.5,
+        FontWeight::Regular,
+        TextAlign::Right,
+        true,
+    );
+    draw_list.push_rect(
+        RectF::new(card.x, card.y + 44.0, card.w, 1.0),
+        tokens.border_hairline,
+        None,
+        0.0,
+        0.0,
+        None,
+    );
+
+    let footer_h = 44.0;
+    let body_rect = RectF::new(
+        card.x + 14.0,
+        card.y + 52.0,
+        (card.w - 28.0).max(0.0),
+        (card.h - 52.0 - footer_h).max(0.0),
+    );
+    draw_list.push_clip(body_rect);
+
+    let mut y = body_rect.y - (scroll_row as f32 * 20.0);
+
+    // 1. GPU Frame-time graph
+    draw_list.push_text(
+        RectF::new(body_rect.x, y, body_rect.w, 16.0),
+        format!(
+            "GPU: {}   avg {:.2}ms · p95 {:.2}ms · max {:.2}ms   draws={} quads={} glyphs={}",
+            snap.gpu_adapter,
+            snap.avg_frame_ms,
+            snap.p95_frame_ms,
+            snap.max_frame_ms,
+            snap.last_draw_calls,
+            snap.last_quads,
+            snap.last_glyphs
+        ),
+        tokens.fg_secondary,
+        FontKind::Mono,
+        10.5,
+        FontWeight::Medium,
+        TextAlign::Left,
+        true,
+    );
+    y += 20.0;
+
+    let graph_h = 68.0;
+    let graph_rect = RectF::new(body_rect.x, y, body_rect.w, graph_h);
+    draw_list.push_rect(
+        graph_rect,
+        tokens.surface_pane,
+        Some(tokens.border_hairline),
+        1.0,
+        cap_radius(6.0, theme_rounding),
+        None,
+    );
+    let max_us = snap
+        .frame_times_us
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(16_667)
+        .max(16_667) as f32;
+    let samples = if snap.frame_times_us.is_empty() {
+        vec![0u32; 1]
+    } else {
+        snap.frame_times_us.clone()
+    };
+    let bar_area_w = (graph_rect.w - 12.0).max(12.0);
+    let bar_count = samples.len().max(1);
+    let step_w = bar_area_w / (bar_count as f32);
+    let bar_w = (step_w - 1.0).max(1.5);
+    for (idx, &us) in samples.iter().enumerate() {
+        let frac = (us as f32 / max_us).clamp(0.04, 1.0);
+        let bh = (graph_h - 10.0) * frac;
+        let bx = graph_rect.x + 6.0 + idx as f32 * step_w;
+        let by = graph_rect.bottom() - 5.0 - bh;
+        let bar_color = if us <= 8_000 {
+            tokens.status_done
+        } else if us <= 16_667 {
+            tokens.status_working
+        } else {
+            tokens.status_error
+        };
+        draw_list.push_rect(
+            RectF::new(bx, by, bar_w, bh),
+            bar_color,
+            None,
+            0.0,
+            1.0,
+            None,
+        );
+    }
+    y += graph_h + 14.0;
+
+    // 2. Hosts, Tailscale & Stream Health
+    draw_list.push_text(
+        RectF::new(body_rect.x, y, body_rect.w, 16.0),
+        format!("Hosts, Tailscale & Stream Health (VT {})", snap.vt_version),
+        tokens.accent_primary,
+        FontKind::Sans,
+        12.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    y += 20.0;
+    if snap.hosts.is_empty() {
+        draw_list.push_text(
+            RectF::new(body_rect.x + 8.0, y, body_rect.w - 8.0, 16.0),
+            "No configured Rex hosts",
+            tokens.fg_muted,
+            FontKind::Mono,
+            10.5,
+            FontWeight::Regular,
+            TextAlign::Left,
+            true,
+        );
+        y += 18.0;
+    } else {
+        for h in &snap.hosts {
+            draw_list.push_text(
+                RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+                format!(
+                    "• {} [{}] · TS: {} · streams={} dropped={}",
+                    h.label, h.status, h.tailscale_summary, h.active_streams, h.dropped_events
+                ),
+                tokens.fg_secondary,
+                FontKind::Mono,
+                10.5,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+            y += 18.0;
+        }
+    }
+    y += 8.0;
+
+    // 3. Keymap warnings
+    draw_list.push_text(
+        RectF::new(body_rect.x, y, body_rect.w, 16.0),
+        format!("Keymap Diagnostics ({})", snap.keymap_warnings.len()),
+        if snap.keymap_warnings.is_empty() {
+            tokens.status_done
+        } else {
+            tokens.status_blocked
+        },
+        FontKind::Sans,
+        12.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    y += 18.0;
+    if snap.keymap_warnings.is_empty() {
+        draw_list.push_text(
+            RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+            "All keymap bindings clean",
+            tokens.fg_muted,
+            FontKind::Mono,
+            10.5,
+            FontWeight::Regular,
+            TextAlign::Left,
+            true,
+        );
+        y += 18.0;
+    } else {
+        for w in snap.keymap_warnings.iter().take(4) {
+            draw_list.push_text(
+                RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+                format!("! {w}"),
+                tokens.status_blocked,
+                FontKind::Mono,
+                10.5,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+            y += 18.0;
+        }
+    }
+    y += 8.0;
+
+    // 4. Listening Ports & Active Tunnels
+    draw_list.push_text(
+        RectF::new(body_rect.x, y, body_rect.w, 16.0),
+        format!(
+            "Listening Ports ({}) & Tunnels ({})",
+            snap.active_ports.len(),
+            snap.active_tunnels.len()
+        ),
+        tokens.accent_primary,
+        FontKind::Sans,
+        12.0,
+        FontWeight::SemiBold,
+        TextAlign::Left,
+        true,
+    );
+    y += 18.0;
+    if snap.active_ports.is_empty() && snap.active_tunnels.is_empty() {
+        draw_list.push_text(
+            RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+            "None active",
+            tokens.fg_muted,
+            FontKind::Mono,
+            10.5,
+            FontWeight::Regular,
+            TextAlign::Left,
+            true,
+        );
+    } else {
+        for line in snap
+            .active_ports
+            .iter()
+            .chain(snap.active_tunnels.iter())
+            .take(5)
+        {
+            draw_list.push_text(
+                RectF::new(body_rect.x + 6.0, y, (body_rect.w - 12.0).max(0.0), 16.0),
+                format!("• {line}"),
+                tokens.fg_secondary,
+                FontKind::Mono,
+                10.5,
+                FontWeight::Regular,
+                TextAlign::Left,
+                true,
+            );
+            y += 17.0;
+        }
+    }
+
+    draw_list.pop_clip();
+
+    // Footer with Copy Debug Bundle button
+    let footer = RectF::new(card.x, card.bottom() - footer_h, card.w, footer_h);
+    draw_list.push_rect(
+        RectF::new(footer.x, footer.y, footer.w, 1.0),
+        tokens.border_hairline,
+        None,
+        0.0,
+        0.0,
+        None,
+    );
+    draw_list.push_text(
+        RectF::new(footer.x + 14.0, footer.y + 13.0, 220.0, 16.0),
+        "Esc / Enter to close",
+        tokens.fg_muted,
+        FontKind::Mono,
+        10.5,
+        FontWeight::Regular,
+        TextAlign::Left,
+        true,
+    );
+    let btn = RectF::new(
+        (footer.right() - 164.0).max(footer.x),
+        footer.y + 8.0,
+        150.0,
+        28.0,
+    );
+    let hovered = interaction.is_hovered(&HitTarget::DiagnosticsCopyBundle);
+    draw_list.push_rect(
+        btn,
+        if hovered {
+            tokens.accent_primary.with_alpha_f32(0.90)
+        } else {
+            tokens.accent_primary
+        },
+        None,
+        0.0,
+        cap_radius(6.0, theme_rounding),
+        None,
+    );
+    draw_list.push_text(
+        btn,
+        "Copy Debug Bundle",
+        tokens.accent_foreground,
+        FontKind::Sans,
+        11.5,
+        FontWeight::SemiBold,
+        TextAlign::Center,
+        false,
+    );
+    draw_list.push_hit(btn, HitTarget::DiagnosticsCopyBundle, z_layer::MODAL + 1);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_settings_modal(
     draw_list: &mut UiDrawList,
     left_x: f32,
@@ -1501,62 +2988,104 @@ fn render_settings_modal(
     modal_w: f32,
     card_r: f32,
     shadow: ShadowSpec,
-    s: SettingsViewSnapshot,
+    s: &SettingsViewSnapshot,
+    category: SettingsCategory,
     selected_row: usize,
     interaction: UiInteraction<'_>,
     tokens: &UiTokens,
     theme_rounding: f32,
 ) {
-    let rows: [(&str, &str, String); 8] = [
-        (
-            "toolbar_position",
-            "Toolbar Layout",
-            format!("{:?}", s.toolbar_position),
-        ),
-        (
-            "toolbar_behavior",
-            "Toolbar Behavior",
-            format!("{:?}", s.toolbar_behavior),
-        ),
-        ("pane_density", "Pane Density", format!("{:?}", s.density)),
-        (
-            "pane_headers",
-            "Pane Headers",
-            format!("{:?}", s.pane_header_mode),
-        ),
-        (
-            "material",
-            "Surface Material",
-            match s.material {
-                MaterialStyle::Classic => "Classic (Opaque)".to_owned(),
-                MaterialStyle::Translucent { alpha } => {
-                    format!("Translucent ({:.0}%)", alpha * 100.0)
+    let rows: Vec<(&str, &str, String)> = match category {
+        SettingsCategory::Workspace => vec![
+            (
+                "toolbar_position",
+                "Toolbar Layout",
+                format!("{:?}", s.toolbar_position),
+            ),
+            (
+                "toolbar_behavior",
+                "Toolbar Behavior",
+                format!("{:?}", s.toolbar_behavior),
+            ),
+            ("pane_density", "Pane Density", format!("{:?}", s.density)),
+            (
+                "pane_headers",
+                "Pane Headers",
+                format!("{:?}", s.pane_header_mode),
+            ),
+        ],
+        SettingsCategory::Appearance => vec![
+            (
+                "theme_name",
+                "Theme",
+                s.theme_name
+                    .clone()
+                    .unwrap_or_else(|| "omarchy-live".to_owned()),
+            ),
+            (
+                "material",
+                "Surface Material",
+                match s.material {
+                    MaterialStyle::Classic => "Classic (Opaque)".to_owned(),
+                    MaterialStyle::Translucent { alpha } => {
+                        format!("Translucent ({:.0}%)", alpha * 100.0)
+                    }
+                },
+            ),
+            (
+                "active_border",
+                "Highlight Active Pane Border",
+                if s.highlight_active_border {
+                    "On"
+                } else {
+                    "Off"
                 }
-            },
-        ),
-        (
-            "active_border",
-            "Highlight Active Pane Border",
-            if s.highlight_active_border {
-                "On"
-            } else {
-                "Off"
-            }
-            .to_owned(),
-        ),
-        (
-            "fade_inactive",
-            "Fade Inactive Panes",
-            if s.fade_inactive_panes { "On" } else { "Off" }.to_owned(),
-        ),
-        (
-            "adaptive_rounding",
-            "Follow Hyprland Rounding",
-            if s.adaptive_rounding { "On" } else { "Off" }.to_owned(),
-        ),
-    ];
+                .to_owned(),
+            ),
+            (
+                "fade_inactive",
+                "Fade Inactive Panes",
+                if s.fade_inactive_panes { "On" } else { "Off" }.to_owned(),
+            ),
+            (
+                "adaptive_rounding",
+                "Follow Hyprland Rounding",
+                if s.adaptive_rounding { "On" } else { "Off" }.to_owned(),
+            ),
+            (
+                "program_color_header",
+                "Program-Color Pane Header",
+                if s.program_color_header { "On" } else { "Off" }.to_owned(),
+            ),
+        ],
+        SettingsCategory::Terminal => vec![
+            (
+                "font_family",
+                "Font Family (settings.json)",
+                s.font_family.clone(),
+            ),
+            (
+                "font_size",
+                "Font Size (click/Enter step)",
+                format!("{:.1} pt", s.font_size_pt),
+            ),
+        ],
+        SettingsCategory::AudioAlerts => vec![
+            (
+                "chime_enabled",
+                "PipeWire Micro-Chimes (OSC 7501)",
+                if s.chime_enabled { "On" } else { "Off" }.to_owned(),
+            ),
+            (
+                "desktop_notifications",
+                "Desktop Notifications",
+                if s.desktop_notifications { "On" } else { "Off" }.to_owned(),
+            ),
+        ],
+    };
 
-    let card_h = 46.0 + rows.len() as f32 * 38.0 + 14.0;
+    let tab_bar_h = 34.0;
+    let card_h = 46.0 + tab_bar_h + rows.len().max(1) as f32 * 38.0 + 16.0;
     let card = RectF::new(
         left_x.round(),
         top_y.round(),
@@ -1581,7 +3110,7 @@ fn render_settings_modal(
         RectF::new(
             card.x + 36.0,
             card.y + 13.0,
-            (card.w - 110.0).max(0.0),
+            (card.w - 150.0).max(0.0),
             20.0,
         ),
         "Settings",
@@ -1593,11 +3122,11 @@ fn render_settings_modal(
         true,
     );
     draw_list.push_text(
-        RectF::new(card.right() - 96.0, card.y + 15.0, 82.0, 16.0),
-        "Enter cycles",
+        RectF::new(card.right() - 126.0, card.y + 15.0, 112.0, 16.0),
+        "←/→ tab · Enter cycle",
         tokens.fg_muted,
         FontKind::Mono,
-        10.5,
+        10.0,
         FontWeight::Regular,
         TextAlign::Right,
         false,
@@ -1611,7 +3140,59 @@ fn render_settings_modal(
         None,
     );
 
-    let mut y = card.y + 52.0;
+    // 4 category tabs
+    let tab_w = ((card.w - 16.0) / SETTINGS_CATEGORIES.len() as f32).max(60.0);
+    for (idx, &(cat, title)) in SETTINGS_CATEGORIES.iter().enumerate() {
+        let tab_rect = RectF::new(
+            card.x + 8.0 + idx as f32 * tab_w,
+            card.y + 50.0,
+            (tab_w - 4.0).max(40.0),
+            24.0,
+        );
+        let tab_hit = HitTarget::SettingsCategoryTab(cat);
+        let active = cat == category;
+        let hovered = interaction.is_hovered(&tab_hit);
+        if active {
+            draw_list.push_rect(
+                tab_rect,
+                tokens.accent_primary.with_alpha_f32(0.18),
+                Some(tokens.accent_primary.with_alpha_f32(0.65)),
+                1.0,
+                cap_radius(6.0, theme_rounding),
+                None,
+            );
+        } else if hovered {
+            draw_list.push_rect(
+                tab_rect,
+                tokens.surface_row_hover,
+                Some(tokens.border_hairline),
+                1.0,
+                cap_radius(6.0, theme_rounding),
+                None,
+            );
+        }
+        draw_list.push_text(
+            tab_rect,
+            title,
+            if active {
+                tokens.accent_primary
+            } else {
+                tokens.fg_secondary
+            },
+            FontKind::Sans,
+            11.5,
+            if active {
+                FontWeight::SemiBold
+            } else {
+                FontWeight::Regular
+            },
+            TextAlign::Center,
+            true,
+        );
+        draw_list.push_hit(tab_rect, tab_hit, z_layer::MODAL + 1);
+    }
+
+    let mut y = card.y + 46.0 + tab_bar_h + 6.0;
     let row_r = cap_radius(7.0, theme_rounding);
     for (idx, (key, label, value)) in rows.into_iter().enumerate() {
         let row_rect = RectF::new(card.x + 8.0, y, (card.w - 16.0).max(0.0), 34.0);
@@ -1644,7 +3225,7 @@ fn render_settings_modal(
             RectF::new(
                 row_rect.x + 10.0,
                 row_rect.y + 8.0,
-                (row_rect.w - 150.0).max(0.0),
+                (row_rect.w - 166.0).max(0.0),
                 18.0,
             ),
             label,
@@ -1656,9 +3237,9 @@ fn render_settings_modal(
             true,
         );
         let pill = RectF::new(
-            (row_rect.right() - 134.0).max(row_rect.x),
+            (row_rect.right() - 150.0).max(row_rect.x),
             row_rect.y + 6.0,
-            124.0,
+            140.0,
             22.0,
         );
         draw_list.push_rect(
@@ -1678,7 +3259,7 @@ fn render_settings_modal(
             value,
             tokens.accent_primary,
             FontKind::Mono,
-            11.0,
+            10.5,
             FontWeight::Medium,
             TextAlign::Center,
             true,
@@ -2411,5 +3992,34 @@ pub fn render_toasts(
             HitTarget::ToastBody { id: toast.id },
             z_layer::TOAST + 1,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_gap02_modal_scrollbar_clamps_safely_on_short_list_rect() {
+        let mut dl = UiDrawList::new();
+        let tokens = Theme::default().effective_ui();
+        // list_rect.h = 28.0 -> >= 24.0 guard, track_h = 16.0 < 20.0.
+        render_modal_scrollbar(
+            &mut dl,
+            RectF::new(0.0, 0.0, 400.0, 28.0),
+            2,
+            8,
+            30,
+            &tokens,
+        );
+        dl.validate_invariants()
+            .expect("short modal scrollbar draw list must be valid");
+        assert_eq!(dl.primitives.len(), 1);
+        match &dl.primitives[0] {
+            crate::draw::UiPrimitive::RoundedRect { rect, .. } => {
+                assert!(rect.h > 0.0 && rect.h <= 16.0 + 0.01);
+            }
+            other => panic!("expected RoundedRect primitive, got {other:?}"),
+        }
     }
 }

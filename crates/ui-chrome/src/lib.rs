@@ -3,6 +3,7 @@
 //! horizontal tab bar, inset pane chrome, unified modals + `rex.ui` prompts, context menus,
 //! and `/pr` floating drawer styling).
 
+pub mod anim;
 pub mod draw;
 pub mod drawer;
 pub mod file_paths;
@@ -12,6 +13,7 @@ pub mod modal;
 pub mod palette;
 pub mod pane_chrome;
 pub mod sidebar;
+pub mod syntax;
 pub mod tabbar;
 pub mod text_input;
 pub mod viewer;
@@ -21,10 +23,12 @@ use std::time::Instant;
 use omarchy_theme::Theme;
 use tr3x_bridge::prompts::PromptSession;
 
+pub use anim::{Spring1D, SpringRect};
 pub use draw::{
     FocusGuard, FocusTarget, FontKind, FontWeight, HitEntry, HitTarget, ModalKind,
-    PaneHeaderButton, SettingChange, ShadowSpec, TextAlign, UiAction, UiDrawList, UiInteraction,
-    UiPrimitive, ViewerAction, cap_radius, z_layer,
+    PaneHeaderButton, SettingChange, SettingsCategory, ShadowSpec, TabReorderOverlay, TextAlign,
+    TextSpan, UiAction, UiDrawList, UiInteraction, UiPrimitive, UiTextMeasurer, ViewerAction,
+    cap_radius, z_layer,
 };
 pub use drawer::{
     ContextMenuItem, ContextMenuState, HoverPreviewState, render_context_menu,
@@ -43,18 +47,20 @@ pub use layout::{
     FloatingLayerSpec, FloatingPaneGeometry, MinimizedCapsuleGeometry, MinimizedCorner,
     PaneDensity, PaneGeometry, PaneHeaderMode, RectF, SplitAxis, SplitLayoutResult, SplitNode,
     ToolbarBehavior, ToolbarPosition, VIEWER_DEFAULT_RATIO, VIEWER_MAX_RATIO, VIEWER_MIN_RATIO,
-    ViewerSplitGeometry, clamp_viewer_ratio, compute_chrome_layout, compute_drag_ratio,
-    compute_viewer_drag_ratio, hit_test_divider, hit_test_drop_zone, hit_test_floating_pane,
-    layout_floating_layers, layout_minimized_capsules, layout_splits, layout_workspace_with_viewer,
+    ViewerSplitGeometry, clamp_viewer_ratio, compute_chrome_layout, compute_chrome_layout_animated,
+    compute_drag_ratio, compute_viewer_drag_ratio, hit_test_divider, hit_test_drop_zone,
+    hit_test_floating_pane, layout_floating_layers, layout_minimized_capsules, layout_splits,
+    layout_workspace_with_viewer, layout_workspace_with_viewer_animated,
 };
 pub use modal::{
-    FindBarState, ModalContent, ModalKey, ModalKeyOutcome, ModalState, SettingsViewSnapshot,
-    ToastAnchor, ToastItem, ToastSeverity, WhichKeyState, render_find_bar, render_modal,
-    render_toasts, render_which_key,
+    DiagnosticsHostRow, DiagnosticsSnapshot, FilePickerEntry, FilePickerPurpose, FindBarState,
+    ModalContent, ModalKey, ModalKeyOutcome, ModalState, SettingsViewSnapshot, ToastAnchor,
+    ToastItem, ToastSeverity, WhichKeyState, render_find_bar, render_modal, render_toasts,
+    render_which_key,
 };
 pub use palette::{PaletteItem, PaletteMatcher, ScoredMatch, highlight_spans};
 pub use pane_chrome::{
-    Osc94Progress, Osc94State, PaneChromeOptions, PaneMeta, ScrollbarMetrics,
+    Osc94Progress, Osc94State, PaneChromeOptions, PaneMeta, PortBadge, ScrollbarMetrics,
     render_workspace_chrome,
 };
 pub use sidebar::{
@@ -65,11 +71,15 @@ pub use sidebar::{
 pub use tabbar::{TabBarView, render_tab_bar};
 pub use text_input::{ImePreedit, TextInput};
 pub use viewer::{
-    ComputedMediaPlacement, ImageViewerState, MAX_ZOOM, MIN_ZOOM, MediaViewportState,
-    TEXT_LINE_HEIGHT, TextViewerState, VideoViewerState, ViewerContent, ViewerImagePlacement,
-    ViewerRenderMetrics, ViewerRenderOutput, ViewerState, ViewerTab, ViewerTabKind,
-    ZOOM_STEP_FACTOR, compute_fit_zoom, compute_media_placement, format_file_size, render_viewer,
-    scrub_fraction_from_x, scrub_time_from_x,
+    AudioViewerState, ComputedMediaPlacement, DiffGutterKind, DiffLineKind, GitDiffHunk,
+    GitDiffLine, GitFileDiff, ImageViewerState, MAX_ZOOM, MIN_ZOOM, MarkdownInlineImage,
+    MediaViewportState, PdfViewerState, RenderedRowMap, TEXT_LINE_HEIGHT, TextDocPos,
+    TextViewerState, VideoViewerState, ViewerContent, ViewerImagePlacement, ViewerRenderMetrics,
+    ViewerRenderOutput, ViewerSearchMatch, ViewerSearchState, ViewerState, ViewerTab,
+    ViewerTabKind, ZOOM_STEP_FACTOR, compute_fit_zoom, compute_media_placement,
+    extract_markdown_image_refs, format_file_size, is_closing_markdown_fence, parse_markdown_fence,
+    parse_markdown_image_target, render_viewer, render_viewer_with_measurer, scrub_fraction_from_x,
+    scrub_time_from_x,
 };
 
 /// Snapshot of workspace state fed into [`UiTree::render`] each frame.
@@ -129,8 +139,12 @@ pub struct UiTree {
     pub pointer_pos: (f32, f32),
     /// Horizontal scroll offset for overflowing top/bottom tab strips.
     pub tabbar_scroll_x: f32,
+    /// Visual overlay for active tab drag-to-reorder.
+    pub tab_reorder_overlay: Option<TabReorderOverlay>,
     /// Latest known online/connecting state per host (for `Disconnect` vs `Connect` menu item).
     host_connected: std::collections::HashMap<String, bool>,
+    /// Spring-physics and slide/fade transition state for border, sidebar, viewer, and modals.
+    anim: anim::UiAnimationState,
 }
 
 impl Default for UiTree {
@@ -160,8 +174,34 @@ impl UiTree {
             pressed_hit: None,
             pointer_pos: (0.0, 0.0),
             tabbar_scroll_x: 0.0,
+            tab_reorder_overlay: None,
             host_connected: std::collections::HashMap::new(),
+            anim: anim::UiAnimationState::default(),
         }
+    }
+
+    /// Advances all UI chrome spring and slide/fade animations to `now`.
+    /// Returns `true` if any animated visual state changed or is still in motion.
+    pub fn tick_animations(&mut self, now: Instant) -> bool {
+        self.anim.tick(now)
+    }
+
+    /// Returns `true` when any UI chrome spring or slide/fade animation is actively running.
+    #[must_use]
+    pub fn has_active_animations(&self) -> bool {
+        self.anim.has_active_animations()
+    }
+
+    /// Returns `true` while a docked sidebar or right-hand viewer slide changes terminal workspace
+    /// dimensions (used to defer PTY `TerminalResize` RPCs until settled).
+    #[must_use]
+    pub fn is_layout_animating(&self) -> bool {
+        self.anim.is_layout_animating()
+    }
+
+    /// Immediately snaps all active UI animations to their target state (used by `--headless-render`).
+    pub fn snap_animations(&mut self) {
+        self.anim.snap_all();
     }
 
     /// Borrowed interaction state snapshot passed into chrome renderers.
@@ -252,6 +292,8 @@ impl UiTree {
     pub fn open_modal(&mut self, modal: ModalState) {
         let kind = modal.kind();
         self.context_menu = None;
+        self.anim.closing_modal = None;
+        self.anim.modal_open_progress = anim::Spring1D::transition_from(0.05, 1.0);
         self.modal = Some(modal);
         self.focus.focus_modal(kind);
     }
@@ -275,9 +317,13 @@ impl UiTree {
         }
     }
 
-    /// Closes any active modal and restores terminal focus.
+    /// Closes any active modal and restores terminal focus immediately while spawning a
+    /// non-blocking visual fade-out shadow.
     pub fn close_modal(&mut self) {
-        self.modal = None;
+        if let Some(closed) = self.modal.take() {
+            let start_p = self.anim.modal_open_progress.value.clamp(0.05, 1.0);
+            self.anim.closing_modal = Some((closed, anim::Spring1D::transition_from(start_p, 0.0)));
+        }
         if matches!(self.focus.current(), FocusTarget::Modal(_)) {
             self.focus.restore_terminal();
         }
@@ -317,12 +363,59 @@ impl UiTree {
         }
     }
 
-    /// Closes the docked right-hand Viewer Pane and restores terminal focus if it owned focus.
+    /// Closes the docked right-hand Viewer Pane and restores terminal focus immediately while
+    /// preserving a non-blocking slide-out shadow.
     pub fn close_viewer(&mut self) {
+        if self.viewer.open {
+            let start_p = self.anim.viewer_progress.value.clamp(0.05, 1.0);
+            if let Some(last_vs) = self.anim.last_viewer_split {
+                self.anim.closing_viewer = Some((
+                    last_vs,
+                    self.viewer.clone(),
+                    anim::Spring1D::transition_from(start_p, 0.0),
+                ));
+            }
+        }
         self.viewer.close_pane();
-        if matches!(self.focus.current(), FocusTarget::Viewer) {
+        self.viewer.close_search();
+        self.anim.viewer_progress.snap(0.0);
+        if matches!(
+            self.focus.current(),
+            FocusTarget::Viewer | FocusTarget::ViewerSearch
+        ) {
             self.focus.restore_terminal();
         }
+    }
+
+    /// Closes a single viewer tab by `tab_id`, preserving the slide-out fade shadow when closing
+    /// the last remaining tab.
+    pub fn close_viewer_tab(&mut self, tab_id: u64) -> Option<viewer::ViewerTab> {
+        let closing_last =
+            self.viewer.open && self.viewer.tabs.len() == 1 && self.viewer.tabs[0].id == tab_id;
+        if closing_last {
+            let start_p = self.anim.viewer_progress.value.clamp(0.05, 1.0);
+            if let Some(last_vs) = self.anim.last_viewer_split {
+                self.anim.closing_viewer = Some((
+                    last_vs,
+                    self.viewer.clone(),
+                    anim::Spring1D::transition_from(start_p, 0.0),
+                ));
+            }
+        }
+        let removed = self.viewer.close_tab_by_id(tab_id);
+        if closing_last && !self.viewer.open {
+            self.anim.viewer_progress.snap(0.0);
+        }
+        if !self.viewer.open
+            && matches!(
+                self.focus.current(),
+                FocusTarget::Viewer | FocusTarget::ViewerSearch
+            )
+        {
+            self.viewer.close_search();
+            self.focus.restore_terminal();
+        }
+        removed
     }
 
     /// Feeds measured viewer layout metrics from [`UiRenderOutput::viewer_metrics`] back into [`ViewerState`].
@@ -342,7 +435,17 @@ impl UiTree {
                 UiAction::CloseModal
             }
             ModalKeyOutcome::Action(action) => {
-                if !matches!(action, UiAction::UpdateSetting(_)) {
+                let keep_open = matches!(
+                    action,
+                    UiAction::UpdateSetting(ref ch) if !matches!(ch, SettingChange::OpenThemePicker)
+                ) || matches!(
+                    action,
+                    UiAction::FilePickerDescend { .. }
+                        | UiAction::FilePickerParent
+                        | UiAction::ThemePickerPreview { .. }
+                        | UiAction::CopyDiagnosticsBundle
+                );
+                if !keep_open {
                     self.close_modal();
                 }
                 action
@@ -500,6 +603,13 @@ impl UiTree {
                     self.close_modal();
                     return UiAction::ReplyRexPrompt(reply);
                 }
+                if matches!(
+                    self.modal.as_ref().map(|m| &m.content),
+                    Some(ModalContent::ThemePicker { .. })
+                ) {
+                    self.close_modal();
+                    return UiAction::ThemePickerCancel;
+                }
                 self.close_modal();
                 UiAction::CloseModal
             }
@@ -520,7 +630,15 @@ impl UiTree {
             HitTarget::SettingsToggle { key } => {
                 if let Some(modal) = self.modal.as_mut() {
                     match modal.activate_setting_key(&key) {
-                        ModalKeyOutcome::Action(action) => action,
+                        ModalKeyOutcome::Action(action) => {
+                            if matches!(
+                                action,
+                                UiAction::UpdateSetting(SettingChange::OpenThemePicker)
+                            ) {
+                                self.close_modal();
+                            }
+                            action
+                        }
                         ModalKeyOutcome::Closed => {
                             self.close_modal();
                             UiAction::CloseModal
@@ -535,6 +653,13 @@ impl UiTree {
                     UiAction::None
                 }
             }
+            HitTarget::SettingsCategoryTab(cat) => {
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.select_settings_category(cat);
+                }
+                UiAction::None
+            }
+            HitTarget::DiagnosticsCopyBundle => UiAction::CopyDiagnosticsBundle,
             HitTarget::SidebarToggle => {
                 if self.layout_cfg.toolbar_behavior == ToolbarBehavior::Always
                     && !self.layout_cfg.sidebar_collapsed
@@ -655,6 +780,13 @@ impl UiTree {
             }
             HitTarget::PaneButton { block_id, button } => UiAction::PaneButton { block_id, button },
             HitTarget::PaneZoomBadge { block_id } => UiAction::UnzoomPane { block_id },
+            HitTarget::PanePortPill { block_id, port } => {
+                UiAction::OpenPortAction { block_id, port }
+            }
+            HitTarget::PaneNewOutputPill { block_id } => {
+                self.focus.focus_terminal(Some(block_id.clone()));
+                UiAction::ScrollPaneToBottom { block_id }
+            }
             HitTarget::PaneScrollbarTrack { block_id }
             | HitTarget::PaneScrollbarThumb { block_id } => {
                 let track = draw_list
@@ -706,20 +838,20 @@ impl UiTree {
                 UiAction::DismissToast { id }
             }
             HitTarget::ViewerDivider => UiAction::Viewer(ViewerAction::BeginDividerDrag),
-            HitTarget::ViewerSurface => {
+            HitTarget::ViewerSurface | HitTarget::ViewerTextBody => {
                 self.focus_viewer();
                 UiAction::Viewer(ViewerAction::Focus)
             }
             HitTarget::ViewerTab { tab_id } => {
                 self.viewer.select_tab_by_id(tab_id);
+                if self.viewer.search.open {
+                    self.viewer.recompute_search();
+                }
                 self.focus_viewer();
                 UiAction::Viewer(ViewerAction::SelectTab { tab_id })
             }
             HitTarget::ViewerTabClose { tab_id } => {
-                self.viewer.close_tab_by_id(tab_id);
-                if !self.viewer.open && matches!(self.focus.current(), FocusTarget::Viewer) {
-                    self.focus.restore_terminal();
-                }
+                self.close_viewer_tab(tab_id);
                 UiAction::Viewer(ViewerAction::CloseTab { tab_id })
             }
             HitTarget::ViewerCopyPath => {
@@ -727,6 +859,20 @@ impl UiTree {
                 self.viewer.active_tab().map_or(UiAction::None, |tab| {
                     UiAction::Viewer(ViewerAction::CopyPath {
                         path: tab.path.clone(),
+                    })
+                })
+            }
+            HitTarget::ViewerCopyPathLine => {
+                self.focus_viewer();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    let line = match &tab.content {
+                        ViewerContent::Text(txt) => txt.target_or_active_line(),
+                        ViewerContent::Pdf(pdf) => pdf.current_page,
+                        _ => 1,
+                    };
+                    UiAction::Viewer(ViewerAction::CopyPathLine {
+                        path: tab.path.clone(),
+                        line,
                     })
                 })
             }
@@ -757,6 +903,43 @@ impl UiTree {
                 self.focus_viewer();
                 self.viewer.toggle_raw_markdown();
                 UiAction::Viewer(ViewerAction::ToggleRawMarkdown)
+            }
+            HitTarget::ViewerDiffToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_diff_mode();
+                UiAction::Viewer(ViewerAction::ToggleDiff)
+            }
+            HitTarget::ViewerLink { url } => {
+                self.focus_viewer();
+                let base_path = self
+                    .viewer
+                    .active_tab()
+                    .map_or_else(String::new, |t| t.path.clone());
+                UiAction::Viewer(ViewerAction::OpenLink { url, base_path })
+            }
+            HitTarget::ViewerSearchInput => {
+                self.focus.focus_viewer_search();
+                UiAction::Viewer(ViewerAction::SearchOpen)
+            }
+            HitTarget::ViewerSearchPrev => {
+                self.focus.focus_viewer_search();
+                self.viewer.prev_search_match();
+                UiAction::Viewer(ViewerAction::SearchPrev)
+            }
+            HitTarget::ViewerSearchNext => {
+                self.focus.focus_viewer_search();
+                self.viewer.next_search_match();
+                UiAction::Viewer(ViewerAction::SearchNext)
+            }
+            HitTarget::ViewerSearchCaseToggle => {
+                self.focus.focus_viewer_search();
+                self.viewer.toggle_search_case();
+                UiAction::Viewer(ViewerAction::SearchToggleCase)
+            }
+            HitTarget::ViewerSearchClose => {
+                self.viewer.close_search();
+                self.focus_viewer();
+                UiAction::Viewer(ViewerAction::SearchClose)
             }
             HitTarget::ViewerZoomOut => {
                 self.focus_viewer();
@@ -814,6 +997,50 @@ impl UiTree {
                     UiAction::Viewer(ViewerAction::ToggleVideoLoop { tab_id: tab.id })
                 })
             }
+            HitTarget::ViewerAudioPlayPause => {
+                self.focus_viewer();
+                self.viewer.toggle_audio_play_pause();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ToggleAudioPlayPause { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerAudioSeekBar | HitTarget::ViewerAudioWaveform => {
+                self.focus_viewer();
+                let fraction = scrub_fraction_from_x(hit_rect, px);
+                self.viewer.seek_active_audio_fraction(fraction);
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::SeekAudio {
+                        tab_id: tab.id,
+                        fraction,
+                    })
+                })
+            }
+            HitTarget::ViewerAudioMuteToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_audio_mute();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ToggleAudioMute { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerAudioLoopToggle => {
+                self.focus_viewer();
+                self.viewer.toggle_audio_loop();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::ToggleAudioLoop { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerPdfPrevPage => {
+                self.focus_viewer();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::PdfPrevPage { tab_id: tab.id })
+                })
+            }
+            HitTarget::ViewerPdfNextPage => {
+                self.focus_viewer();
+                self.viewer.active_tab().map_or(UiAction::None, |tab| {
+                    UiAction::Viewer(ViewerAction::PdfNextPage { tab_id: tab.id })
+                })
+            }
             HitTarget::ViewerScrollbarTrack | HitTarget::ViewerScrollbarThumb => {
                 self.focus_viewer();
                 let track = draw_list
@@ -849,7 +1076,17 @@ impl UiTree {
                 UiAction::CloseModal
             }
             ModalKeyOutcome::Action(action) => {
-                if !matches!(action, UiAction::UpdateSetting(_)) {
+                let keep_open = matches!(
+                    action,
+                    UiAction::UpdateSetting(ref ch) if !matches!(ch, SettingChange::OpenThemePicker)
+                ) || matches!(
+                    action,
+                    UiAction::FilePickerDescend { .. }
+                        | UiAction::FilePickerParent
+                        | UiAction::ThemePickerPreview { .. }
+                        | UiAction::CopyDiagnosticsBundle
+                );
+                if !keep_open {
                     self.close_modal();
                 }
                 action
@@ -896,11 +1133,24 @@ impl UiTree {
 
     /// Computes layout and emits the complete backend-agnostic [`UiDrawList`] for one frame.
     pub fn render(
-        &self,
+        &mut self,
         input: &UiFrameInput,
         theme: &Theme,
         now: Instant,
         anim_phase: f32,
+    ) -> UiRenderOutput {
+        self.render_with_measurer(input, theme, now, anim_phase, None)
+    }
+
+    /// Same as [`Self::render`], passing an optional [`UiTextMeasurer`] for exact proportional
+    /// link hit-rects & underlines in the Markdown viewer.
+    pub fn render_with_measurer(
+        &mut self,
+        input: &UiFrameInput,
+        theme: &Theme,
+        now: Instant,
+        anim_phase: f32,
+        measurer: Option<&mut dyn UiTextMeasurer>,
     ) -> UiRenderOutput {
         let mut draw_list = UiDrawList::new();
         let tokens = theme.effective_ui();
@@ -916,8 +1166,45 @@ impl UiTree {
         effective_theme.rounding = cfg.pane_corner_radius();
         let theme = &effective_theme;
 
-        // 1. Taffy outer chrome layout
-        let chrome = compute_chrome_layout(input.viewport_w, input.viewport_h, &cfg);
+        // 1. Taffy outer chrome layout (with smooth sidebar open/close slide)
+        let chrome_target = compute_chrome_layout(input.viewport_w, input.viewport_h, &cfg);
+        let sidebar_target_visible = chrome_target.sidebar.is_some();
+        if !self.anim.sidebar_initialized {
+            self.anim
+                .sidebar_progress
+                .snap(if sidebar_target_visible { 1.0 } else { 0.0 });
+            self.anim.sidebar_initialized = true;
+            self.anim.last_sidebar_auto_collapsed = chrome_target.sidebar_auto_collapsed;
+            self.anim.last_sidebar_is_overlay = chrome_target.toolbar_is_overlay;
+        } else if self.anim.last_sidebar_auto_collapsed != chrome_target.sidebar_auto_collapsed {
+            self.anim
+                .sidebar_progress
+                .snap(if sidebar_target_visible { 1.0 } else { 0.0 });
+            self.anim.last_sidebar_auto_collapsed = chrome_target.sidebar_auto_collapsed;
+        } else {
+            self.anim
+                .sidebar_progress
+                .set_target(if sidebar_target_visible { 1.0 } else { 0.0 });
+            if sidebar_target_visible && self.anim.sidebar_progress.value <= 0.005 {
+                self.anim.sidebar_progress.value = 0.08;
+            }
+        }
+        let sp = self.anim.sidebar_progress.value.clamp(0.0, 1.0);
+        let is_overlay_sidebar = chrome_target.toolbar_is_overlay
+            || (self.anim.last_sidebar_is_overlay && !sidebar_target_visible);
+        let chrome = if !is_overlay_sidebar
+            && cfg.toolbar_position.is_sidebar()
+            && cfg.toolbar_behavior == ToolbarBehavior::Always
+        {
+            compute_chrome_layout_animated(input.viewport_w, input.viewport_h, &cfg, sp)
+        } else {
+            chrome_target
+        };
+        if let Some(sb_rect) = chrome.sidebar {
+            self.anim.last_sidebar_rect = chrome_target.sidebar.or(Some(sb_rect));
+            self.anim.last_sidebar_is_right = cfg.toolbar_position == ToolbarPosition::Right;
+            self.anim.last_sidebar_is_overlay = chrome.toolbar_is_overlay;
+        }
         draw_list.push_rect(chrome.viewport, tokens.surface_frame, None, 0.0, 0.0, None);
 
         if let Some(edge) = chrome.hot_edge {
@@ -925,13 +1212,48 @@ impl UiTree {
         }
 
         // 2. Optional docked right-hand Viewer Pane horizontal split inside `chrome.workspace`
-        let viewer_split = layout_workspace_with_viewer(
+        if !self.anim.viewer_initialized {
+            self.anim
+                .viewer_progress
+                .snap(if self.viewer.open { 1.0 } else { 0.0 });
+            self.anim.viewer_initialized = true;
+        } else {
+            self.anim
+                .viewer_progress
+                .set_target(if self.viewer.open { 1.0 } else { 0.0 });
+        }
+        let vp = self.anim.viewer_progress.value.clamp(0.0, 1.0);
+        let target_viewer_split = layout_workspace_with_viewer(
             chrome.workspace,
             self.viewer.open,
             self.viewer.maximized,
             self.viewer.split_ratio,
             &cfg,
         );
+        if let Some(vs) = target_viewer_split {
+            self.anim.last_viewer_split = Some(vs);
+        }
+        let viewer_split = if self.viewer.open {
+            layout_workspace_with_viewer_animated(
+                chrome.workspace,
+                true,
+                self.viewer.maximized,
+                self.viewer.split_ratio,
+                &cfg,
+                vp.max(0.05),
+            )
+        } else if let Some((ref closing_vs, _, ref closing_sp)) = self.anim.closing_viewer {
+            layout_workspace_with_viewer_animated(
+                chrome.workspace,
+                true,
+                closing_vs.effective_ratio >= 0.999,
+                closing_vs.effective_ratio,
+                &cfg,
+                closing_sp.value,
+            )
+        } else {
+            None
+        };
         let terminal_workspace = viewer_split.map_or(chrome.workspace, |vs| vs.terminal_workspace);
 
         // 2b. Binary split tree, floating layers, and minimized capsules inside `terminal_workspace`
@@ -967,6 +1289,51 @@ impl UiTree {
             )
         };
 
+        // Sync spring-physics active-pane border target (snaps on first pane, window resize,
+        // or split-divider resize; spring-animates on focus switch or zoom toggle).
+        let focused_pane = tiled_panes
+            .iter()
+            .find(|g| {
+                input
+                    .pane_metas
+                    .iter()
+                    .any(|m| m.block_id == g.id && m.focused)
+            })
+            .or_else(|| tiled_panes.first());
+        let spring_active_border = if let Some(fgeo) = focused_pane {
+            let target = fgeo.card_rect;
+            let same_block = self.anim.active_border_block.as_deref() == Some(fgeo.id.as_str());
+            let zoom_changed = self.anim.active_border_zoomed != input.zoomed_pane;
+            let viewport_changed =
+                self.anim.active_border_viewport != Some((input.viewport_w, input.viewport_h));
+
+            match &mut self.anim.active_border_rect {
+                None => {
+                    self.anim.active_border_rect = Some(SpringRect::from_rect(target));
+                }
+                Some(rect) => {
+                    if !same_block || zoom_changed {
+                        rect.set_target(target);
+                    } else if viewport_changed || rect.target() != target {
+                        rect.snap(target);
+                    }
+                }
+            }
+            self.anim.active_border_block = Some(fgeo.id.clone());
+            self.anim.active_border_viewport = Some((input.viewport_w, input.viewport_h));
+            self.anim.active_border_zoomed = input.zoomed_pane.clone();
+            self.anim.active_border_rect.map(|r| r.current())
+        } else {
+            self.anim.active_border_rect = None;
+            self.anim.active_border_block = None;
+            self.anim.active_border_viewport = Some((input.viewport_w, input.viewport_h));
+            self.anim.active_border_zoomed = input.zoomed_pane.clone();
+            None
+        };
+
+        if self.viewer.open {
+            self.anim.closing_viewer = None;
+        }
         let interaction = self.interaction();
         let show_sidebar_expand = cfg.toolbar_position.is_sidebar()
             && chrome.sidebar.is_none()
@@ -984,44 +1351,181 @@ impl UiTree {
                 self.pane_options,
                 input.dnd_overlay,
                 show_sidebar_expand,
+                spring_active_border,
                 interaction,
                 theme,
                 anim_phase,
             );
         }
 
-        // 2c. Docked right-hand tabbed Viewer Pane
-        let viewer_out = if let Some(vs) = viewer_split {
-            render_viewer(
-                &mut draw_list,
-                vs,
-                &self.viewer,
-                self.focus.current() == &FocusTarget::Viewer,
-                self.pane_options.highlight_active_border,
-                self.pane_options.active_border_opacity,
-                interaction,
-                theme,
-                anim_phase,
-            )
+        // 2c. Docked right-hand tabbed Viewer Pane (with slide/fade open & non-blocking close shadow)
+        let viewer_focused = matches!(
+            self.focus.current(),
+            FocusTarget::Viewer | FocusTarget::ViewerSearch
+        );
+        let viewer_out = if self.viewer.open {
+            if let Some(target_vs) = target_viewer_split {
+                if vp >= 0.995 {
+                    render_viewer_with_measurer(
+                        &mut draw_list,
+                        target_vs,
+                        &self.viewer,
+                        viewer_focused,
+                        self.pane_options.highlight_active_border,
+                        self.pane_options.active_border_opacity,
+                        interaction,
+                        theme,
+                        anim_phase,
+                        measurer,
+                    )
+                } else {
+                    draw_list.push_clip(chrome.workspace);
+                    let start_p = draw_list.primitives.len();
+                    let out = render_viewer_with_measurer(
+                        &mut draw_list,
+                        target_vs,
+                        &self.viewer,
+                        viewer_focused,
+                        self.pane_options.highlight_active_border,
+                        self.pane_options.active_border_opacity,
+                        interaction,
+                        theme,
+                        anim_phase,
+                        measurer,
+                    );
+                    let dx = (1.0 - vp) * target_vs.viewer_rect.w;
+                    draw_list.apply_transition(start_p, dx, 0.0, vp.max(0.05));
+                    draw_list.pop_clip();
+                    out
+                }
+            } else {
+                ViewerRenderOutput::default()
+            }
+        } else if let Some((ref closing_vs, ref closing_state, ref closing_sp)) =
+            self.anim.closing_viewer
+        {
+            let p = closing_sp.value.clamp(0.0, 1.0);
+            if p > 0.005 {
+                draw_list.push_clip(chrome.workspace);
+                let start_p = draw_list.primitives.len();
+                let start_h = draw_list.hits.len();
+                let _ = render_viewer_with_measurer(
+                    &mut draw_list,
+                    *closing_vs,
+                    closing_state,
+                    false,
+                    self.pane_options.highlight_active_border,
+                    self.pane_options.active_border_opacity,
+                    interaction,
+                    theme,
+                    anim_phase,
+                    measurer,
+                );
+                draw_list.hits.truncate(start_h);
+                let dx = (1.0 - p) * closing_vs.viewer_rect.w;
+                draw_list.apply_transition(start_p, dx, 0.0, p);
+                draw_list.pop_clip();
+            }
+            ViewerRenderOutput::default()
         } else {
             ViewerRenderOutput::default()
         };
 
-        // 3. Sidebar or horizontal Tab Bar
+        // 3. Sidebar or horizontal Tab Bar (with smooth slide/fade)
         let sidebar_scroll = if let Some(sb_rect) = chrome.sidebar {
-            render_sidebar(
-                &mut draw_list,
-                sb_rect,
-                chrome.sidebar_resize_handle,
-                cfg.toolbar_position == ToolbarPosition::Right,
-                chrome.toolbar_is_overlay,
-                &input.hosts,
-                &self.sidebar,
-                self.focus.current(),
-                interaction,
-                theme,
-                anim_phase,
-            )
+            if sp >= 0.995 {
+                render_sidebar(
+                    &mut draw_list,
+                    sb_rect,
+                    chrome.sidebar_resize_handle,
+                    cfg.toolbar_position == ToolbarPosition::Right,
+                    chrome.toolbar_is_overlay,
+                    &input.hosts,
+                    &self.sidebar,
+                    self.focus.current(),
+                    interaction,
+                    theme,
+                    anim_phase,
+                    self.tab_reorder_overlay.as_ref(),
+                )
+            } else if sp > 0.005 {
+                let target_w = cfg.responsive_sidebar_width(input.viewport_w);
+                let full_rect = chrome_target.sidebar.unwrap_or_else(|| {
+                    if cfg.toolbar_position == ToolbarPosition::Right {
+                        RectF::new(
+                            (input.viewport_w - target_w).max(0.0),
+                            0.0,
+                            target_w,
+                            input.viewport_h,
+                        )
+                    } else {
+                        RectF::new(0.0, 0.0, target_w, input.viewport_h)
+                    }
+                });
+                let dx = if cfg.toolbar_position == ToolbarPosition::Right {
+                    (1.0 - sp) * full_rect.w
+                } else {
+                    -(1.0 - sp) * full_rect.w
+                };
+                draw_list.push_clip(if chrome.toolbar_is_overlay {
+                    chrome.viewport
+                } else {
+                    sb_rect
+                });
+                let start_p = draw_list.primitives.len();
+                let start_h = draw_list.hits.len();
+                let scroll = render_sidebar(
+                    &mut draw_list,
+                    full_rect,
+                    chrome.sidebar_resize_handle,
+                    cfg.toolbar_position == ToolbarPosition::Right,
+                    chrome.toolbar_is_overlay,
+                    &input.hosts,
+                    &self.sidebar,
+                    self.focus.current(),
+                    interaction,
+                    theme,
+                    anim_phase,
+                    self.tab_reorder_overlay.as_ref(),
+                );
+                if !sidebar_target_visible {
+                    draw_list.hits.truncate(start_h);
+                }
+                draw_list.apply_transition(start_p, dx, 0.0, sp.max(0.05));
+                draw_list.pop_clip();
+                scroll
+            } else {
+                SidebarScrollMetrics::default()
+            }
+        } else if !sidebar_target_visible && sp > 0.005 && self.anim.last_sidebar_is_overlay {
+            if let Some(prev_sb) = self.anim.last_sidebar_rect {
+                let dx = if self.anim.last_sidebar_is_right {
+                    (1.0 - sp) * prev_sb.w
+                } else {
+                    -(1.0 - sp) * prev_sb.w
+                };
+                draw_list.push_clip(chrome.viewport);
+                let start_p = draw_list.primitives.len();
+                let start_h = draw_list.hits.len();
+                let _ = render_sidebar(
+                    &mut draw_list,
+                    prev_sb,
+                    None,
+                    self.anim.last_sidebar_is_right,
+                    true,
+                    &input.hosts,
+                    &self.sidebar,
+                    self.focus.current(),
+                    interaction,
+                    theme,
+                    anim_phase,
+                    None,
+                );
+                draw_list.hits.truncate(start_h);
+                draw_list.apply_transition(start_p, dx, 0.0, sp);
+                draw_list.pop_clip();
+            }
+            SidebarScrollMetrics::default()
         } else {
             if let Some(tb_rect) = chrome.tab_bar {
                 let active_tabs: &[SidebarTabView] = input
@@ -1055,6 +1559,7 @@ impl UiTree {
                     scroll_offset_x: self.tabbar_scroll_x,
                     is_bottom: cfg.toolbar_position == ToolbarPosition::Bottom,
                     is_overlay: chrome.toolbar_is_overlay,
+                    tab_reorder_overlay: self.tab_reorder_overlay.as_ref(),
                 };
                 render_tab_bar(
                     &mut draw_list,
@@ -1108,6 +1613,8 @@ impl UiTree {
 
         // 8. Active centered Modal (Command Palette, Settings, `rex.ui` prompt, etc.)
         if let Some(modal) = &self.modal {
+            let mp = self.anim.modal_open_progress.value.clamp(0.05, 1.0);
+            let start_p = draw_list.primitives.len();
             render_modal(
                 &mut draw_list,
                 chrome.viewport,
@@ -1116,6 +1623,25 @@ impl UiTree {
                 theme,
                 now,
             );
+            if mp < 0.995 {
+                draw_list.apply_transition(start_p, 0.0, (1.0 - mp) * 10.0, mp);
+            }
+        } else if let Some((ref closing_modal, ref closing_sp)) = self.anim.closing_modal {
+            let p = closing_sp.value.clamp(0.0, 1.0);
+            if p > 0.005 {
+                let start_p = draw_list.primitives.len();
+                let start_h = draw_list.hits.len();
+                render_modal(
+                    &mut draw_list,
+                    chrome.viewport,
+                    closing_modal,
+                    interaction,
+                    theme,
+                    now,
+                );
+                draw_list.hits.truncate(start_h);
+                draw_list.apply_transition(start_p, 0.0, (1.0 - p) * 10.0, p);
+            }
         }
 
         // 9. Topmost Right-Click Context Menu
@@ -1281,6 +1807,9 @@ mod tests {
                         hovered: false,
                     },
                     program_bg: None,
+                    has_unread_output: false,
+                    copy_mode_badge: None,
+                    listening_ports: Vec::new(),
                     is_pr_drawer: false,
                     pr_subtitle: None,
                 },
@@ -1296,6 +1825,9 @@ mod tests {
                     osc94_progress: None,
                     scrollbar: ScrollbarMetrics::default(),
                     program_bg: None,
+                    has_unread_output: false,
+                    copy_mode_badge: None,
+                    listening_ports: Vec::new(),
                     is_pr_drawer: true,
                     pr_subtitle: Some("#177 · feat/omarex".into()),
                 },
@@ -1724,6 +2256,7 @@ mod tests {
         let snap = SettingsViewSnapshot::from_config(
             &tree.layout_cfg,
             omarchy_theme::MaterialStyle::default(),
+            true,
             true,
             true,
         );
@@ -2339,6 +2872,7 @@ mod tests {
             omarchy_theme::MaterialStyle::default(),
             true,
             true,
+            true,
         );
         tree.open_modal(ModalState::open_settings(snap));
         let settings_out = tree.render(&input, &theme, Instant::now(), 0.0);
@@ -2585,5 +3119,525 @@ mod tests {
         let offline_menu = tree.context_menu.as_ref().expect("offline host menu");
         assert!(offline_menu.items.iter().any(|i| i.label == "Connect"
             && matches!(&i.action, UiAction::ReconnectHost { host_id } if host_id == "remote:mac-mini")));
+    }
+
+    #[test]
+    fn spring_active_border_and_close_modal_viewer_animations_settle_and_preserve_focus() {
+        let mut tree = UiTree::new();
+        let mut input = sample_t3_23_window_input();
+        input.floating_layers.clear();
+        input.split_root = Some(SplitNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            SplitNode::leaf("blk:00".into()),
+            SplitNode::leaf("blk:01".into()),
+        ));
+        input.pane_metas.push(PaneMeta {
+            block_id: "blk:01".into(),
+            label: "Second".into(),
+            cwd: None,
+            icon: IconId::Terminal,
+            focused: false,
+            hovered: false,
+            bell_unread: false,
+            program_status: None,
+            osc94_progress: None,
+            scrollbar: ScrollbarMetrics::default(),
+            program_bg: None,
+            has_unread_output: false,
+            copy_mode_badge: None,
+            listening_ports: Vec::new(),
+            is_pr_drawer: false,
+            pr_subtitle: None,
+        });
+        let theme = Theme::default();
+        let mut t = Instant::now();
+
+        // First render must snap active border directly to blk:00 (no fly-in from (0,0)) and be settled.
+        let out0 = tree.render(&input, &theme, t, 0.0);
+        assert!(!tree.has_active_animations());
+        assert_eq!(out0.tiled_panes.len(), 2);
+
+        // Switch focus to blk:01 -> active border springs smoothly from blk:00 -> blk:01.
+        input.pane_metas[0].focused = false;
+        input.pane_metas[2].focused = true;
+        let _ = tree.render(&input, &theme, t, 0.0);
+        assert!(tree.has_active_animations());
+        t += std::time::Duration::from_millis(16);
+        assert!(tree.tick_animations(t));
+        let out_mid = tree.render(&input, &theme, t, 0.0);
+        let border_mid = out_mid
+            .draw_list
+            .primitives
+            .iter()
+            .rev()
+            .find_map(|p| match p {
+                UiPrimitive::RoundedRect {
+                    rect,
+                    fill,
+                    border_width,
+                    ..
+                } if fill.a == 0 && (*border_width - 1.5).abs() < 0.01 => Some(*rect),
+                _ => None,
+            })
+            .expect("spring border primitive");
+        assert!(
+            border_mid.x > out0.tiled_panes[0].card_rect.x
+                && border_mid.x < out0.tiled_panes[1].card_rect.x,
+            "expected mid-flight border x between pane 0 and pane 1, got {:?}",
+            border_mid
+        );
+
+        // Advance 400ms -> settles cleanly (has_active_animations == false).
+        for _ in 0..30 {
+            t += std::time::Duration::from_millis(16);
+            tree.tick_animations(t);
+        }
+        assert!(!tree.has_active_animations());
+
+        // Modal open + close_modal immediately sets modal=None and FocusTarget::Terminal while
+        // closing_modal fades out with ZERO hit targets!
+        tree.open_modal(ModalState::open_shortcuts_help());
+        assert_eq!(
+            tree.focus.current(),
+            &FocusTarget::Modal(ModalKind::ShortcutsHelp)
+        );
+        let _ = tree.render(&input, &theme, t, 0.0);
+        tree.close_modal();
+        assert!(tree.modal.is_none());
+        assert!(matches!(tree.focus.current(), FocusTarget::Terminal(_)));
+        assert!(tree.has_active_animations());
+
+        let closing_out = tree.render(&input, &theme, t, 0.0);
+        assert!(
+            !closing_out
+                .draw_list
+                .hits
+                .iter()
+                .any(|h| matches!(h.target, HitTarget::ModalBackdrop)),
+            "closing_modal shadow must be hit-free so clicks pass through immediately"
+        );
+        for _ in 0..30 {
+            t += std::time::Duration::from_millis(16);
+            tree.tick_animations(t);
+        }
+        assert!(!tree.has_active_animations());
+    }
+
+    #[test]
+    fn new_output_pill_renders_and_clicks_to_bottom_and_program_bg_keeps_wcag_contrast() {
+        let mut tree = UiTree::new();
+        let mut input = sample_t3_23_window_input();
+        input.floating_layers.clear();
+        // Set unread output + bright light program_bg (#fbf1c7) inside dark theme
+        input.pane_metas[0].has_unread_output = true;
+        input.pane_metas[0].program_bg = Some(omarchy_theme::Rgba::new(0xfb, 0xf1, 0xc7, 255));
+        let theme = Theme::default();
+
+        let out = tree.render(&input, &theme, Instant::now(), 0.0);
+        out.draw_list
+            .validate_invariants()
+            .expect("pill + program_bg invariants");
+
+        // Verify ↓ New output pill is rendered and clickable
+        let pill_hit = out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| matches!(&h.target, HitTarget::PaneNewOutputPill { block_id } if block_id == "blk:00"))
+            .expect("PaneNewOutputPill hit target");
+        let (px, py) = pill_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&out.draw_list, px, py, false),
+            UiAction::ScrollPaneToBottom {
+                block_id: "blk:00".into(),
+            }
+        );
+
+        // Verify pane header label text has WCAG contrast >= 4.5 against bright program_bg #fbf1c7
+        let pbg_rgb = omarchy_theme::Rgb::new(0xfb, 0xf1, 0xc7);
+        let title_color = out
+            .draw_list
+            .primitives
+            .iter()
+            .find_map(|p| match p {
+                UiPrimitive::Text { text, color, .. } if text == "Thread #00" => Some(*color),
+                _ => None,
+            })
+            .expect("pane header title");
+        assert!(
+            pbg_rgb.wcag_contrast(title_color.rgb()) >= 4.5,
+            "expected WCAG AA contrast >= 4.5 on bright program_bg, got {:.2}",
+            pbg_rgb.wcag_contrast(title_color.rgb())
+        );
+    }
+
+    #[test]
+    fn file_picker_modal_tab_and_backspace_do_not_close() {
+        let mut tree = UiTree::new();
+        let entries = vec![
+            FilePickerEntry {
+                name: "src".into(),
+                path: "/work/src".into(),
+                is_dir: true,
+                is_symlink: false,
+            },
+            FilePickerEntry {
+                name: "Cargo.toml".into(),
+                path: "/work/Cargo.toml".into(),
+                is_dir: false,
+                is_symlink: false,
+            },
+        ];
+        tree.open_modal(ModalState::open_file_picker(
+            FilePickerPurpose::InsertPath,
+            "/work",
+            None,
+            entries,
+            false,
+        ));
+        assert_eq!(
+            tree.focus.current(),
+            &FocusTarget::Modal(ModalKind::FilePicker)
+        );
+
+        let descend = tree.handle_modal_key(ModalKey::Tab);
+        assert_eq!(
+            descend,
+            UiAction::FilePickerDescend {
+                path: "/work/src".into()
+            }
+        );
+        assert!(tree.modal.is_some(), "Tab must keep file picker open");
+
+        let parent = tree.handle_modal_key(ModalKey::Backspace);
+        assert_eq!(parent, UiAction::FilePickerParent);
+        assert!(
+            tree.modal.is_some(),
+            "Backspace on empty filter keeps modal open"
+        );
+
+        let accept = tree.handle_modal_key(ModalKey::Enter);
+        assert_eq!(
+            accept,
+            UiAction::FilePickerAccept {
+                path: "/work/src".into()
+            }
+        );
+        assert!(tree.modal.is_none(), "Enter must close file picker");
+    }
+
+    #[test]
+    fn theme_picker_preview_commit_and_cancel() {
+        let mut tree = UiTree::new();
+        let items = vec![
+            PaletteItem::new("omarchy-live", "omarchy-live"),
+            PaletteItem::new("catppuccin", "catppuccin"),
+        ];
+        tree.open_modal(ModalState::open_theme_picker(items, Some("omarchy-live")));
+        assert_eq!(
+            tree.handle_modal_key(ModalKey::Down),
+            UiAction::ThemePickerPreview {
+                name: "catppuccin".into()
+            }
+        );
+        assert!(tree.modal.is_some(), "preview keeps ThemePicker open");
+
+        assert_eq!(
+            tree.handle_modal_key(ModalKey::Escape),
+            UiAction::ThemePickerCancel
+        );
+        assert!(tree.modal.is_none(), "Esc closes ThemePicker");
+    }
+
+    #[test]
+    fn tabbar_mute_icon_pane_port_pill_copy_badge_settings_categories_and_diagnostics() {
+        let mut tree = UiTree::new();
+        let mut input = sample_t3_23_window_input();
+        input.floating_layers.clear();
+        input.hosts[0].sessions[0].tabs[0].muted = true;
+        input.pane_metas[0].copy_mode_badge = Some("V-LINE");
+        input.pane_metas[0].listening_ports = vec![PortBadge {
+            port: 3000,
+            label: Some("vite".into()),
+            tunneled: false,
+        }];
+        let theme = Theme::default();
+
+        let out = tree.render(&input, &theme, Instant::now(), 0.0);
+        out.draw_list
+            .validate_invariants()
+            .expect("m4 chrome invariants");
+
+        assert!(
+            out.draw_list.primitives.iter().any(|p| matches!(
+                p,
+                UiPrimitive::Icon {
+                    icon: IconId::BellOff,
+                    ..
+                }
+            )),
+            "muted tab should render BellOff icon"
+        );
+        assert!(
+            out.draw_list
+                .primitives
+                .iter()
+                .any(|p| matches!(p, UiPrimitive::Text { text, .. } if text == "V-LINE")),
+            "copy mode badge should render"
+        );
+        let port_hit = out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| matches!(&h.target, HitTarget::PanePortPill { port: 3000, .. }))
+            .expect("PanePortPill hit target");
+        let (px, py) = port_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&out.draw_list, px, py, false),
+            UiAction::OpenPortAction {
+                block_id: "blk:00".into(),
+                port: 3000,
+            }
+        );
+
+        // Settings modal category switching
+        let snap = SettingsViewSnapshot::from_config(
+            &tree.layout_cfg,
+            omarchy_theme::MaterialStyle::default(),
+            true,
+            true,
+            true,
+        );
+        tree.open_modal(ModalState::open_settings(snap));
+        let set_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        let audio_tab = set_out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| h.target == HitTarget::SettingsCategoryTab(SettingsCategory::AudioAlerts))
+            .expect("AudioAlerts tab");
+        let (ax, ay) = audio_tab.rect.center();
+        assert_eq!(
+            tree.handle_click(&set_out.draw_list, ax, ay, false),
+            UiAction::None
+        );
+        let audio_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        assert!(audio_out.draw_list.hits.iter().any(
+            |h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "chime_enabled")
+        ));
+
+        // Diagnostics modal frame graph + copy debug bundle
+        tree.open_modal(ModalState::open_diagnostics(DiagnosticsSnapshot {
+            app_version: "0.1.0".into(),
+            vt_version: "1.4.0".into(),
+            gpu_adapter: "Test GPU".into(),
+            gpu_backend: "Vulkan".into(),
+            frame_times_us: vec![2000, 4500, 19000],
+            avg_frame_ms: 8.5,
+            p95_frame_ms: 19.0,
+            max_frame_ms: 19.0,
+            last_draw_calls: 12,
+            last_quads: 40,
+            last_glyphs: 500,
+            hosts: vec![DiagnosticsHostRow {
+                label: "Local".into(),
+                status: "Connected".into(),
+                tailscale_summary: "online".into(),
+                dropped_events: 0,
+                active_streams: 1,
+            }],
+            keymap_warnings: vec!["unused key".into()],
+            active_ports: vec![":3000".into()],
+            active_tunnels: vec![],
+        }));
+        let diag_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        diag_out
+            .draw_list
+            .validate_invariants()
+            .expect("diagnostics invariants");
+        let copy_hit = diag_out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| h.target == HitTarget::DiagnosticsCopyBundle)
+            .expect("DiagnosticsCopyBundle hit");
+        let (cx, cy) = copy_hit.rect.center();
+        assert_eq!(
+            tree.handle_click(&diag_out.draw_list, cx, cy, false),
+            UiAction::CopyDiagnosticsBundle
+        );
+    }
+
+    #[test]
+    fn narrow_pane_renders_port_overflow_badge_when_one_pill_fits() {
+        let mut tree = UiTree::new();
+        tree.layout_cfg.toolbar_behavior = ToolbarBehavior::Hidden;
+        tree.layout_cfg.pane_header_mode = PaneHeaderMode::Always;
+        let mut input = sample_t3_23_window_input();
+        input.floating_layers.clear();
+        input.viewport_w = 300.0;
+        input.viewport_h = 400.0;
+        input.pane_metas[0].label = "sh".into();
+        input.pane_metas[0].cwd = None;
+        input.pane_metas[0].program_status = None;
+        input.pane_metas[0].copy_mode_badge = None;
+        input.pane_metas[0].listening_ports = vec![
+            PortBadge {
+                port: 80,
+                label: None,
+                tunneled: false,
+            },
+            PortBadge {
+                port: 3000,
+                label: None,
+                tunneled: false,
+            },
+            PortBadge {
+                port: 8080,
+                label: None,
+                tunneled: false,
+            },
+        ];
+        let theme = Theme::default();
+        let out = tree.render(&input, &theme, Instant::now(), 0.0);
+        out.draw_list
+            .validate_invariants()
+            .expect("narrow port pill invariants");
+
+        let texts: Vec<&str> = out
+            .draw_list
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                UiPrimitive::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&":80"),
+            "first port pill must render: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&":3000"),
+            "second port pill exceeds max_x at 300px: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"+2"),
+            "+2 overflow badge must render when space remains after first pill: {texts:?}"
+        );
+
+        input.viewport_w = 420.0;
+        let wide_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        let wide_texts: Vec<&str> = wide_out
+            .draw_list
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                UiPrimitive::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(wide_texts.contains(&":80"));
+        assert!(wide_texts.contains(&":3000"));
+        assert!(wide_texts.contains(&"+1"));
+    }
+
+    #[test]
+    fn file_picker_clears_filter_on_dir_change_and_terminal_font_size_steps() {
+        let mut modal = ModalState::open_file_picker(
+            FilePickerPurpose::InsertPath,
+            "/work",
+            None,
+            vec![FilePickerEntry {
+                name: "src".into(),
+                path: "/work/src".into(),
+                is_dir: true,
+                is_symlink: false,
+            }],
+            false,
+        );
+        for ch in ['s', 'r', 'c'] {
+            modal.handle_key(ModalKey::Char(ch));
+        }
+        // Navigating to /work/src clears the filter so child items are visible.
+        modal.set_file_picker_entries(
+            "/work/src",
+            vec![FilePickerEntry {
+                name: "main.rs".into(),
+                path: "/work/src/main.rs".into(),
+                is_dir: false,
+                is_symlink: false,
+            }],
+            None,
+        );
+        if let ModalContent::FilePicker {
+            current_dir,
+            input,
+            filtered_indices,
+            ..
+        } = &modal.content
+        {
+            assert_eq!(current_dir, "/work/src");
+            assert_eq!(input.text(), "");
+            assert_eq!(filtered_indices.len(), 1);
+        } else {
+            panic!("expected FilePicker");
+        }
+
+        // Error preserves current_dir and prior entries.
+        modal.set_file_picker_error("Permission denied");
+        if let ModalContent::FilePicker {
+            current_dir,
+            entries,
+            error,
+            ..
+        } = &modal.content
+        {
+            assert_eq!(current_dir, "/work/src");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(error.as_deref(), Some("Permission denied"));
+        } else {
+            panic!("expected FilePicker");
+        }
+
+        // Terminal Font Size row steps cleanly on click/Enter.
+        let mut tree = UiTree::new();
+        let snap = SettingsViewSnapshot::from_config(
+            &tree.layout_cfg,
+            omarchy_theme::MaterialStyle::default(),
+            true,
+            true,
+            true,
+        )
+        .with_extras(None, "JetBrainsMono Nerd Font", 11.0, true, true);
+        tree.open_modal(ModalState::open_settings(snap));
+        let input = sample_t3_23_window_input();
+        let theme = Theme::default();
+        let out = tree.render(&input, &theme, Instant::now(), 0.0);
+        let term_tab = out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| h.target == HitTarget::SettingsCategoryTab(SettingsCategory::Terminal))
+            .expect("Terminal tab");
+        let (tx, ty) = term_tab.rect.center();
+        assert_eq!(
+            tree.handle_click(&out.draw_list, tx, ty, false),
+            UiAction::None
+        );
+
+        let term_out = tree.render(&input, &theme, Instant::now(), 0.0);
+        let font_row = term_out
+            .draw_list
+            .hits
+            .iter()
+            .find(|h| matches!(&h.target, HitTarget::SettingsToggle { key } if key == "font_size"))
+            .expect("font_size hit target");
+        let (fx, fy) = font_row.rect.center();
+        assert_eq!(
+            tree.handle_click(&term_out.draw_list, fx, fy, false),
+            UiAction::UpdateSetting(SettingChange::FontSizePt(12.0))
+        );
     }
 }

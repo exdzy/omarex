@@ -11,7 +11,7 @@ pub struct ImePreedit {
 }
 
 /// Self-contained single-line text editing state with selection, word motion, history, and IME preedit.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextInput {
     text: String,
     /// Caret byte offset within `text` (always on a UTF-8 char boundary).

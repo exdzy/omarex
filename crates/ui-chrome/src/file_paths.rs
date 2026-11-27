@@ -471,6 +471,8 @@ pub enum TargetKind {
     Markdown,
     Image,
     Video,
+    Audio,
+    Pdf,
     ThreadLink,
     ExternalUrl,
     OtherFile,
@@ -497,6 +499,13 @@ pub enum ResolvedTarget {
     Video {
         path: String,
     },
+    Audio {
+        path: String,
+    },
+    Pdf {
+        path: String,
+        page: Option<u32>,
+    },
     ThreadLink {
         uri: String,
     },
@@ -516,6 +525,8 @@ impl ResolvedTarget {
             Self::Markdown { .. } => TargetKind::Markdown,
             Self::Image { .. } => TargetKind::Image,
             Self::Video { .. } => TargetKind::Video,
+            Self::Audio { .. } => TargetKind::Audio,
+            Self::Pdf { .. } => TargetKind::Pdf,
             Self::ThreadLink { .. } => TargetKind::ThreadLink,
             Self::ExternalUrl { .. } => TargetKind::ExternalUrl,
             Self::OtherFile { .. } => TargetKind::OtherFile,
@@ -529,6 +540,8 @@ impl ResolvedTarget {
             | Self::Markdown { path, .. }
             | Self::Image { path }
             | Self::Video { path }
+            | Self::Audio { path }
+            | Self::Pdf { path, .. }
             | Self::OtherFile { path } => Some(path.as_str()),
             Self::ThreadLink { .. } | Self::ExternalUrl { .. } => None,
         }
@@ -538,6 +551,7 @@ impl ResolvedTarget {
     pub const fn line(&self) -> Option<u32> {
         match self {
             Self::TextCode { line, .. } | Self::Markdown { line, .. } => *line,
+            Self::Pdf { page, .. } => *page,
             _ => None,
         }
     }
@@ -563,7 +577,12 @@ impl ResolvedTarget {
     pub const fn is_in_app_viewable(&self) -> bool {
         matches!(
             self,
-            Self::TextCode { .. } | Self::Markdown { .. } | Self::Image { .. } | Self::Video { .. }
+            Self::TextCode { .. }
+                | Self::Markdown { .. }
+                | Self::Image { .. }
+                | Self::Video { .. }
+                | Self::Audio { .. }
+                | Self::Pdf { .. }
         )
     }
 }
@@ -731,6 +750,8 @@ pub fn classify_extension(path: &str) -> TargetKind {
             "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "ogv" | "flv" | "wmv" => {
                 TargetKind::Video
             }
+            "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus" | "wma" => TargetKind::Audio,
+            "pdf" => TargetKind::Pdf,
             "md" | "markdown" | "mdx" | "rst" => TargetKind::Markdown,
             "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "pyi" | "go" | "c"
             | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "java" | "kt" | "kts" | "swift"
@@ -821,6 +842,13 @@ pub fn classify_path(
         },
         TargetKind::Video => ResolvedTarget::Video {
             path: path.to_owned(),
+        },
+        TargetKind::Audio => ResolvedTarget::Audio {
+            path: path.to_owned(),
+        },
+        TargetKind::Pdf => ResolvedTarget::Pdf {
+            path: path.to_owned(),
+            page: line,
         },
         TargetKind::Markdown => ResolvedTarget::Markdown {
             path: path.to_owned(),

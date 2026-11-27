@@ -8,8 +8,8 @@ use tr3x_bridge::t3_session::{
 };
 
 use crate::draw::{
-    FocusTarget, FontKind, FontWeight, HitTarget, TextAlign, UiDrawList, UiInteraction, cap_radius,
-    z_layer,
+    FocusTarget, FontKind, FontWeight, HitTarget, TabReorderOverlay, TextAlign, UiDrawList,
+    UiInteraction, cap_radius, z_layer,
 };
 use crate::icons::IconId;
 use crate::layout::RectF;
@@ -104,14 +104,6 @@ impl SidebarSessionView {
     #[must_use]
     pub fn attention_count(&self) -> usize {
         self.tabs.iter().filter(|t| t.needs_attention()).count()
-    }
-
-    #[must_use]
-    pub fn working_count(&self) -> usize {
-        self.tabs
-            .iter()
-            .filter(|t| matches!(t.card.state, ProgramState::Working))
-            .count()
     }
 
     /// Returns the highest-priority semantic status dot color across all child tabs
@@ -407,6 +399,7 @@ pub fn render_sidebar(
     interaction: UiInteraction<'_>,
     theme: &Theme,
     anim_phase: f32,
+    tab_reorder: Option<&TabReorderOverlay>,
 ) -> SidebarScrollMetrics {
     if sidebar_rect.is_empty() {
         return SidebarScrollMetrics::default();
@@ -662,6 +655,7 @@ pub fn render_sidebar(
                 theme.rounding,
                 anim_phase,
                 z,
+                tab_reorder,
             );
         }
 
@@ -690,8 +684,9 @@ pub fn render_sidebar(
         // Subtle overlay scroll indicator when sidebar content overflows its viewport.
         if scroll_metrics.max_scroll > 0.5 && scroll_metrics.content_height > 0.0 {
             let track_h = (scroll_rect.h - 10.0).max(16.0);
-            let thumb_h =
-                ((scroll_rect.h / scroll_metrics.content_height) * track_h).clamp(24.0, track_h);
+            let min_thumb = 24.0_f32.min(track_h);
+            let thumb_h = ((scroll_rect.h / scroll_metrics.content_height) * track_h)
+                .clamp(min_thumb, track_h);
             let ratio = (effective_scroll_y / scroll_metrics.max_scroll).clamp(0.0, 1.0);
             let thumb_y = scroll_rect.y + 5.0 + ratio * (track_h - thumb_h);
             let thumb_x = (scroll_rect.right() - 5.0).max(scroll_rect.x);
@@ -1019,6 +1014,7 @@ fn render_host_session_tree(
     theme_rounding: f32,
     anim_phase: f32,
     z: u16,
+    tab_reorder: Option<&TabReorderOverlay>,
 ) {
     let base_y = scroll_rect.y + SIDEBAR_CONTENT_PAD - scroll_offset_y.max(0.0);
     let inner_x = scroll_rect.x + 8.0;
@@ -1283,10 +1279,48 @@ fn render_host_session_tree(
                             anim_phase,
                             z,
                         );
+                        if let Some(overlay) = tab_reorder
+                            && overlay.host_id == host.host_id
+                            && overlay.session_id == session.session_id
+                            && overlay.dragged_window_id == tab.window_id
+                        {
+                            draw_list.push_rect(
+                                row_rect,
+                                tokens.accent_primary.with_alpha_f32(0.10),
+                                Some(tokens.accent_primary.with_alpha_f32(0.70)),
+                                1.25,
+                                cap_radius(8.0, theme_rounding),
+                                None,
+                            );
+                        }
                     }
                     y += TAB_ROW_ADVANCE;
                 }
             }
+        }
+        if let Some(overlay) = tab_reorder
+            && let Some(ind) = overlay.indicator_rect
+            && ind.bottom() >= content_clip.y
+            && ind.y <= content_clip.bottom()
+        {
+            draw_list.push_rect(ind, tokens.accent_primary, None, 0.0, 1.25, None);
+            let cy = ind.y + ind.h * 0.5;
+            draw_list.push_rect(
+                RectF::new(ind.x - 2.0, cy - 2.5, 5.0, 5.0),
+                tokens.accent_primary,
+                None,
+                0.0,
+                2.5,
+                None,
+            );
+            draw_list.push_rect(
+                RectF::new(ind.right() - 3.0, cy - 2.5, 5.0, 5.0),
+                tokens.accent_primary,
+                None,
+                0.0,
+                2.5,
+                None,
+            );
         }
         draw_list.pop_clip();
     }
@@ -1927,4 +1961,59 @@ fn tab_matches_query(tab: &SidebarTabView, lower_query: &str) -> bool {
     lower_query.is_empty()
         || tab.card.title.to_ascii_lowercase().contains(lower_query)
         || tab.card.subtitle.to_ascii_lowercase().contains(lower_query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tr3x_bridge::t3_session::build_tab_card;
+
+    #[test]
+    fn new_gap02_sidebar_scrollbar_clamps_safely_on_short_viewport() {
+        let tabs: Vec<SidebarTabView> = (0..10)
+            .map(|i| SidebarTabView {
+                window_id: format!("win:{i}"),
+                card: build_tab_card(&format!("Tab {i}"), Some("omarex"), None, None, None),
+                active: i == 0,
+                muted: false,
+                unread: false,
+                pane_count: 1,
+                icon_override: None,
+            })
+            .collect();
+        let hosts = vec![SidebarHostView {
+            host_id: "local".into(),
+            label: "This Machine".into(),
+            is_local: true,
+            connection: HostConnectionState::Online,
+            collapsed: false,
+            sessions: vec![SidebarSessionView {
+                session_id: "sess:1".into(),
+                label: "Main".into(),
+                active: true,
+                collapsed: false,
+                muted: false,
+                tabs,
+            }],
+        }];
+        let state = SidebarState::default();
+        let mut dl = UiDrawList::new();
+        let metrics = render_sidebar(
+            &mut dl,
+            RectF::new(0.0, 0.0, 240.0, 100.0),
+            None,
+            false,
+            false,
+            &hosts,
+            &state,
+            &FocusTarget::Terminal(None),
+            UiInteraction::default(),
+            &Theme::default(),
+            0.0,
+            None,
+        );
+        assert!(metrics.max_scroll > 0.5);
+        dl.validate_invariants()
+            .expect("short sidebar draw list must be valid");
+    }
 }

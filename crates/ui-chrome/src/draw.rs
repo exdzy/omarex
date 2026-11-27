@@ -48,6 +48,50 @@ pub struct ShadowSpec {
     pub color: Rgba,
 }
 
+/// Single colored/styled span inside [`UiPrimitive::RichText`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSpan {
+    pub text: String,
+    pub color: Rgba,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl TextSpan {
+    #[must_use]
+    pub fn new(text: impl Into<String>, color: Rgba) -> Self {
+        Self {
+            text: text.into(),
+            color,
+            bold: false,
+            italic: false,
+        }
+    }
+
+    #[must_use]
+    pub fn styled(text: impl Into<String>, color: Rgba, bold: bool, italic: bool) -> Self {
+        Self {
+            text: text.into(),
+            color,
+            bold,
+            italic,
+        }
+    }
+}
+
+/// Optional text-width measurer passed into [`crate::UiTree::render_with_measurer`] so
+/// proportional spans (such as Markdown links) compute exact pixel hit-rects & underlines.
+pub trait UiTextMeasurer {
+    fn measure_text(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        bold: bool,
+        italic: bool,
+        mono: bool,
+    ) -> f32;
+}
+
 /// Backend-agnostic UI draw primitive translated into `gpu-renderer::DrawList` by `omarex`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiPrimitive {
@@ -72,6 +116,14 @@ pub enum UiPrimitive {
         highlight_ranges: Vec<Range<usize>>,
         highlight_color: Option<Rgba>,
     },
+    RichText {
+        rect: RectF,
+        clip_rect: Option<RectF>,
+        spans: Vec<TextSpan>,
+        font_size: f32,
+        line_height: f32,
+        mono: bool,
+    },
     Icon {
         rect: RectF,
         icon: IconId,
@@ -91,6 +143,15 @@ pub enum UiPrimitive {
     PopClip,
 }
 
+/// Visual overlay for dragging a tab to reorder within a session's tab strip or sidebar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabReorderOverlay {
+    pub host_id: String,
+    pub session_id: String,
+    pub dragged_window_id: String,
+    pub indicator_rect: Option<RectF>,
+}
+
 /// Which of the 5 Rex pane header buttons was clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneHeaderButton {
@@ -108,11 +169,23 @@ pub enum ModalKind {
     SwitchSession,
     GoToAnything,
     ActivityPicker,
+    FilePicker,
+    ThemePicker,
+    Diagnostics,
     Settings,
     Rename,
     AddHost,
     ShortcutsHelp,
     RexPrompt,
+}
+
+/// Settings modal category tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsCategory {
+    Workspace,
+    Appearance,
+    Terminal,
+    AudioAlerts,
 }
 
 /// Strict keyboard focus owner preventing background `session_view_changed` events from
@@ -121,6 +194,7 @@ pub enum ModalKind {
 pub enum FocusTarget {
     Terminal(Option<String>),
     Viewer,
+    ViewerSearch,
     Modal(ModalKind),
     FindBar,
     SidebarFilter,
@@ -204,6 +278,11 @@ impl FocusGuard {
         self.current = FocusTarget::Viewer;
     }
 
+    /// Transfers keyboard focus to the in-viewer search bar (`Ctrl+F`).
+    pub fn focus_viewer_search(&mut self) {
+        self.current = FocusTarget::ViewerSearch;
+    }
+
     /// Restores keyboard focus to the last active terminal block.
     pub fn restore_terminal(&mut self) {
         self.current = FocusTarget::Terminal(self.last_terminal_block.clone());
@@ -275,6 +354,13 @@ pub enum HitTarget {
     PaneZoomBadge {
         block_id: String,
     },
+    PanePortPill {
+        block_id: String,
+        port: u16,
+    },
+    PaneNewOutputPill {
+        block_id: String,
+    },
     PaneScrollbarTrack {
         block_id: String,
     },
@@ -310,6 +396,8 @@ pub enum HitTarget {
     SettingsToggle {
         key: String,
     },
+    SettingsCategoryTab(SettingsCategory),
+    DiagnosticsCopyBundle,
     FindBarInput,
     FindBarPrev,
     FindBarNext,
@@ -329,6 +417,7 @@ pub enum HitTarget {
     // Docked right-hand Viewer Pane interactions
     ViewerDivider,
     ViewerSurface,
+    ViewerTextBody,
     ViewerTab {
         tab_id: u64,
     },
@@ -336,11 +425,21 @@ pub enum HitTarget {
         tab_id: u64,
     },
     ViewerCopyPath,
+    ViewerCopyPathLine,
     ViewerOpenExternal,
     ViewerMaximizeToggle,
     ViewerClose,
     ViewerWrapToggle,
     ViewerRawToggle,
+    ViewerDiffToggle,
+    ViewerLink {
+        url: String,
+    },
+    ViewerSearchInput,
+    ViewerSearchPrev,
+    ViewerSearchNext,
+    ViewerSearchCaseToggle,
+    ViewerSearchClose,
     ViewerZoomOut,
     ViewerZoomReset,
     ViewerZoomIn,
@@ -350,6 +449,13 @@ pub enum HitTarget {
     ViewerVideoSeekBar,
     ViewerVideoMuteToggle,
     ViewerVideoLoopToggle,
+    ViewerAudioPlayPause,
+    ViewerAudioSeekBar,
+    ViewerAudioWaveform,
+    ViewerAudioMuteToggle,
+    ViewerAudioLoopToggle,
+    ViewerPdfPrevPage,
+    ViewerPdfNextPage,
     ViewerScrollbarTrack,
     ViewerScrollbarThumb,
 }
@@ -381,6 +487,7 @@ impl HitTarget {
                 | Self::CommandPaletteButton
                 | Self::PaneButton { .. }
                 | Self::PaneZoomBadge { .. }
+                | Self::PaneNewOutputPill { .. }
                 | Self::MinimizedCapsule { .. }
                 | Self::MinimizedCapsuleClose { .. }
                 | Self::EmptyStateNewTab
@@ -402,11 +509,18 @@ impl HitTarget {
                 | Self::ViewerTab { .. }
                 | Self::ViewerTabClose { .. }
                 | Self::ViewerCopyPath
+                | Self::ViewerCopyPathLine
                 | Self::ViewerOpenExternal
                 | Self::ViewerMaximizeToggle
                 | Self::ViewerClose
                 | Self::ViewerWrapToggle
                 | Self::ViewerRawToggle
+                | Self::ViewerDiffToggle
+                | Self::ViewerLink { .. }
+                | Self::ViewerSearchPrev
+                | Self::ViewerSearchNext
+                | Self::ViewerSearchCaseToggle
+                | Self::ViewerSearchClose
                 | Self::ViewerZoomOut
                 | Self::ViewerZoomReset
                 | Self::ViewerZoomIn
@@ -415,6 +529,13 @@ impl HitTarget {
                 | Self::ViewerVideoSeekBar
                 | Self::ViewerVideoMuteToggle
                 | Self::ViewerVideoLoopToggle
+                | Self::ViewerAudioPlayPause
+                | Self::ViewerAudioSeekBar
+                | Self::ViewerAudioWaveform
+                | Self::ViewerAudioMuteToggle
+                | Self::ViewerAudioLoopToggle
+                | Self::ViewerPdfPrevPage
+                | Self::ViewerPdfNextPage
         )
     }
 
@@ -445,6 +566,7 @@ impl HitTarget {
                 PaneHeaderButton::Close => "Close Pane (Ctrl+Shift+W)",
             }),
             Self::PaneZoomBadge { .. } => Some("Unzoom Pane (Ctrl+Shift+Z)"),
+            Self::PaneNewOutputPill { .. } => Some("Jump to Latest Output"),
             Self::FindBarCaseToggle => Some("Match Case"),
             Self::FindBarRegexToggle => Some("Use Regular Expression"),
             Self::FindBarPrev => Some("Previous Match"),
@@ -454,11 +576,18 @@ impl HitTarget {
             Self::ToastDismiss { .. } => Some("Dismiss"),
             Self::ViewerTabClose { .. } => Some("Close Viewer Tab"),
             Self::ViewerCopyPath => Some("Copy File Path"),
+            Self::ViewerCopyPathLine => Some("Copy path:line (Ctrl+Shift+C)"),
             Self::ViewerOpenExternal => Some("Open in External App"),
             Self::ViewerMaximizeToggle => Some("Maximize / Restore Viewer"),
             Self::ViewerClose => Some("Close Viewer Pane"),
             Self::ViewerWrapToggle => Some("Toggle Word Wrap"),
             Self::ViewerRawToggle => Some("Toggle Raw / Rendered Markdown"),
+            Self::ViewerDiffToggle => Some("Toggle Git Diff View (D)"),
+            Self::ViewerLink { .. } => Some("Open Link"),
+            Self::ViewerSearchPrev => Some("Previous Match (Shift+Enter)"),
+            Self::ViewerSearchNext => Some("Next Match (Enter)"),
+            Self::ViewerSearchCaseToggle => Some("Match Case"),
+            Self::ViewerSearchClose => Some("Close Search (Esc)"),
             Self::ViewerZoomOut => Some("Zoom Out (-)"),
             Self::ViewerZoomReset => Some("Actual Size (100%)"),
             Self::ViewerZoomIn => Some("Zoom In (+)"),
@@ -466,6 +595,11 @@ impl HitTarget {
             Self::ViewerVideoPlayPause => Some("Play / Pause (Space)"),
             Self::ViewerVideoMuteToggle => Some("Mute / Unmute (M)"),
             Self::ViewerVideoLoopToggle => Some("Toggle Loop (L)"),
+            Self::ViewerAudioPlayPause => Some("Play / Pause (Space)"),
+            Self::ViewerAudioMuteToggle => Some("Mute / Unmute (M)"),
+            Self::ViewerAudioLoopToggle => Some("Toggle Loop (L)"),
+            Self::ViewerPdfPrevPage => Some("Previous Page (Left / PageUp)"),
+            Self::ViewerPdfNextPage => Some("Next Page (Right / PageDown)"),
             _ => None,
         }
     }
@@ -673,6 +807,28 @@ impl UiDrawList {
         self.primitives.push(UiPrimitive::Icon { rect, icon, tint });
     }
 
+    pub fn push_rich_text(
+        &mut self,
+        rect: RectF,
+        clip_rect: Option<RectF>,
+        spans: Vec<TextSpan>,
+        font_size: f32,
+        line_height: f32,
+        mono: bool,
+    ) {
+        if rect.is_empty() || spans.iter().all(|s| s.text.is_empty()) {
+            return;
+        }
+        self.primitives.push(UiPrimitive::RichText {
+            rect,
+            clip_rect,
+            spans,
+            font_size: font_size.max(1.0),
+            line_height: line_height.max(1.0),
+            mono,
+        });
+    }
+
     pub fn push_progress(
         &mut self,
         rect: RectF,
@@ -710,6 +866,80 @@ impl UiDrawList {
             target,
             z_order,
         });
+    }
+
+    /// Offsets geometry and scales alpha on all primitives emitted since `start_idx` (used for
+    /// smooth slide/fade transitions of modals, sidebar, and the right-hand viewer).
+    pub fn apply_transition(&mut self, start_idx: usize, dx: f32, dy: f32, alpha_mul: f32) {
+        let a = alpha_mul.clamp(0.0, 1.0);
+        let mul = |c: &mut Rgba| {
+            c.a = (f32::from(c.a) * a).round().clamp(0.0, 255.0) as u8;
+        };
+        let shift = |r: &mut RectF| {
+            r.x += dx;
+            r.y += dy;
+        };
+        for prim in self.primitives.iter_mut().skip(start_idx) {
+            match prim {
+                UiPrimitive::RoundedRect {
+                    rect,
+                    fill,
+                    border_color,
+                    shadow,
+                    ..
+                } => {
+                    shift(rect);
+                    mul(fill);
+                    if let Some(bc) = border_color {
+                        mul(bc);
+                    }
+                    if let Some(sh) = shadow {
+                        mul(&mut sh.color);
+                    }
+                }
+                UiPrimitive::Text {
+                    rect,
+                    color,
+                    highlight_color,
+                    ..
+                } => {
+                    shift(rect);
+                    mul(color);
+                    if let Some(hc) = highlight_color {
+                        mul(hc);
+                    }
+                }
+                UiPrimitive::RichText {
+                    rect,
+                    clip_rect,
+                    spans,
+                    ..
+                } => {
+                    shift(rect);
+                    if let Some(cr) = clip_rect {
+                        shift(cr);
+                    }
+                    for span in spans {
+                        mul(&mut span.color);
+                    }
+                }
+                UiPrimitive::Icon { rect, tint, .. } => {
+                    shift(rect);
+                    mul(tint);
+                }
+                UiPrimitive::ProgressBar {
+                    rect, fill, track, ..
+                } => {
+                    shift(rect);
+                    mul(fill);
+                    mul(track);
+                }
+                UiPrimitive::PushClip { rect } => {
+                    shift(rect);
+                }
+                UiPrimitive::PopClip => {}
+            }
+        }
     }
 
     /// Reverse-order pointer hit test returning the highest `(z_order, insertion_order)` entry
@@ -768,6 +998,26 @@ impl UiDrawList {
                     validate_rect(rect, idx)?;
                     if !size_px.is_finite() || *size_px <= 0.0 {
                         return Err(format!("primitive {idx}: invalid size_px {size_px}"));
+                    }
+                }
+                UiPrimitive::RichText {
+                    rect,
+                    clip_rect,
+                    font_size,
+                    line_height,
+                    ..
+                } => {
+                    validate_rect(rect, idx)?;
+                    if let Some(cr) = clip_rect {
+                        validate_rect(cr, idx)?;
+                    }
+                    if !font_size.is_finite() || *font_size <= 0.0 {
+                        return Err(format!("primitive {idx}: invalid font_size {font_size}"));
+                    }
+                    if !line_height.is_finite() || *line_height <= 0.0 {
+                        return Err(format!(
+                            "primitive {idx}: invalid line_height {line_height}"
+                        ));
                     }
                 }
                 UiPrimitive::Icon { rect, .. } => validate_rect(rect, idx)?,
@@ -834,6 +1084,11 @@ pub enum SettingChange {
     ToggleActivePaneBorder,
     ToggleFadeInactivePanes,
     ToggleAdaptiveRounding,
+    ToggleProgramColorHeader,
+    ToggleChimeEnabled,
+    ToggleDesktopNotifications,
+    FontSizePt(f32),
+    OpenThemePicker,
 }
 
 /// Typed high-level UI action returned to `omarex` on pointer/keyboard interaction.
@@ -976,6 +1231,28 @@ pub enum UiAction {
         block_id: String,
         fraction: f32,
     },
+    ScrollPaneToBottom {
+        block_id: String,
+    },
+    OpenPortAction {
+        block_id: String,
+        port: u16,
+    },
+    FilePickerDescend {
+        path: String,
+    },
+    FilePickerParent,
+    FilePickerAccept {
+        path: String,
+    },
+    ThemePickerPreview {
+        name: String,
+    },
+    ThemePickerCommit {
+        name: String,
+    },
+    ThemePickerCancel,
+    CopyDiagnosticsBundle,
     Viewer(ViewerAction),
 }
 
@@ -993,6 +1270,10 @@ pub enum ViewerAction {
     CopyPath {
         path: String,
     },
+    CopyPathLine {
+        path: String,
+        line: usize,
+    },
     OpenExternal {
         path: String,
         remote_host: Option<String>,
@@ -1001,6 +1282,16 @@ pub enum ViewerAction {
     ClosePane,
     ToggleWrap,
     ToggleRawMarkdown,
+    ToggleDiff,
+    OpenLink {
+        url: String,
+        base_path: String,
+    },
+    SearchOpen,
+    SearchPrev,
+    SearchNext,
+    SearchToggleCase,
+    SearchClose,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -1017,6 +1308,25 @@ pub enum ViewerAction {
         tab_id: u64,
     },
     ToggleVideoLoop {
+        tab_id: u64,
+    },
+    ToggleAudioPlayPause {
+        tab_id: u64,
+    },
+    SeekAudio {
+        tab_id: u64,
+        fraction: f32,
+    },
+    ToggleAudioMute {
+        tab_id: u64,
+    },
+    ToggleAudioLoop {
+        tab_id: u64,
+    },
+    PdfPrevPage {
+        tab_id: u64,
+    },
+    PdfNextPage {
         tab_id: u64,
     },
     ScrollToFraction {

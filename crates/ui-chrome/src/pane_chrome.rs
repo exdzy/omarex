@@ -45,6 +45,14 @@ pub struct ScrollbarMetrics {
     pub hovered: bool,
 }
 
+/// Listening TCP port badge displayed as a clickable `● :<port>` pill in pane headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortBadge {
+    pub port: u16,
+    pub label: Option<String>,
+    pub tunneled: bool,
+}
+
 /// Per-pane chrome metadata supplied for rendering tiled or floating panes.
 #[derive(Debug, Clone)]
 pub struct PaneMeta {
@@ -60,6 +68,12 @@ pub struct PaneMeta {
     pub scrollbar: ScrollbarMetrics,
     /// Optional explicit background from TUI `fill_with_program_colors`.
     pub program_bg: Option<Rgba>,
+    /// True when new PTY output arrived while this pane was scrolled up into scrollback.
+    pub has_unread_output: bool,
+    /// Optional Vim Copy Mode badge (`"COPY"`, `"VISUAL"`, `"V-LINE"`, `"V-BLOCK"`).
+    pub copy_mode_badge: Option<&'static str>,
+    /// Live listening TCP ports detected for this pane (`● :<port>` pills).
+    pub listening_ports: Vec<PortBadge>,
     /// True if this floating pane is a `tr3x` Pull Request drawer (`label == "Pull Request"`).
     pub is_pr_drawer: bool,
     /// Optional PR branch/number subtitle for `tr3x` `/pr` drawer chrome.
@@ -74,6 +88,7 @@ pub struct PaneChromeOptions {
     pub fade_inactive_panes: bool,
     pub hovered_divider_index: Option<usize>,
     pub is_t3_session: bool,
+    pub program_color_header: bool,
 }
 
 impl Default for PaneChromeOptions {
@@ -84,6 +99,7 @@ impl Default for PaneChromeOptions {
             fade_inactive_panes: true,
             hovered_divider_index: None,
             is_t3_session: false,
+            program_color_header: true,
         }
     }
 }
@@ -102,6 +118,7 @@ pub fn render_workspace_chrome(
     options: PaneChromeOptions,
     dnd_overlay: Option<DropZoneHit>,
     show_sidebar_expand: bool,
+    spring_active_border: Option<RectF>,
     interaction: UiInteraction<'_>,
     theme: &Theme,
     anim_phase: f32,
@@ -159,10 +176,36 @@ pub fn render_workspace_chrome(
             multi_pane,
             inline_expand_pane_idx == Some(idx),
             options,
+            spring_active_border.is_some(),
             interaction,
             &tokens,
             theme.rounding,
             anim_phase,
+        );
+    }
+
+    // 1b. Spring-physics active-pane border (drawn over tiled panes, below floating panes & modals)
+    if options.highlight_active_border
+        && let Some(active_rect) = spring_active_border
+        && !active_rect.is_empty()
+    {
+        let focused_geo = tiled
+            .iter()
+            .find(|g| metas.iter().any(|m| m.block_id == g.id && m.focused))
+            .or_else(|| tiled.first());
+        let active_radius =
+            focused_geo.map_or(0.0, |g| cap_radius(g.corner_radius, theme.rounding));
+        draw_list.push_rect(
+            active_rect,
+            Rgba::new(0, 0, 0, 0),
+            Some(
+                tokens
+                    .border_active
+                    .with_alpha_f32(options.active_border_opacity),
+            ),
+            1.5,
+            active_radius,
+            None,
         );
     }
 
@@ -230,6 +273,7 @@ pub fn render_workspace_chrome(
             draw_list,
             fgeo,
             meta,
+            options.program_color_header,
             interaction,
             &tokens,
             theme.rounding,
@@ -316,6 +360,7 @@ fn render_tiled_pane(
     multi_pane: bool,
     show_sidebar_expand: bool,
     options: PaneChromeOptions,
+    use_spring_active_border: bool,
     interaction: UiInteraction<'_>,
     tokens: &UiTokens,
     theme_rounding: f32,
@@ -327,20 +372,21 @@ fn render_tiled_pane(
         .unwrap_or(tokens.surface_pane);
     let radius = cap_radius(geo.corner_radius, theme_rounding);
 
-    let (border_color, border_w) = if focused && options.highlight_active_border {
-        (
-            Some(
-                tokens
-                    .border_active
-                    .with_alpha_f32(options.active_border_opacity),
-            ),
-            1.5,
-        )
-    } else if radius > 0.0 || multi_pane {
-        (Some(tokens.border_pane), 1.0)
-    } else {
-        (None, 0.0)
-    };
+    let (border_color, border_w) =
+        if focused && options.highlight_active_border && !use_spring_active_border {
+            (
+                Some(
+                    tokens
+                        .border_active
+                        .with_alpha_f32(options.active_border_opacity),
+                ),
+                1.5,
+            )
+        } else if radius > 0.0 || multi_pane {
+            (Some(tokens.border_pane), 1.0)
+        } else {
+            (None, 0.0)
+        };
 
     draw_list.push_rect(geo.card_rect, fill, border_color, border_w, radius, None);
 
@@ -354,49 +400,82 @@ fn render_tiled_pane(
             false,
             geo.is_zoomed,
             show_sidebar_expand,
+            options.program_color_header,
+            radius,
             interaction,
             tokens,
             theme_rounding,
             anim_phase,
             z_layer::PANE_CHROME,
         );
-    } else if geo.is_zoomed {
-        // Floating `ZOOMED` pill in top-right when pane headers are hidden
-        let badge = RectF::new(
-            (geo.card_rect.right() - 72.0).max(geo.card_rect.x + 8.0),
-            geo.card_rect.y + 8.0,
-            62.0,
-            20.0,
-        );
-        let zoom_target = HitTarget::PaneZoomBadge {
-            block_id: geo.id.clone(),
-        };
-        let badge_fill = if interaction.is_pressed(&zoom_target) {
-            tokens.accent_primary.with_alpha_f32(0.80)
-        } else if interaction.is_hovered(&zoom_target) {
-            tokens.accent_primary.with_alpha_f32(0.92)
-        } else {
-            tokens.accent_primary
-        };
-        draw_list.push_rect(
-            badge,
-            badge_fill,
-            None,
-            0.0,
-            cap_radius(5.0, theme_rounding),
-            None,
-        );
-        draw_list.push_text(
-            badge,
-            "ZOOMED",
-            tokens.accent_foreground,
-            FontKind::Mono,
-            9.5,
-            FontWeight::Bold,
-            TextAlign::Center,
-            false,
-        );
-        draw_list.push_hit(badge, zoom_target, z_layer::PANE_CHROME + 2);
+    } else {
+        let mut right_edge = geo.card_rect.right() - 10.0;
+        if geo.is_zoomed {
+            // Floating `ZOOMED` pill in top-right when pane headers are hidden
+            let badge = RectF::new(
+                (right_edge - 62.0).max(geo.card_rect.x + 8.0),
+                geo.card_rect.y + 8.0,
+                62.0,
+                20.0,
+            );
+            let zoom_target = HitTarget::PaneZoomBadge {
+                block_id: geo.id.clone(),
+            };
+            let badge_fill = if interaction.is_pressed(&zoom_target) {
+                tokens.accent_primary.with_alpha_f32(0.80)
+            } else if interaction.is_hovered(&zoom_target) {
+                tokens.accent_primary.with_alpha_f32(0.92)
+            } else {
+                tokens.accent_primary
+            };
+            draw_list.push_rect(
+                badge,
+                badge_fill,
+                None,
+                0.0,
+                cap_radius(5.0, theme_rounding),
+                None,
+            );
+            draw_list.push_text(
+                badge,
+                "ZOOMED",
+                tokens.accent_foreground,
+                FontKind::Mono,
+                9.5,
+                FontWeight::Bold,
+                TextAlign::Center,
+                false,
+            );
+            draw_list.push_hit(badge, zoom_target, z_layer::PANE_CHROME + 2);
+            right_edge = badge.x - 6.0;
+        }
+        if let Some(copy_badge) = meta.and_then(|m| m.copy_mode_badge) {
+            let bw = (copy_badge.len() as f32 * 6.8 + 16.0).max(52.0);
+            let badge = RectF::new(
+                (right_edge - bw).max(geo.card_rect.x + 8.0),
+                geo.card_rect.y + 8.0,
+                bw,
+                20.0,
+            );
+            draw_list.push_rect(
+                badge,
+                tokens.accent_primary,
+                None,
+                0.0,
+                cap_radius(5.0, theme_rounding),
+                None,
+            );
+            draw_list.push_text(
+                badge,
+                copy_badge,
+                tokens.accent_foreground,
+                FontKind::Mono,
+                9.5,
+                FontWeight::Bold,
+                TextAlign::Center,
+                false,
+            );
+        }
     }
 
     // OSC 9;4 hairline progress bar (`2px`) beneath pane header or along top of terminal
@@ -442,6 +521,19 @@ fn render_tiled_pane(
         );
     }
 
+    // Floating `↓ New output` pill when scrolled up while live PTY bytes arrive
+    if meta.is_some_and(|m| m.has_unread_output) {
+        render_new_output_pill(
+            draw_list,
+            geo.terminal_rect,
+            &geo.id,
+            interaction,
+            tokens,
+            theme_rounding,
+            z_layer::PANE_CHROME + 3,
+        );
+    }
+
     // Inactive pane subtle dim overlay when multiple panes exist
     if multi_pane && !focused && options.fade_inactive_panes {
         draw_list.push_rect(
@@ -468,6 +560,7 @@ fn render_floating_pane(
     draw_list: &mut UiDrawList,
     geo: &FloatingPaneGeometry<String>,
     meta: Option<&PaneMeta>,
+    program_color_header: bool,
     interaction: UiInteraction<'_>,
     tokens: &UiTokens,
     theme_rounding: f32,
@@ -487,6 +580,9 @@ fn render_floating_pane(
         );
     } else {
         let radius = cap_radius(geo.corner_radius, theme_rounding);
+        let fill = meta
+            .and_then(|m| m.program_bg)
+            .unwrap_or(tokens.surface_pane);
         let border = if meta.is_some_and(|m| m.focused) {
             tokens.border_active
         } else {
@@ -499,14 +595,7 @@ fn render_floating_pane(
             spread: 0.0,
             color: tokens.shadow_color,
         };
-        draw_list.push_rect(
-            geo.card_rect,
-            tokens.surface_pane,
-            Some(border),
-            1.0,
-            radius,
-            Some(shadow),
-        );
+        draw_list.push_rect(geo.card_rect, fill, Some(border), 1.0, radius, Some(shadow));
         render_pane_header(
             draw_list,
             geo.header_rect,
@@ -515,6 +604,8 @@ fn render_floating_pane(
             true,
             false,
             false,
+            program_color_header,
+            radius,
             interaction,
             tokens,
             theme_rounding,
@@ -532,6 +623,18 @@ fn render_floating_pane(
             interaction,
             tokens,
             z + 1,
+        );
+    }
+
+    if meta.is_some_and(|m| m.has_unread_output) {
+        render_new_output_pill(
+            draw_list,
+            geo.terminal_rect,
+            &geo.id,
+            interaction,
+            tokens,
+            theme_rounding,
+            z + 3,
         );
     }
 
@@ -588,20 +691,74 @@ fn render_pane_header(
     is_floating: bool,
     is_zoomed: bool,
     show_sidebar_expand: bool,
+    program_color_header: bool,
+    card_radius: f32,
     interaction: UiInteraction<'_>,
     tokens: &UiTokens,
     theme_rounding: f32,
     anim_phase: f32,
     z: u16,
 ) {
-    // Only fill opaque header strip in sharp/0px mode; in rounded card mode, the card's own
-    // rounded background shows cleanly underneath so square corners never poke past the border.
+    let raw_program_bg = meta.and_then(|m| m.program_bg);
+    let effective_program_bg = if program_color_header {
+        raw_program_bg
+    } else {
+        None
+    };
+
+    // Only fill opaque header strip in sharp/0px mode unless `program_color_header == false`
+    // overrides a rounded pane card's `program_bg`, in which case we keep the rounded top corners
+    // clean while painting `tokens.surface_pane_header`.
     if theme_rounding <= 0.0 {
-        let header_bg = meta
-            .and_then(|m| m.program_bg)
-            .unwrap_or(tokens.surface_pane_header);
+        let header_bg = effective_program_bg.unwrap_or(tokens.surface_pane_header);
         draw_list.push_rect(header_rect, header_bg, None, 0.0, 0.0, None);
+    } else if !program_color_header && raw_program_bg.is_some() {
+        let inner = RectF::new(
+            header_rect.x + 1.0,
+            header_rect.y + 1.0,
+            (header_rect.w - 2.0).max(0.0),
+            (header_rect.h - 1.0).max(0.0),
+        );
+        let r = card_radius.min(inner.h * 0.5).max(0.0);
+        draw_list.push_rect(inner, tokens.surface_pane_header, None, 0.0, r, None);
+        if r > 0.0 && inner.h > r {
+            draw_list.push_rect(
+                RectF::new(inner.x, inner.y + r, inner.w, inner.h - r),
+                tokens.surface_pane_header,
+                None,
+                0.0,
+                0.0,
+                None,
+            );
+        }
     }
+
+    // WCAG AA (>= 4.5) contrast guard when program_bg paints behind the pane header.
+    let header_surface =
+        effective_program_bg.unwrap_or(if theme_rounding <= 0.0 || !program_color_header {
+            tokens.surface_pane_header
+        } else {
+            tokens.surface_pane
+        });
+    let bg_rgb = header_surface.rgb();
+    let (hdr_fg_primary, hdr_fg_secondary, hdr_fg_muted, hdr_hairline) =
+        if effective_program_bg.is_some() && bg_rgb.wcag_contrast(tokens.fg_primary.rgb()) < 4.5 {
+            let prim = bg_rgb.readable_foreground();
+            (
+                prim.opaque(),
+                prim.blend(bg_rgb, 0.25).opaque(),
+                prim.blend(bg_rgb, 0.45).opaque(),
+                bg_rgb.blend(prim, 0.14).opaque(),
+            )
+        } else {
+            (
+                tokens.fg_primary,
+                tokens.fg_secondary,
+                tokens.fg_muted,
+                tokens.border_hairline,
+            )
+        };
+
     draw_list.push_rect(
         RectF::new(
             header_rect.x + 1.5,
@@ -609,7 +766,7 @@ fn render_pane_header(
             (header_rect.w - 3.0).max(0.0),
             1.0,
         ),
-        tokens.border_hairline,
+        hdr_hairline,
         None,
         0.0,
         0.0,
@@ -659,7 +816,7 @@ fn render_pane_header(
                 button: btn,
             };
             if btn == PaneHeaderButton::Close {
-                let (bg, tint) = interaction.danger_button_style(&target, tokens.fg_muted, tokens);
+                let (bg, tint) = interaction.danger_button_style(&target, hdr_fg_muted, tokens);
                 if let Some((fill, border)) = bg {
                     draw_list.push_rect(btn_rect, fill, border, 1.0, btn_r, None);
                 }
@@ -676,7 +833,7 @@ fn render_pane_header(
                 } else if interaction.is_hovered(&target) || interaction.is_pressed(&target) {
                     tokens.fg_primary
                 } else {
-                    tokens.fg_muted
+                    hdr_fg_muted
                 };
                 draw_list.push_icon(btn_rect.inset_uniform(4.5), btn_icon, tint);
             }
@@ -702,7 +859,7 @@ fn render_pane_header(
             if interaction.is_hovered(&HitTarget::SidebarToggle) {
                 tokens.fg_primary
             } else {
-                tokens.fg_secondary
+                hdr_fg_secondary
             },
         );
         draw_list.push_hit(sb_btn, HitTarget::SidebarToggle, z + 2);
@@ -716,7 +873,7 @@ fn render_pane_header(
             .map(|[r, g, b]| Rgba::new(r, g, b, 255))
             .unwrap_or(tokens.accent_primary)
     } else {
-        tokens.fg_secondary
+        hdr_fg_secondary
     };
     draw_list.push_icon(
         RectF::new(cx, header_rect.y + (header_rect.h - 14.0) * 0.5, 14.0, 14.0),
@@ -731,9 +888,9 @@ fn render_pane_header(
         RectF::new(cx, header_rect.y + 6.0, label_w, 18.0),
         label,
         if focused {
-            tokens.fg_primary
+            hdr_fg_primary
         } else {
-            tokens.fg_secondary
+            hdr_fg_secondary
         },
         FontKind::Sans,
         12.0,
@@ -751,7 +908,7 @@ fn render_pane_header(
         draw_list.push_text(
             RectF::new(cx, header_rect.y + 6.0, cwd_w, 18.0),
             cwd,
-            tokens.fg_muted,
+            hdr_fg_muted,
             FontKind::Mono,
             11.5,
             FontWeight::Regular,
@@ -813,6 +970,129 @@ fn render_pane_header(
             true,
         );
         cx += pill_w + 8.0;
+    }
+
+    // Copy Mode badge (`COPY`, `VISUAL`, `V-LINE`, `V-BLOCK`)
+    if let Some(copy_badge) = meta.and_then(|m| m.copy_mode_badge) {
+        let bw = (copy_badge.len() as f32 * 6.8 + 16.0).max(50.0);
+        if cx + bw <= max_x {
+            let pill = RectF::new(cx, header_rect.y + 6.0, bw, 18.0);
+            draw_list.push_rect(
+                pill,
+                tokens.accent_primary,
+                None,
+                0.0,
+                cap_radius(4.0, theme_rounding),
+                None,
+            );
+            draw_list.push_text(
+                pill,
+                copy_badge,
+                tokens.accent_foreground,
+                FontKind::Mono,
+                9.5,
+                FontWeight::Bold,
+                TextAlign::Center,
+                false,
+            );
+            cx += bw + 6.0;
+        }
+    }
+
+    // Listening TCP port pills (`● :<port>`)
+    if let Some(ports) = meta.map(|m| m.listening_ports.as_slice())
+        && !ports.is_empty()
+    {
+        let pill_r = if theme_rounding <= 0.0 { 0.0 } else { 9.5 };
+        let pill_y = header_rect.y + (header_rect.h - 19.0) * 0.5;
+        let mut shown = 0usize;
+        for p in ports.iter().take(2) {
+            let label = if p.tunneled {
+                format!(":{} ⇄", p.port)
+            } else {
+                format!(":{}", p.port)
+            };
+            let pill_w = 22.0 + (label.chars().count() as f32) * 6.4;
+            if cx + pill_w > max_x {
+                break;
+            }
+            let pill_rect = RectF::new(cx, pill_y, pill_w, 19.0);
+            let port_target = HitTarget::PanePortPill {
+                block_id: block_id.to_owned(),
+                port: p.port,
+            };
+            let hovered = interaction.is_hovered(&port_target);
+            let dot_color = if p.tunneled {
+                tokens.accent_primary
+            } else {
+                tokens.status_done
+            };
+            draw_list.push_rect(
+                pill_rect,
+                if hovered {
+                    dot_color.with_alpha_f32(0.24)
+                } else {
+                    dot_color.with_alpha_f32(0.14)
+                },
+                Some(dot_color.with_alpha_f32(if hovered { 0.85 } else { 0.48 })),
+                1.0,
+                pill_r,
+                None,
+            );
+            draw_list.push_rect(
+                RectF::new(pill_rect.x + 7.0, pill_rect.y + 6.5, 6.0, 6.0),
+                dot_color,
+                None,
+                0.0,
+                3.0,
+                None,
+            );
+            draw_list.push_text(
+                RectF::new(
+                    pill_rect.x + 17.0,
+                    pill_rect.y + 2.0,
+                    (pill_rect.w - 21.0).max(0.0),
+                    15.0,
+                ),
+                label,
+                dot_color,
+                FontKind::Mono,
+                10.5,
+                FontWeight::SemiBold,
+                TextAlign::Left,
+                false,
+            );
+            draw_list.push_hit(pill_rect, port_target, z + 2);
+            cx += pill_w + 6.0;
+            shown += 1;
+        }
+        let omitted = ports.len().saturating_sub(shown);
+        if omitted > 0 {
+            let extra = format!("+{omitted}");
+            let ew = (extra.len() as f32 * 6.4 + 10.0).max(24.0);
+            if cx + ew <= max_x {
+                let extra_rect = RectF::new(cx, pill_y, ew, 19.0);
+                draw_list.push_rect(
+                    extra_rect,
+                    tokens.surface_pane,
+                    Some(tokens.border_hairline),
+                    1.0,
+                    pill_r,
+                    None,
+                );
+                draw_list.push_text(
+                    extra_rect,
+                    extra,
+                    tokens.fg_muted,
+                    FontKind::Mono,
+                    10.0,
+                    FontWeight::Medium,
+                    TextAlign::Center,
+                    false,
+                );
+                cx += ew + 6.0;
+            }
+        }
     }
 
     // Unfocused bell badge
@@ -974,6 +1254,74 @@ fn render_overlay_scrollbar(
     draw_list.push_rect(thumb, thumb_color, None, 0.0, track_w * 0.5, None);
     draw_list.push_hit(track, track_target, z);
     draw_list.push_hit(thumb, thumb_target, z + 1);
+}
+
+fn render_new_output_pill(
+    draw_list: &mut UiDrawList,
+    terminal_rect: RectF,
+    block_id: &str,
+    interaction: UiInteraction<'_>,
+    tokens: &UiTokens,
+    theme_rounding: f32,
+    z: u16,
+) {
+    if terminal_rect.w < 140.0 || terminal_rect.h < 60.0 {
+        return;
+    }
+    let pill_w = 118.0f32.min((terminal_rect.w - 24.0).max(0.0));
+    let pill_h = 26.0;
+    let x = terminal_rect.x + (terminal_rect.w - pill_w) * 0.5;
+    let y = (terminal_rect.bottom() - pill_h - 12.0).max(terminal_rect.y + 6.0);
+    let pill = RectF::new(x, y, pill_w, pill_h);
+
+    let target = HitTarget::PaneNewOutputPill {
+        block_id: block_id.to_owned(),
+    };
+    let hovered = interaction.is_hovered(&target);
+    let pressed = interaction.is_pressed(&target);
+
+    let fill = if pressed {
+        tokens.surface_row_selected
+    } else if hovered {
+        tokens.surface_row_active
+    } else {
+        tokens.surface_modal
+    };
+    let border = if hovered || pressed {
+        tokens.accent_primary
+    } else {
+        tokens.accent_primary.with_alpha_f32(0.75)
+    };
+    let shadow = ShadowSpec {
+        offset_x: 0.0,
+        offset_y: 4.0,
+        blur_radius: 14.0,
+        spread: 0.0,
+        color: tokens.shadow_color,
+    };
+    draw_list.push_rect(
+        pill,
+        fill,
+        Some(border),
+        1.0,
+        cap_radius(pill_h * 0.5, theme_rounding),
+        Some(shadow),
+    );
+    draw_list.push_text(
+        pill,
+        "↓ New output",
+        if hovered || pressed {
+            tokens.accent_primary
+        } else {
+            tokens.fg_primary
+        },
+        FontKind::Sans,
+        11.5,
+        FontWeight::SemiBold,
+        TextAlign::Center,
+        false,
+    );
+    draw_list.push_hit(pill, target, z);
 }
 
 fn render_minimized_capsule(

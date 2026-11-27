@@ -277,16 +277,37 @@ pub fn compute_chrome_layout(
     viewport_h: f32,
     cfg: &ChromeLayoutConfig,
 ) -> ChromeRects {
+    let sp = if cfg.toolbar_position.is_sidebar() && cfg.sidebar_collapsed {
+        0.0
+    } else {
+        1.0
+    };
+    compute_chrome_layout_animated(viewport_w, viewport_h, cfg, sp)
+}
+
+/// Computes outer window chrome geometry using `taffy::TaffyTree`, scaling docked sidebar width
+/// by `sidebar_progress` (`0.0..=1.0`) for smooth slide open/close transitions.
+#[must_use]
+pub fn compute_chrome_layout_animated(
+    viewport_w: f32,
+    viewport_h: f32,
+    cfg: &ChromeLayoutConfig,
+    sidebar_progress: f32,
+) -> ChromeRects {
     let vw = viewport_w.max(0.0);
     let vh = viewport_h.max(0.0);
     let viewport = RectF::new(0.0, 0.0, vw, vh);
+    let sp = sidebar_progress.clamp(0.0, 1.0);
 
     let sidebar_auto_collapsed = cfg.is_sidebar_auto_collapsed(vw);
 
     let toolbar_docked = match cfg.toolbar_behavior {
         ToolbarBehavior::Always => {
-            !(cfg.toolbar_position.is_sidebar()
-                && (cfg.sidebar_collapsed || sidebar_auto_collapsed))
+            if cfg.toolbar_position.is_sidebar() {
+                !sidebar_auto_collapsed && sp > 0.005
+            } else {
+                true
+            }
         }
         ToolbarBehavior::OnHover | ToolbarBehavior::Hidden => false,
     };
@@ -298,7 +319,7 @@ pub fn compute_chrome_layout(
         }
     };
 
-    let docked_sidebar_w = cfg.responsive_sidebar_width(vw);
+    let docked_sidebar_w = (cfg.responsive_sidebar_width(vw) * sp).round();
     let overlay_sidebar_w = cfg
         .effective_sidebar_width()
         .min((vw - 32.0).max(0.0))
@@ -511,14 +532,36 @@ pub fn layout_workspace_with_viewer(
     viewer_ratio: f32,
     cfg: &ChromeLayoutConfig,
 ) -> Option<ViewerSplitGeometry> {
-    if !viewer_open || workspace.is_empty() {
+    layout_workspace_with_viewer_animated(
+        workspace,
+        viewer_open,
+        viewer_maximized,
+        viewer_ratio,
+        cfg,
+        1.0,
+    )
+}
+
+/// Animated variant of [`layout_workspace_with_viewer`] scaling viewer width by `viewer_progress`
+/// (`0.0..=1.0`) for smooth slide open/close transitions.
+#[must_use]
+pub fn layout_workspace_with_viewer_animated(
+    workspace: RectF,
+    viewer_open: bool,
+    viewer_maximized: bool,
+    viewer_ratio: f32,
+    cfg: &ChromeLayoutConfig,
+    viewer_progress: f32,
+) -> Option<ViewerSplitGeometry> {
+    let vp = viewer_progress.clamp(0.0, 1.0);
+    if !viewer_open || workspace.is_empty() || vp <= 0.005 {
         return None;
     }
 
     let margin = cfg.outer_margin();
     let corner_radius = cfg.pane_corner_radius();
 
-    if viewer_maximized {
+    if viewer_maximized && vp >= 0.995 {
         return Some(ViewerSplitGeometry {
             terminal_workspace: RectF::new(workspace.x, workspace.y, 0.0, workspace.h),
             divider_visual_rect: None,
@@ -529,10 +572,14 @@ pub fn layout_workspace_with_viewer(
         });
     }
 
-    let clamped = clamp_viewer_ratio(viewer_ratio);
+    let clamped = if viewer_maximized {
+        1.0
+    } else {
+        clamp_viewer_ratio(viewer_ratio)
+    };
     let divider_w = if margin > 0.0 { 2.0 } else { 1.0 };
     let avail_w = (workspace.w - divider_w).max(0.0);
-    let viewer_outer_w = (avail_w * clamped).round().clamp(0.0, avail_w);
+    let viewer_outer_w = (avail_w * clamped * vp).round().clamp(0.0, avail_w);
 
     let mut tree: TaffyTree<()> = TaffyTree::new();
     let term_node = tree

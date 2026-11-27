@@ -5,7 +5,8 @@ use omarchy_theme::{Rgb, Theme};
 use tr3x_bridge::t3_session::WorkingIndicator;
 
 use crate::draw::{
-    FontKind, FontWeight, HitTarget, TextAlign, UiDrawList, UiInteraction, cap_radius, z_layer,
+    FontKind, FontWeight, HitTarget, TabReorderOverlay, TextAlign, UiDrawList, UiInteraction,
+    cap_radius, z_layer,
 };
 use crate::icons::IconId;
 use crate::layout::RectF;
@@ -27,6 +28,7 @@ pub struct TabBarView<'a> {
     pub scroll_offset_x: f32,
     pub is_bottom: bool,
     pub is_overlay: bool,
+    pub tab_reorder_overlay: Option<&'a TabReorderOverlay>,
 }
 
 /// Renders the horizontal top or bottom tab bar into `draw_list`.
@@ -356,8 +358,9 @@ pub fn render_tab_bar(
         }
 
         // Title text
+        let mute_reserve = if tab.muted { 16.0 } else { 0.0 };
         let text_x = icon_tile.right() + 7.0;
-        let text_w = (tab_rect.right() - text_x - 26.0).max(0.0);
+        let text_w = (tab_rect.right() - text_x - 26.0 - mute_reserve).max(0.0);
         draw_list.push_text(
             RectF::new(text_x, tab_rect.y + 6.0, text_w, 16.0),
             &tab.card.title,
@@ -376,6 +379,14 @@ pub fn render_tab_bar(
             TextAlign::Left,
             true,
         );
+
+        if tab.muted {
+            draw_list.push_icon(
+                RectF::new(tab_rect.right() - 38.0, tab_rect.y + 8.5, 11.0, 11.0),
+                IconId::BellOff,
+                tokens.fg_muted,
+            );
+        }
 
         // Trailing close button (on hover or active, with danger hover pill) or `•••` working pulse
         let close_rect = RectF::new(tab_rect.right() - 22.0, tab_rect.y + 5.0, 18.0, 18.0);
@@ -406,7 +417,47 @@ pub fn render_tab_bar(
 
         draw_list.push_hit(tab_rect.intersect(strip_rect), tab_target, z + 1);
 
+        if let Some(overlay) = view.tab_reorder_overlay
+            && overlay.host_id == view.host_id
+            && overlay.session_id == view.session_id
+            && overlay.dragged_window_id == tab.window_id
+        {
+            draw_list.push_rect(
+                tab_rect,
+                tokens.accent_primary.with_alpha_f32(0.10),
+                Some(tokens.accent_primary.with_alpha_f32(0.70)),
+                1.25,
+                pill_r,
+                None,
+            );
+        }
+
         x += tab_w + gap;
+    }
+
+    if let Some(overlay) = view.tab_reorder_overlay
+        && overlay.host_id == view.host_id
+        && overlay.session_id == view.session_id
+        && let Some(ind) = overlay.indicator_rect
+    {
+        draw_list.push_rect(ind, tokens.accent_primary, None, 0.0, 1.25, None);
+        let cx = ind.x + ind.w * 0.5;
+        draw_list.push_rect(
+            RectF::new(cx - 2.5, ind.y - 2.0, 5.0, 5.0),
+            tokens.accent_primary,
+            None,
+            0.0,
+            2.5,
+            None,
+        );
+        draw_list.push_rect(
+            RectF::new(cx - 2.5, ind.bottom() - 3.0, 5.0, 5.0),
+            tokens.accent_primary,
+            None,
+            0.0,
+            2.5,
+            None,
+        );
     }
 
     // Subtle overflow edge fades when horizontal tab strip scrolls beyond visible width.

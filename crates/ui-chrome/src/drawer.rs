@@ -7,7 +7,6 @@ use crate::draw::{
     FontKind, FontWeight, HitTarget, PaneHeaderButton, ShadowSpec, TextAlign, UiAction, UiDrawList,
     UiInteraction, cap_radius, z_layer,
 };
-use crate::file_paths::DetectedFilePath;
 use crate::icons::IconId;
 use crate::layout::{FloatingPaneGeometry, RectF};
 
@@ -236,18 +235,6 @@ impl ContextMenuState {
         }
     }
 
-    /// Builds the session right-click context menu.
-    #[must_use]
-    pub fn for_session(
-        anchor_x: f32,
-        anchor_y: f32,
-        host_id: impl Into<String>,
-        session_id: impl Into<String>,
-        muted: bool,
-    ) -> Self {
-        Self::for_session_with_state(anchor_x, anchor_y, host_id, session_id, muted, false, false)
-    }
-
     /// Builds the session right-click context menu with collapse & T3 state awareness.
     #[must_use]
     pub fn for_session_with_state(
@@ -470,11 +457,6 @@ impl ContextMenuState {
     pub fn activate_index(&self, index: usize) -> Option<UiAction> {
         self.items.get(index).map(|item| item.action.clone())
     }
-
-    #[must_use]
-    pub fn activate_focused(&self) -> Option<UiAction> {
-        self.hovered_index.and_then(|idx| self.activate_index(idx))
-    }
 }
 
 /// Renders an open context menu clamped strictly inside `viewport`.
@@ -647,19 +629,6 @@ pub enum HoverPreviewState {
         anchor_x: f32,
         anchor_y: f32,
     },
-}
-
-impl HoverPreviewState {
-    #[must_use]
-    pub fn from_detected_path(hit: &DetectedFilePath<'_>, anchor_x: f32, anchor_y: f32) -> Self {
-        Self::FilePath {
-            path: hit.path.to_owned(),
-            line: hit.line,
-            column: hit.column,
-            anchor_x,
-            anchor_y,
-        }
-    }
 }
 
 /// Renders a file-path hover tooltip or image preview card frame.
