@@ -6,6 +6,9 @@ pub mod hyprland;
 pub mod notify;
 pub mod watcher;
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -124,6 +127,210 @@ impl Theme {
             }
         }
     }
+}
+
+/// Reserved built-in theme name that tracks live `~/.local/state/omarchy/current/theme/`.
+pub const OMARCHY_LIVE_THEME_NAME: &str = "omarchy-live";
+/// Built-in dark fallback theme name.
+pub const OMARCHY_DEFAULT_DARK_NAME: &str = "omarchy-default-dark";
+/// Built-in light fallback theme name.
+pub const OMARCHY_DEFAULT_LIGHT_NAME: &str = "omarchy-default-light";
+
+/// Metadata for a discovered Omarchy or built-in theme entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeDescriptor {
+    pub name: String,
+    pub colors_path: Option<PathBuf>,
+    pub mode: AppearanceMode,
+    pub is_user_override: bool,
+    pub is_builtin: bool,
+}
+
+/// Lists all available themes across `~/.config/omarchy/themes/`, `/usr/share/omarchy/themes/`,
+/// live Omarchy state, and built-in presets. Directories lacking `colors.toml` are skipped.
+pub fn list_available_themes() -> Vec<ThemeDescriptor> {
+    let user_dir = ThemePalette::default_user_themes_dir();
+    let system_dir = ThemePalette::default_system_themes_dir();
+    let current_dir = ThemePalette::default_omarchy_dir();
+    discover_themes_in(
+        user_dir.as_deref(),
+        Some(system_dir.as_path()),
+        current_dir.as_deref(),
+    )
+}
+
+/// Alias matching design docs for [`list_available_themes`].
+pub fn discover_themes() -> Vec<ThemeDescriptor> {
+    list_available_themes()
+}
+
+/// Discovers themes in explicit user, system, and current-state directories (unit-test friendly).
+pub fn discover_themes_in(
+    user_dir: Option<&Path>,
+    system_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Vec<ThemeDescriptor> {
+    let live_palette = current_dir
+        .and_then(|d| ThemePalette::load_from_omarchy_dir(d).ok())
+        .unwrap_or_else(ThemePalette::default_dark);
+
+    let mut out = vec![ThemeDescriptor {
+        name: OMARCHY_LIVE_THEME_NAME.to_owned(),
+        colors_path: current_dir.map(|d| d.join("theme/colors.toml")),
+        mode: live_palette.mode,
+        is_user_override: false,
+        is_builtin: true,
+    }];
+
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(OMARCHY_LIVE_THEME_NAME.to_owned());
+
+    let mut discovered = Vec::new();
+    for (dir_opt, is_user) in [(user_dir, true), (system_dir, false)] {
+        let Some(dir) = dir_opt else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if !entry_path.is_dir() {
+                continue;
+            }
+            let Some(name) = entry_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if seen.contains(&name) {
+                continue;
+            }
+            let colors_path = entry_path.join("colors.toml");
+            if !colors_path.is_file() {
+                continue;
+            }
+            let Ok(pal) = ThemePalette::load_from_path(&colors_path) else {
+                continue;
+            };
+            seen.insert(name.clone());
+            discovered.push(ThemeDescriptor {
+                name,
+                colors_path: Some(colors_path),
+                mode: pal.mode,
+                is_user_override: is_user,
+                is_builtin: false,
+            });
+        }
+    }
+
+    discovered.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out.extend(discovered);
+
+    if !seen.contains(OMARCHY_DEFAULT_DARK_NAME) {
+        out.push(ThemeDescriptor {
+            name: OMARCHY_DEFAULT_DARK_NAME.to_owned(),
+            colors_path: None,
+            mode: AppearanceMode::Dark,
+            is_user_override: false,
+            is_builtin: true,
+        });
+    }
+    if !seen.contains(OMARCHY_DEFAULT_LIGHT_NAME) {
+        out.push(ThemeDescriptor {
+            name: OMARCHY_DEFAULT_LIGHT_NAME.to_owned(),
+            colors_path: None,
+            mode: AppearanceMode::Light,
+            is_user_override: false,
+            is_builtin: true,
+        });
+    }
+    out
+}
+
+/// Loads a theme by name from `~/.config/omarchy/themes/`, `/usr/share/omarchy/themes/`,
+/// live Omarchy state (`"omarchy-live"`), or built-in fallbacks.
+pub fn load_theme_by_name(name: &str) -> Result<ThemePalette, ThemeError> {
+    let user_dir = ThemePalette::default_user_themes_dir();
+    let system_dir = ThemePalette::default_system_themes_dir();
+    let current_dir = ThemePalette::default_omarchy_dir();
+    load_theme_by_name_in(
+        name,
+        user_dir.as_deref(),
+        Some(system_dir.as_path()),
+        current_dir.as_deref(),
+    )
+}
+
+/// Loads a theme by name from explicit user, system, and current-state directories.
+pub fn load_theme_by_name_in(
+    name: &str,
+    user_dir: Option<&Path>,
+    system_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Result<ThemePalette, ThemeError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed == "."
+        || trimmed == ".."
+    {
+        return Err(ThemeError::Parse(format!("invalid theme name `{name}`")));
+    }
+
+    match trimmed {
+        OMARCHY_LIVE_THEME_NAME => {
+            return Ok(current_dir
+                .and_then(|d| ThemePalette::load_from_omarchy_dir(d).ok())
+                .unwrap_or_else(ThemePalette::default_dark));
+        }
+        OMARCHY_DEFAULT_DARK_NAME => return Ok(ThemePalette::default_dark()),
+        OMARCHY_DEFAULT_LIGHT_NAME => return Ok(ThemePalette::default_light()),
+        _ => {}
+    }
+
+    let mut last_parse_err: Option<ThemeError> = None;
+    for dir_opt in [user_dir, system_dir] {
+        let Some(dir) = dir_opt else {
+            continue;
+        };
+        let candidate = dir.join(trimmed).join("colors.toml");
+        if candidate.is_file() {
+            match ThemePalette::load_from_path(&candidate) {
+                Ok(mut pal) => {
+                    if pal.source_name.is_none() {
+                        pal.source_name = Some(trimmed.to_owned());
+                    }
+                    return Ok(pal);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %candidate.display(),
+                        error = %err,
+                        "skipping invalid omarchy theme colors.toml"
+                    );
+                    last_parse_err = Some(err);
+                }
+            }
+        }
+    }
+
+    Err(last_parse_err.unwrap_or_else(|| {
+        ThemeError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("theme `{trimmed}` not found"),
+        ))
+    }))
 }
 
 /// Holds both zero-polling background watcher handles alive until dropped.
@@ -452,5 +659,111 @@ green = "#40a02b"
         // Sanitization strips BiDi overrides and control chars.
         let dirty = "Needs\x07 you\u{202E}spoof\nnow\t!";
         assert_eq!(sanitize_notification_text(dirty), "Needs youspoof now !");
+    }
+
+    #[test]
+    fn discover_themes_skips_missing_colors_toml_and_prefers_user_override() {
+        let root = make_temp_dir("themes");
+        let user_dir = root.join("user");
+        let sys_dir = root.join("sys");
+        let cur_dir = root.join("current");
+        std::fs::create_dir_all(user_dir.join("catppuccin")).unwrap();
+        std::fs::create_dir_all(sys_dir.join("catppuccin")).unwrap();
+        std::fs::create_dir_all(sys_dir.join("osaka-jade")).unwrap();
+        std::fs::create_dir_all(sys_dir.join("alpine-light")).unwrap();
+        std::fs::create_dir_all(cur_dir.join("theme")).unwrap();
+
+        // User override uses light mode, system uses dark -> user must win.
+        std::fs::write(
+            user_dir.join("catppuccin/colors.toml"),
+            "background = \"#f5f5f5\"\nforeground = \"#111111\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sys_dir.join("catppuccin/colors.toml"),
+            "background = \"#111111\"\nforeground = \"#eeeeee\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sys_dir.join("alpine-light/colors.toml"),
+            "background = \"#ffffff\"\nforeground = \"#000000\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cur_dir.join("theme/colors.toml"),
+            "background = \"#121212\"\nforeground = \"#dddddd\"\n",
+        )
+        .unwrap();
+        // Note: sys_dir/osaka-jade intentionally has NO colors.toml!
+
+        let list = discover_themes_in(Some(&user_dir), Some(&sys_dir), Some(&cur_dir));
+        let names: Vec<&str> = list.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"omarchy-live"));
+        assert!(names.contains(&"catppuccin"));
+        assert!(names.contains(&"alpine-light"));
+        assert!(!names.contains(&"osaka-jade"));
+
+        let cat = list.iter().find(|t| t.name == "catppuccin").unwrap();
+        assert!(cat.is_user_override);
+        assert_eq!(cat.mode, AppearanceMode::Light);
+
+        let loaded = load_theme_by_name_in(
+            "catppuccin",
+            Some(&user_dir),
+            Some(&sys_dir),
+            Some(&cur_dir),
+        )
+        .unwrap();
+        assert_eq!(loaded.mode, AppearanceMode::Light);
+
+        assert!(
+            load_theme_by_name_in(
+                "osaka-jade",
+                Some(&user_dir),
+                Some(&sys_dir),
+                Some(&cur_dir),
+            )
+            .is_err()
+        );
+        assert!(
+            load_theme_by_name_in("../escape", Some(&user_dir), Some(&sys_dir), Some(&cur_dir),)
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_theme_by_name_falls_back_to_system_when_user_override_corrupt() {
+        let root = make_temp_dir("corrupt-fallback");
+        let user_dir = root.join("user");
+        let sys_dir = root.join("sys");
+        std::fs::create_dir_all(user_dir.join("nord")).unwrap();
+        std::fs::create_dir_all(sys_dir.join("nord")).unwrap();
+        std::fs::create_dir_all(user_dir.join("only-broken")).unwrap();
+
+        std::fs::write(user_dir.join("nord/colors.toml"), "NOT VALID TOML = [[[").unwrap();
+        std::fs::write(
+            sys_dir.join("nord/colors.toml"),
+            "background = \"#2e3440\"\nforeground = \"#d8dee9\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user_dir.join("only-broken/colors.toml"),
+            "NOT VALID TOML = [[[",
+        )
+        .unwrap();
+
+        let pal = load_theme_by_name_in("nord", Some(&user_dir), Some(&sys_dir), None)
+            .expect("should fall back to valid system nord theme");
+        assert_eq!(pal.source_name.as_deref(), Some("nord"));
+        assert_eq!(pal.mode, AppearanceMode::Dark);
+
+        assert!(
+            load_theme_by_name_in("only-broken", Some(&user_dir), Some(&sys_dir), None).is_err(),
+            "must still return Err when no valid candidate exists anywhere"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -700,6 +700,356 @@ pub fn clear_selection(terminal: &Terminal) -> Result<(), VtError> {
     Ok(())
 }
 
+/// 0-based screen-absolute cell coordinate `(col, row)` covering scrollback + viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenPoint {
+    pub col: u16,
+    pub row: u32,
+}
+
+/// Selection geometry mode for Copy Mode range selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    Char,
+    Line,
+    Block,
+}
+
+/// Vim-style word motion operations on screen coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordMotion {
+    NextStart,
+    PrevStart,
+    NextEnd,
+}
+
+#[inline]
+fn screen_point(col: u16, row: u32) -> ffi::GhosttyPoint {
+    ffi::GhosttyPoint {
+        tag: ffi::GHOSTTY_POINT_TAG_SCREEN,
+        value: ffi::GhosttyPointValue {
+            coordinate: ffi::GhosttyPointCoordinate { x: col, y: row },
+        },
+    }
+}
+
+fn terminal_cols_and_total_rows(raw: ffi::GhosttyTerminal) -> Result<(u16, u32), VtError> {
+    let mut cols: u16 = 0;
+    let rc_c = unsafe {
+        ffi::ghostty_terminal_get(raw, ffi::GHOSTTY_TERMINAL_DATA_COLS, (&raw mut cols).cast())
+    };
+    if rc_c != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(rc_c));
+    }
+    let mut sb = ffi::GhosttyTerminalScrollbar::default();
+    let rc_s = unsafe {
+        ffi::ghostty_terminal_get(
+            raw,
+            ffi::GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+            (&raw mut sb).cast(),
+        )
+    };
+    if rc_s != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(rc_s));
+    }
+    let total = u32::try_from(sb.total).unwrap_or(u32::MAX);
+    Ok((cols, total))
+}
+
+/// Returns `(cols, total_screen_rows)` covering scrollback history + active screen.
+pub fn screen_row_bounds(terminal: &Terminal) -> Result<(u16, u32), VtError> {
+    let guard = terminal.inner.lock();
+    terminal_cols_and_total_rows(guard.raw)
+}
+
+/// Installs a terminal selection between two screen-absolute coordinates using `Char`, `Line`,
+/// or `Block` (rectangular) mode.
+pub fn select_range(
+    terminal: &Terminal,
+    anchor: ScreenPoint,
+    cursor: ScreenPoint,
+    mode: SelectionMode,
+) -> Result<(), VtError> {
+    let guard = terminal.inner.lock();
+    let (cols, total_rows) = terminal_cols_and_total_rows(guard.raw)?;
+    if cols == 0 || total_rows == 0 {
+        return Ok(());
+    }
+    let max_col = cols.saturating_sub(1);
+    let max_row = total_rows.saturating_sub(1);
+    let a_row = anchor.row.min(max_row);
+    let c_row = cursor.row.min(max_row);
+    let a_col = anchor.col.min(max_col);
+    let c_col = cursor.col.min(max_col);
+
+    let (start_pt, end_pt, rectangle) = match mode {
+        SelectionMode::Char => (
+            screen_point(a_col, a_row),
+            screen_point(c_col, c_row),
+            false,
+        ),
+        SelectionMode::Line => {
+            let top = a_row.min(c_row);
+            let bot = a_row.max(c_row);
+            (screen_point(0, top), screen_point(max_col, bot), false)
+        }
+        SelectionMode::Block => (screen_point(a_col, a_row), screen_point(c_col, c_row), true),
+    };
+
+    let mut ref0 = ffi::GhosttyGridRef::default();
+    let mut ref1 = ffi::GhosttyGridRef::default();
+    // SAFETY: `guard.raw` is locked and both screen points are clamped within bounds.
+    let r0 = unsafe { ffi::ghostty_terminal_grid_ref(guard.raw, start_pt, &raw mut ref0) };
+    if r0 != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(r0));
+    }
+    let r1 = unsafe { ffi::ghostty_terminal_grid_ref(guard.raw, end_pt, &raw mut ref1) };
+    if r1 != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(r1));
+    }
+
+    let sel = ffi::GhosttySelection {
+        size: std::mem::size_of::<ffi::GhosttySelection>(),
+        start: ref0,
+        end: ref1,
+        rectangle,
+    };
+    // SAFETY: Installs snapshot selection on the same locked terminal.
+    let rc = unsafe {
+        ffi::ghostty_terminal_set(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_OPT_SELECTION,
+            (&raw const sel).cast(),
+        )
+    };
+    if rc != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(rc));
+    }
+    Ok(())
+}
+
+fn read_screen_row_cells(
+    raw: ffi::GhosttyTerminal,
+    cols: u16,
+    total_rows: u32,
+    screen_row: u32,
+) -> Result<Vec<(char, u16)>, VtError> {
+    if cols == 0 || screen_row >= total_rows {
+        return Ok(Vec::new());
+    }
+    let mut ref0 = ffi::GhosttyGridRef::default();
+    let mut ref1 = ffi::GhosttyGridRef::default();
+    let r0 =
+        unsafe { ffi::ghostty_terminal_grid_ref(raw, screen_point(0, screen_row), &raw mut ref0) };
+    let r1 = unsafe {
+        ffi::ghostty_terminal_grid_ref(
+            raw,
+            screen_point(cols.saturating_sub(1), screen_row),
+            &raw mut ref1,
+        )
+    };
+    if r0 != ffi::GHOSTTY_SUCCESS || r1 != ffi::GHOSTTY_SUCCESS {
+        return Ok(Vec::new());
+    }
+    let sel = ffi::GhosttySelection {
+        size: std::mem::size_of::<ffi::GhosttySelection>(),
+        start: ref0,
+        end: ref1,
+        rectangle: true,
+    };
+    let text = format_explicit_selection(raw, &sel, false, true)?;
+    let mut out = Vec::with_capacity(text.chars().count());
+    let mut col: u16 = 0;
+    for ch in text.chars() {
+        let w = char_display_width(ch);
+        if w == 0 {
+            continue;
+        }
+        out.push((ch, col));
+        col = col.saturating_add(u16::from(w));
+    }
+    Ok(out)
+}
+
+/// Returns the column of the first non-whitespace character on `screen_row` (`^`), or `0` if blank.
+pub fn screen_first_non_blank_col(terminal: &Terminal, screen_row: u32) -> Result<u16, VtError> {
+    let guard = terminal.inner.lock();
+    let (cols, total_rows) = terminal_cols_and_total_rows(guard.raw)?;
+    let cells = read_screen_row_cells(guard.raw, cols, total_rows, screen_row)?;
+    for (ch, col) in cells {
+        if !ch.is_whitespace() {
+            return Ok(col);
+        }
+    }
+    Ok(0)
+}
+
+/// Returns the column of the last non-whitespace character on `screen_row` (`$`), or `0` if blank.
+pub fn screen_line_end_col(terminal: &Terminal, screen_row: u32) -> Result<u16, VtError> {
+    let guard = terminal.inner.lock();
+    let (cols, total_rows) = terminal_cols_and_total_rows(guard.raw)?;
+    let cells = read_screen_row_cells(guard.raw, cols, total_rows, screen_row)?;
+    for &(ch, col) in cells.iter().rev() {
+        if !ch.is_whitespace() {
+            return Ok(col);
+        }
+    }
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimCharClass {
+    Space,
+    Word,
+    Punct,
+}
+
+#[inline]
+fn classify_vim_char(ch: char) -> VimCharClass {
+    if ch.is_whitespace() {
+        VimCharClass::Space
+    } else if ch.is_alphanumeric() || ch == '_' {
+        VimCharClass::Word
+    } else {
+        VimCharClass::Punct
+    }
+}
+
+/// Returns dense per-cell `(col, class)` up to the last non-blank char (empty vec if blank row).
+fn screen_row_classes(
+    raw: ffi::GhosttyTerminal,
+    cols: u16,
+    total_rows: u32,
+    screen_row: u32,
+) -> Result<Vec<(u16, VimCharClass)>, VtError> {
+    let cells = read_screen_row_cells(raw, cols, total_rows, screen_row)?;
+    let mut out: Vec<(u16, VimCharClass)> = cells
+        .into_iter()
+        .map(|(ch, col)| (col, classify_vim_char(ch)))
+        .collect();
+    while out
+        .last()
+        .is_some_and(|(_, cls)| *cls == VimCharClass::Space)
+    {
+        out.pop();
+    }
+    Ok(out)
+}
+
+/// Computes the next cursor [`ScreenPoint`] for Vim `w` (`NextStart`), `b` (`PrevStart`),
+/// or `e` (`NextEnd`) across scrollback + viewport rows.
+pub fn screen_word_motion(
+    terminal: &Terminal,
+    from: ScreenPoint,
+    motion: WordMotion,
+) -> Result<ScreenPoint, VtError> {
+    let guard = terminal.inner.lock();
+    let (cols, total_rows) = terminal_cols_and_total_rows(guard.raw)?;
+    if cols == 0 || total_rows == 0 {
+        return Ok(from);
+    }
+    let max_row = total_rows.saturating_sub(1);
+    let mut row = from.row.min(max_row);
+    let mut classes = screen_row_classes(guard.raw, cols, total_rows, row)?;
+
+    match motion {
+        WordMotion::NextStart => {
+            // Find index at or after `from.col`.
+            let idx = classes.iter().position(|&(c, _)| c >= from.col);
+            if let Some(mut i) = idx {
+                let start_cls = classes[i].1;
+                if start_cls != VimCharClass::Space {
+                    while i < classes.len() && classes[i].1 == start_cls {
+                        i += 1;
+                    }
+                }
+                while i < classes.len() && classes[i].1 == VimCharClass::Space {
+                    i += 1;
+                }
+                if i < classes.len() {
+                    return Ok(ScreenPoint {
+                        col: classes[i].0,
+                        row,
+                    });
+                }
+            }
+            // Advance to subsequent rows.
+            while row < max_row {
+                row += 1;
+                classes = screen_row_classes(guard.raw, cols, total_rows, row)?;
+                if classes.is_empty() {
+                    return Ok(ScreenPoint { col: 0, row });
+                }
+                if let Some(&(col, _)) =
+                    classes.iter().find(|&&(_, cls)| cls != VimCharClass::Space)
+                {
+                    return Ok(ScreenPoint { col, row });
+                }
+            }
+            let end_col = classes.last().map_or(0, |&(c, _)| c);
+            Ok(ScreenPoint { col: end_col, row })
+        }
+        WordMotion::PrevStart => {
+            // Find index strictly before `from.col`.
+            let mut idx_opt = classes.iter().rposition(|&(c, _)| c < from.col);
+            loop {
+                if let Some(mut i) = idx_opt {
+                    while i > 0 && classes[i].1 == VimCharClass::Space {
+                        i -= 1;
+                    }
+                    if classes[i].1 != VimCharClass::Space {
+                        let target_cls = classes[i].1;
+                        while i > 0 && classes[i - 1].1 == target_cls {
+                            i -= 1;
+                        }
+                        return Ok(ScreenPoint {
+                            col: classes[i].0,
+                            row,
+                        });
+                    }
+                }
+                if row == 0 {
+                    return Ok(ScreenPoint { col: 0, row: 0 });
+                }
+                row -= 1;
+                classes = screen_row_classes(guard.raw, cols, total_rows, row)?;
+                if classes.is_empty() {
+                    return Ok(ScreenPoint { col: 0, row });
+                }
+                idx_opt = Some(classes.len() - 1);
+            }
+        }
+        WordMotion::NextEnd => {
+            // Start strictly after `from.col`.
+            let mut idx = classes.iter().position(|&(c, _)| c > from.col);
+            loop {
+                if let Some(mut i) = idx {
+                    while i < classes.len() && classes[i].1 == VimCharClass::Space {
+                        i += 1;
+                    }
+                    if i < classes.len() {
+                        let target_cls = classes[i].1;
+                        while i + 1 < classes.len() && classes[i + 1].1 == target_cls {
+                            i += 1;
+                        }
+                        return Ok(ScreenPoint {
+                            col: classes[i].0,
+                            row,
+                        });
+                    }
+                }
+                if row >= max_row {
+                    let end_col = classes.last().map_or(0, |&(c, _)| c);
+                    return Ok(ScreenPoint { col: end_col, row });
+                }
+                row += 1;
+                classes = screen_row_classes(guard.raw, cols, total_rows, row)?;
+                idx = if classes.is_empty() { None } else { Some(0) };
+            }
+        }
+    }
+}
+
 /// Extracts the OSC 8 hyperlink URI at viewport coordinate `(col, row)`, if present.
 pub fn hyperlink_at(terminal: &Terminal, col: u16, row: u32) -> Result<Option<String>, VtError> {
     let guard = terminal.inner.lock();
@@ -806,6 +1156,33 @@ fn format_explicit_selection(
     }
     buf.truncate(written);
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Returns viewport-relative `(row, start_col..end_col)` spans for the active terminal selection.
+///
+/// Uses a scratch `RenderState` so the pane's incremental dirty-row cache is not disturbed.
+pub fn selection_viewport_spans(terminal: &Terminal) -> Result<Vec<RowCellSpan>, VtError> {
+    let mut rs = crate::RenderState::new()?;
+    let _ = rs.begin_update(terminal, crate::Overscan::default())?;
+    rs.end_update()?;
+
+    let mut spans = Vec::new();
+    rs.for_each_row(|row| {
+        if row.viewport_y >= 0
+            && let Some(sel) = row.selection
+        {
+            let start_col = sel.start_x;
+            let end_col = sel.end_x.saturating_add(1);
+            if end_col > start_col {
+                spans.push(RowCellSpan {
+                    row: row.viewport_y as u32,
+                    start_col,
+                    end_col,
+                });
+            }
+        }
+    })?;
+    Ok(spans)
 }
 
 /// Extracts the full unwrapped logical line containing viewport cell `(col, row)`, along with the
@@ -1755,6 +2132,61 @@ impl TerminalSearch {
             ffi::GHOSTTY_NO_VALUE => Ok(None),
             other => Err(VtError::Ffi(other)),
         }
+    }
+
+    /// Returns the currently selected match as `(start, end)` screen coordinates, or `None` if
+    /// nothing is selected.
+    pub fn selected_match_screen_range(
+        &self,
+        terminal: &Terminal,
+    ) -> Result<Option<(ScreenPoint, ScreenPoint)>, VtError> {
+        let guard = terminal.inner.lock();
+        let mut sel = ffi::GhosttySelection::default();
+        // SAFETY: `GHOSTTY_SEARCH_DATA_SELECTED_MATCH` writes `GhosttySelection`.
+        let rc = unsafe {
+            ffi::ghostty_search_get(
+                self.raw,
+                ffi::GHOSTTY_SEARCH_DATA_SELECTED_MATCH,
+                (&raw mut sel).cast(),
+            )
+        };
+        match rc {
+            ffi::GHOSTTY_NO_VALUE => return Ok(None),
+            ffi::GHOSTTY_SUCCESS => {}
+            other => return Err(VtError::Ffi(other)),
+        }
+        let mut start_pt = ffi::GhosttyPointCoordinate::default();
+        let mut end_pt = ffi::GhosttyPointCoordinate::default();
+        // SAFETY: `sel.start`/`sel.end` are valid snapshots under `guard.raw`.
+        let rc_s = unsafe {
+            ffi::ghostty_terminal_point_from_grid_ref(
+                guard.raw,
+                &raw const sel.start,
+                ffi::GHOSTTY_POINT_TAG_SCREEN,
+                &raw mut start_pt,
+            )
+        };
+        let rc_e = unsafe {
+            ffi::ghostty_terminal_point_from_grid_ref(
+                guard.raw,
+                &raw const sel.end,
+                ffi::GHOSTTY_POINT_TAG_SCREEN,
+                &raw mut end_pt,
+            )
+        };
+        if rc_s != ffi::GHOSTTY_SUCCESS || rc_e != ffi::GHOSTTY_SUCCESS {
+            return Ok(None);
+        }
+        Ok(Some((
+            ScreenPoint {
+                col: start_pt.x,
+                row: start_pt.y,
+            },
+            ScreenPoint {
+                col: end_pt.x,
+                row: end_pt.y,
+            },
+        )))
     }
 
     /// Returns all currently visible viewport search matches projected to `(col, row)` coordinates.

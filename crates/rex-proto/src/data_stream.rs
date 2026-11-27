@@ -865,6 +865,15 @@ impl BytesDataStream {
         }
     }
 
+    /// Wrap an already-handshaken WebSocket stream (used by tests).
+    pub fn from_raw_for_test(ws: RexWsStream, welcome: DataWelcome) -> Self {
+        Self {
+            ws,
+            welcome,
+            bytes_received: 0,
+        }
+    }
+
     /// Cleanly terminate the stream with WebSocket status `1000`.
     pub async fn close_clean(&mut self) -> Result<(), ProtoError> {
         self.ws
@@ -873,6 +882,130 @@ impl BytesDataStream {
                 reason: "".into(),
             }))
             .await
+    }
+
+    /// Relays full-duplex bytes between this `rex.data.bytes.v1` stream and an arbitrary
+    /// `AsyncRead + AsyncWrite` stream (such as a local `TcpStream` or `DuplexStream`),
+    /// propagating half-close EOFs in both directions and handling WebSocket pings.
+    pub async fn bridge_io<S>(
+        self,
+        io: S,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), ProtoError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut ws_sink, mut ws_stream) = self.ws.split();
+        let (mut io_read, mut io_write) = tokio::io::split(io);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(64);
+
+        let writer_task = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if ws_sink.send_message(msg).await.is_err() {
+                    break;
+                }
+            }
+            let _ = ws_sink.close().await;
+        });
+
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut local_eof = false;
+        let mut server_eof = false;
+        let mut outcome: Result<(), ProtoError> = Ok(());
+
+        loop {
+            if local_eof && server_eof {
+                let _ = tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: "".into(),
+                    })))
+                    .await;
+                break;
+            }
+
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        let _ = tx
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Normal,
+                                reason: "".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                }
+                read_res = io_read.read(&mut buf), if !local_eof => {
+                    match read_res {
+                        Ok(0) => {
+                            local_eof = true;
+                            if tx.send(Message::Binary(Bytes::new())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(n) => {
+                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            if tx.send(Message::Binary(chunk)).await.is_err() {
+                                outcome = Err(ProtoError::Closed("data writer closed".into()));
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            outcome = Err(ProtoError::Transport(err.to_string()));
+                            break;
+                        }
+                    }
+                }
+                ws_msg = ws_stream.next_message() => {
+                    match ws_msg {
+                        Some(Ok(Message::Binary(data))) => {
+                            if data.is_empty() {
+                                server_eof = true;
+                                let _ = io_write.shutdown().await;
+                            } else if let Err(err) = io_write.write_all(&data).await {
+                                outcome = Err(ProtoError::Transport(err.to_string()));
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = tx.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(cf))) => {
+                            let code = cf.as_ref().map(|c| u16::from(c.code)).unwrap_or(1000);
+                            let _ = io_write.shutdown().await;
+                            if code != 1000 {
+                                let reason = cf
+                                    .as_ref()
+                                    .map(|c| c.reason.to_string())
+                                    .unwrap_or_default();
+                                outcome = Err(ProtoError::Closed(format!(
+                                    "bytes stream closed abnormally ({code}): {reason}"
+                                )));
+                            }
+                            break;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => {
+                            let _ = io_write.shutdown().await;
+                            outcome = Err(ProtoError::Transport(err.to_string()));
+                            break;
+                        }
+                        None => {
+                            let _ = io_write.shutdown().await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(tx);
+        let _ = writer_task.await;
+        outcome
     }
 }
 
@@ -1161,5 +1294,72 @@ mod tests {
             );
             assert_eq!(framer.spoofed_apc_count(), 1, "chunk_size={chunk_size}");
         }
+    }
+
+    #[tokio::test]
+    async fn bytes_data_stream_bridge_io_full_duplex_and_half_close() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (ws_client_io, ws_server_io) = tokio::io::duplex(64 * 1024);
+        let ws_client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(ws_client_io, Role::Client, None)
+                .await;
+        let mut ws_server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(ws_server_io, Role::Server, None)
+                .await;
+
+        let welcome = DataWelcome {
+            reconnect_token: DataReconnectToken([7u8; 16]),
+            resume_ttl_ms: 60_000,
+            channel_nonce: 42,
+        };
+        let stream =
+            BytesDataStream::from_raw_for_test(RexWsStream::from_duplex(ws_client), welcome);
+
+        let (local_peer, mut test_peer) = tokio::io::duplex(64 * 1024);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_handle = tokio::spawn(stream.bridge_io(local_peer, cancel_rx));
+
+        // Send from local peer -> WS server, and concurrently from WS server -> local peer.
+        test_peer
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        test_peer.shutdown().await.unwrap();
+
+        let msg1 = ws_server.next().await.unwrap().unwrap();
+        assert_eq!(
+            msg1,
+            Message::Binary(Bytes::from_static(b"GET / HTTP/1.1\r\n\r\n"))
+        );
+
+        // Local shutdown should have sent zero-length binary half-close frame.
+        let msg2 = ws_server.next().await.unwrap().unwrap();
+        assert_eq!(msg2, Message::Binary(Bytes::new()));
+
+        // Server responds with payload + half-close + close 1000.
+        ws_server
+            .send(Message::Binary(Bytes::from_static(
+                b"HTTP/1.1 200 OK\r\n\r\nok",
+            )))
+            .await
+            .unwrap();
+        ws_server.send(Message::Binary(Bytes::new())).await.unwrap();
+        ws_server
+            .close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "".into(),
+            }))
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        test_peer.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\n\r\nok");
+
+        bridge_handle.await.unwrap().unwrap();
     }
 }

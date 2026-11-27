@@ -24,7 +24,7 @@ impl Rgb {
     /// Parses `#RRGGBB` or `RRGGBB` (case-insensitive, surrounding whitespace ignored).
     pub fn from_hex(input: &str) -> Result<Self, ThemeError> {
         let s = input.trim().strip_prefix('#').unwrap_or(input.trim());
-        if s.len() != 6 {
+        if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ThemeError::Parse(format!("invalid hex color `{input}`")));
         }
         let r = u8::from_str_radix(&s[0..2], 16)
@@ -505,6 +505,18 @@ impl ThemePalette {
         Self::load_from_path(&omarchy_current_dir.join("theme/colors.toml"))
     }
 
+    /// Returns the default user Omarchy themes directory (`~/.config/omarchy/themes`).
+    pub fn default_user_themes_dir() -> Option<std::path::PathBuf> {
+        dirs::config_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+            .map(|base| base.join("omarchy/themes"))
+    }
+
+    /// Returns the default system Omarchy themes directory (`/usr/share/omarchy/themes`).
+    pub fn default_system_themes_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/usr/share/omarchy/themes")
+    }
+
     /// Builds the typed arguments for Rex `com.superlogical.terminal.set_theme`.
     pub fn to_rex_set_theme_args(&self) -> RexSetThemeArgs {
         let palette = self
@@ -805,5 +817,53 @@ fn parse_opt(map: &HashMap<String, String>, key: &str) -> Result<Option<Rgb>, Th
     match map.get(key) {
         Some(raw) => Rgb::from_hex(raw).map(Some),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn from_hex_rejects_multibyte_utf8_without_panicking() {
+        for bad in [
+            "€€", "#€€", "#🦀ab", "🦀ab", "ééé", "#ééé", "12345", "#12345g",
+        ] {
+            assert!(
+                Rgb::from_hex(bad).is_err(),
+                "expected Err for invalid hex `{bad}`"
+            );
+        }
+        assert_eq!(
+            Rgb::from_hex("#e28203").unwrap(),
+            Rgb::new(0xe2, 0x82, 0x03)
+        );
+        assert_eq!(
+            Rgb::from_hex("  AABBCC ").unwrap(),
+            Rgb::new(0xaa, 0xbb, 0xcc)
+        );
+    }
+
+    #[test]
+    fn theme_palette_from_toml_and_omarchy_dir_rejects_multibyte_utf8_cleanly() {
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "omarchy-theme-utf8-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let theme_dir = dir.join("theme");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        let toml = "background = \"€€\"\n";
+        std::fs::write(theme_dir.join("colors.toml"), toml).unwrap();
+
+        assert!(ThemePalette::from_toml_str(toml).is_err());
+        assert!(ThemePalette::load_from_omarchy_dir(&dir).is_err());
+        // `load_omarchy_or_default` never panics even if user theme dir is missing/malformed.
+        let fallback = ThemePalette::load_omarchy_or_default();
+        assert!(!fallback.terminal.background.to_hex().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

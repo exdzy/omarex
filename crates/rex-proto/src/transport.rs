@@ -9,6 +9,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Once};
 use std::task::{Context, Poll};
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -148,6 +149,79 @@ impl RexWsStream {
             Self::Duplex(ws) => ws.close(frame).await,
         };
         res.map_err(|e| ProtoError::Transport(e.to_string()))
+    }
+
+    /// Splits this WebSocket stream into independent sink and stream halves for full-duplex I/O.
+    pub fn split(self) -> (RexWsSink, RexWsStreamHalf) {
+        match self {
+            Self::Unix(ws) => {
+                let (sink, stream) = (*ws).split();
+                (RexWsSink::Unix(sink), RexWsStreamHalf::Unix(stream))
+            }
+            Self::Tcp(ws) => {
+                let (sink, stream) = (*ws).split();
+                (RexWsSink::Tcp(sink), RexWsStreamHalf::Tcp(stream))
+            }
+            Self::Ssh(ws) => {
+                let (sink, stream) = (*ws).split();
+                (RexWsSink::Ssh(sink), RexWsStreamHalf::Ssh(stream))
+            }
+            Self::Duplex(ws) => {
+                let (sink, stream) = (*ws).split();
+                (RexWsSink::Duplex(sink), RexWsStreamHalf::Duplex(stream))
+            }
+        }
+    }
+}
+
+/// Write half of a split [`RexWsStream`].
+pub enum RexWsSink {
+    Unix(SplitSink<WebSocketStream<UnixStream>, Message>),
+    Tcp(SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>),
+    Ssh(SplitSink<WebSocketStream<SshStdioStream>, Message>),
+    Duplex(SplitSink<WebSocketStream<tokio::io::DuplexStream>, Message>),
+}
+
+impl RexWsSink {
+    pub async fn send_message(&mut self, msg: Message) -> Result<(), ProtoError> {
+        let res = match self {
+            Self::Unix(s) => s.send(msg).await,
+            Self::Tcp(s) => s.send(msg).await,
+            Self::Ssh(s) => s.send(msg).await,
+            Self::Duplex(s) => s.send(msg).await,
+        };
+        res.map_err(|e| ProtoError::Transport(e.to_string()))
+    }
+
+    pub async fn close(&mut self) -> Result<(), ProtoError> {
+        let res = match self {
+            Self::Unix(s) => s.close().await,
+            Self::Tcp(s) => s.close().await,
+            Self::Ssh(s) => s.close().await,
+            Self::Duplex(s) => s.close().await,
+        };
+        res.map_err(|e| ProtoError::Transport(e.to_string()))
+    }
+}
+
+/// Read half of a split [`RexWsStream`].
+pub enum RexWsStreamHalf {
+    Unix(SplitStream<WebSocketStream<UnixStream>>),
+    Tcp(SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    Ssh(SplitStream<WebSocketStream<SshStdioStream>>),
+    Duplex(SplitStream<WebSocketStream<tokio::io::DuplexStream>>),
+}
+
+impl RexWsStreamHalf {
+    pub async fn next_message(
+        &mut self,
+    ) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        match self {
+            Self::Unix(s) => s.next().await,
+            Self::Tcp(s) => s.next().await,
+            Self::Ssh(s) => s.next().await,
+            Self::Duplex(s) => s.next().await,
+        }
     }
 }
 

@@ -342,7 +342,7 @@ Instead of issuing an N+1 RPC storm on startup, `omarex` opens its entire worksp
 | --- | --- | --- |
 | `bell` | *(empty)* | Visual pane flash / optional system bell / urgent tab dot. |
 | `child_exited` | `exit_code` | Show exited badge/banner on pane (`[exited <code>]`). |
-| `clipboard_written` | `id`, `kind`, `size`, `truncated?` | OSC 52 write; read via `com.superlogical.terminal.clipboard_read` and set Wayland clipboard (when policy permits). |
+| `clipboard_written` | `text?`, `id?`, `bytes?` | OSC 52 write; apply inline `text` or read via `com.superlogical.terminal.clipboard_read` and set Wayland clipboard (when policy permits). |
 | `desktop_notification` | `title`, `body` | OSC 9 / 777; show desktop notification (`notify-send` / D-Bus) if unfocused. |
 | `ports_changed` | `ports`, `status` | Update listening-ports pill on pane/window. |
 | `process_changed` | `foreground`, `child`, `last_exit` | Update pane subtitle / running command indicator. |
@@ -383,7 +383,7 @@ Instead of issuing an N+1 RPC storm on startup, `omarex` opens its entire worksp
 | `session.own_block` | `session_id` | `block_ids` (empty = all), `mode` (`"take"`\|`"request"`) | `blocks` |
 | `session.disown_block` | `session_id` | `block_ids` | `blocks` |
 | `session.describe_block` | `session_id`, `block_id` | — | full block metadata (`label`, `owner`, `creator_name`, `flavor`, `host_id`, ...) |
-| `session.transfer_window` | `source_session_id`, `target_session_id`, `window_id` | `focus` | `revision` |
+| `session.transfer_window` | `session_id`, `window_id`, `to_session_id` | `before_window_id?`, `focus?` | `revision`, `to_revision` |
 | `block.close` | `session_id`, `block_id` | `undoable` | `{}` |
 | `block.event` | `session_id`, `block_id`, `event` (`{type, payload}`) | — | `{}` |
 | `data.connect` | `session_id`, `block_id`, `data_ref_id` | `subprotocol` | `ticket` (22-char base64url), `expires_in_ms` (`60000`) |

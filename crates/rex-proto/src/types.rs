@@ -2066,6 +2066,230 @@ pub struct TerminalClipboardReadResponse {
     pub eof: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListDirStatus {
+    Ok,
+    Missing,
+    NotDir,
+    Denied,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    #[serde(default)]
+    pub file: bool,
+    #[serde(default)]
+    pub symlink: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalListDirArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalListDirResponse {
+    pub status: ListDirStatus,
+    pub path: String,
+    pub home: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub entries: Vec<DirEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardWrittenEvent {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortScanStatus {
+    Ok,
+    Partial,
+    Unsupported,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortEntry {
+    pub port: u16,
+    pub address: String,
+    pub protocol: String,
+    pub first_seen_at: String,
+    #[serde(default)]
+    pub pid: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortProcessEntry {
+    pub pid: i64,
+    pub user_id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub invoked_path: Option<String>,
+    #[serde(default)]
+    pub argv0: Option<String>,
+    #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+impl PortProcessEntry {
+    pub fn display_label(&self) -> &str {
+        self.script
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.argv0.as_deref().filter(|s| !s.is_empty()))
+            .unwrap_or(self.name.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalPortsResponse {
+    pub status: PortScanStatus,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub ports: Vec<PortEntry>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub processes: Vec<PortProcessEntry>,
+    #[serde(default)]
+    pub truncated: Option<bool>,
+    #[serde(default)]
+    pub id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalBlobReadArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalBlobReadResponse {
+    pub id: u64,
+    pub data: String,
+    pub total: u64,
+    pub eof: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionNewBlockRequest {
+    pub session_id: String,
+    pub flavor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionNewBlockResponse {
+    #[serde(default)]
+    pub block_id: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelDialOptions {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelListenOptions {
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelInfoResponse {
+    pub flavor: String,
+    pub connections: u64,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub client_address: Option<String>,
+    #[serde(default)]
+    pub client_target: Option<String>,
+    #[serde(default)]
+    pub last_owner: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelConnectionRequestedEvent {
+    #[serde(rename = "ref")]
+    pub data_ref_id: String,
+    pub peer: String,
+    pub client: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSwapBlocksRequest {
+    pub session_id: String,
+    pub block_id: String,
+    pub other_block_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSwapBlocksResponse {
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTransferWindowRequest {
+    pub session_id: String,
+    pub window_id: String,
+    pub to_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTransferWindowResponse {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub to_revision: u64,
+}
+
 // ============================================================================
 // Data Ticket & Multi-Host Registry RPCs
 // ============================================================================
@@ -2259,5 +2483,97 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(mods.to_rex_string(), "shift+ctrl+super");
+    }
+
+    #[test]
+    fn rev24_m4_and_m5_schemas_deserialize_and_roundtrip() {
+        // list_dir with Go nil slice `entries: null` and `status: "denied"`
+        let denied: TerminalListDirResponse = serde_json::from_str(
+            r#"{"entries":null,"home":"/home/mike","path":"/root","status":"denied","truncated":false}"#,
+        )
+        .unwrap();
+        assert_eq!(denied.status, ListDirStatus::Denied);
+        assert!(denied.entries.is_empty());
+
+        let ok_dir: TerminalListDirResponse = serde_json::from_str(
+            r#"{"entries":[{"name":"src"},{"name":"Cargo.toml","file":true},{"name":"link","symlink":true}],"home":"/home/mike","path":"/work","status":"ok","truncated":true}"#,
+        )
+        .unwrap();
+        assert_eq!(ok_dir.status, ListDirStatus::Ok);
+        assert!(ok_dir.truncated);
+        assert_eq!(ok_dir.entries.len(), 3);
+        assert!(!ok_dir.entries[0].file);
+        assert!(ok_dir.entries[1].file);
+        assert!(ok_dir.entries[2].symlink);
+
+        // clipboard_written matching live Rev 24 schema
+        let cw_inline: ClipboardWrittenEvent = serde_json::from_str(r#"{"text":"hello"}"#).unwrap();
+        assert_eq!(cw_inline.text.as_deref(), Some("hello"));
+        let cw_chunked: ClipboardWrittenEvent =
+            serde_json::from_str(r#"{"id":12,"bytes":65536}"#).unwrap();
+        assert_eq!(cw_chunked.id, Some(12));
+        assert_eq!(cw_chunked.bytes, Some(65536));
+        assert!(cw_chunked.text.is_none());
+
+        // ports / ports_changed with truncated blob_read
+        let ports: TerminalPortsResponse = serde_json::from_str(
+            r#"{
+                "status": "partial",
+                "ports": [{"port":3000,"address":"0.0.0.0","protocol":"tcp","first_seen_at":"2026-11-26T20:00:00Z","pid":42}],
+                "processes": [{"pid":42,"user_id":1000,"name":"node","script":"vite","argv0":"node"}],
+                "truncated": true,
+                "id": 7
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ports.status, PortScanStatus::Partial);
+        assert_eq!(ports.truncated, Some(true));
+        assert_eq!(ports.id, Some(7));
+        assert_eq!(ports.processes[0].display_label(), "vite");
+
+        let blob: TerminalBlobReadResponse =
+            serde_json::from_str(r#"{"id":7,"data":"{}","total":2,"eof":true}"#).unwrap();
+        assert!(blob.eof);
+
+        // tunnel dial, info, connection_requested, and session new_block/swap_blocks/transfer_window
+        let dial_json = serde_json::to_value(TunnelDialOptions {
+            host: "127.0.0.1".into(),
+            port: 3000,
+            client_address: Some("127.0.0.1:3000".into()),
+        })
+        .unwrap();
+        assert_eq!(dial_json["port"], 3000);
+
+        let info: TunnelInfoResponse =
+            serde_json::from_str(r#"{"flavor":"dial","connections":2,"target":"127.0.0.1:3000"}"#)
+                .unwrap();
+        assert_eq!(info.connections, 2);
+
+        let conn_req: TunnelConnectionRequestedEvent =
+            serde_json::from_str(r#"{"ref":"conn:1","peer":"127.0.0.1:51234","client":"c1"}"#)
+                .unwrap();
+        assert_eq!(conn_req.data_ref_id, "conn:1");
+
+        let nb: SessionNewBlockResponse =
+            serde_json::from_str(r#"{"block_id":"blk-9","revision":15}"#).unwrap();
+        assert_eq!(nb.block_id.as_deref(), Some("blk-9"));
+
+        let swap = SessionSwapBlocksRequest {
+            session_id: "s1".into(),
+            block_id: "b1".into(),
+            other_block_id: "b2".into(),
+        };
+        assert_eq!(serde_json::to_value(&swap).unwrap()["other_block_id"], "b2");
+
+        let xfer = SessionTransferWindowRequest {
+            session_id: "s1".into(),
+            window_id: "w1".into(),
+            to_session_id: "s2".into(),
+            before_window_id: None,
+            focus: Some(true),
+        };
+        let xfer_val = serde_json::to_value(&xfer).unwrap();
+        assert_eq!(xfer_val["to_session_id"], "s2");
+        assert!(xfer_val.get("before_window_id").is_none());
     }
 }

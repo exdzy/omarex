@@ -36,11 +36,12 @@ pub use input::{
     should_bypass_mouse_reporting,
 };
 pub use selection::{
-    CharCellOrigin, RowCellSpan, SearchScroll, SearchStatus, SelectionAutoscroll,
-    SelectionBehavior, SelectionGeometry, SelectionGesture, TerminalSearch, UnwrappedLine,
-    ViewportMatch, clear_selection, hyperlink_at, kitty_placement_at, logical_line_at,
-    logical_line_with_tui_unwrap_at, select_all, select_line, select_word, selection_text,
-    viewport_row_span_is_blank, viewport_text_lines,
+    CharCellOrigin, RowCellSpan, ScreenPoint, SearchScroll, SearchStatus, SelectionAutoscroll,
+    SelectionBehavior, SelectionGeometry, SelectionGesture, SelectionMode, TerminalSearch,
+    UnwrappedLine, ViewportMatch, WordMotion, clear_selection, hyperlink_at, kitty_placement_at,
+    logical_line_at, logical_line_with_tui_unwrap_at, screen_first_non_blank_col,
+    screen_line_end_col, screen_row_bounds, screen_word_motion, select_all, select_line,
+    select_range, select_word, selection_text, viewport_row_span_is_blank, viewport_text_lines,
 };
 pub use snapshot::{BackgroundStep, SnapshotDecoder, SnapshotFeedStatus};
 
@@ -582,11 +583,6 @@ enum DecstbmParseState {
 }
 
 impl ScrollRegionTracker {
-    #[allow(dead_code)]
-    fn reset_region(&mut self) {
-        self.region = None;
-    }
-
     fn feed(&mut self, bytes: &[u8], term_rows: u16) {
         for &b in bytes {
             match self.state {
@@ -1596,6 +1592,22 @@ impl Terminal {
         Ok((width_px, height_px))
     }
 
+    /// Returns `true` when the terminal is currently displaying the alternate screen buffer
+    /// (e.g., `nvim`, `btop`, `lazygit`, `tr3x`).
+    pub fn is_alternate_screen(&self) -> bool {
+        let guard = self.inner.lock();
+        let mut screen: ffi::GhosttyTerminalScreen = ffi::GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+        // SAFETY: `guard.raw` is locked; `screen` matches `GhosttyTerminalScreen *`.
+        let rc = unsafe {
+            ffi::ghostty_terminal_get(
+                guard.raw,
+                ffi::GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                (&raw mut screen).cast(),
+            )
+        };
+        rc == ffi::GHOSTTY_SUCCESS && screen == ffi::GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+    }
+
     /// Returns the active DECSTBM vertical scrolling region `(top_row, bottom_row)` (0-based
     /// inclusive) when a proper sub-screen margin is active on the primary screen.
     pub fn scroll_region(&self) -> Option<(u16, u16)> {
@@ -2430,6 +2442,71 @@ impl RenderState {
         }
         self.dirty = DirtyState::Clean;
         Ok(())
+    }
+
+    /// Samples a fullscreen TUI program background color (`!= default_bg`) from viewport border
+    /// cells after `end_update()`.
+    ///
+    /// Returns `None` for normal shells (including prompts with isolated colored segments) or
+    /// transparent alt-screen apps so Omarchy desktop translucency is preserved.
+    pub fn sample_program_bg(&mut self, is_alt_screen: bool) -> Result<Option<Rgb>, VtError> {
+        let default_bg = self.colors.background;
+        let rows = i32::from(self.rows);
+        let cols = usize::from(self.cols);
+        if rows <= 0 || cols == 0 {
+            return Ok(None);
+        }
+
+        let mut total_cells = 0usize;
+        let mut explicit_bg_cells = 0usize;
+        let mut edge_cells = 0usize;
+        let mut edge_counts: Vec<(Rgb, usize)> = Vec::new();
+
+        self.for_each_row(|dirty_row| {
+            if dirty_row.viewport_y < 0 || dirty_row.viewport_y >= rows {
+                return;
+            }
+            let is_top_or_bot = dirty_row.viewport_y == 0 || dirty_row.viewport_y == rows - 1;
+            for (col_idx, cell) in dirty_row.cells.iter().enumerate() {
+                total_cells += 1;
+                let is_edge = is_top_or_bot || col_idx == 0 || col_idx + 1 == cols;
+                if is_edge {
+                    edge_cells += 1;
+                }
+                if cell.flags.contains(CellFlags::SELECTED)
+                    || cell.flags.contains(CellFlags::INVERSE)
+                {
+                    continue;
+                }
+                if let Some(bg) = cell.bg
+                    && bg != default_bg
+                {
+                    explicit_bg_cells += 1;
+                    if is_edge {
+                        if let Some((_, count)) = edge_counts.iter_mut().find(|(c, _)| *c == bg) {
+                            *count += 1;
+                        } else if edge_counts.len() < 32 {
+                            edge_counts.push((bg, 1));
+                        }
+                    }
+                }
+            }
+        })?;
+
+        let mostly_explicit = total_cells > 0 && (explicit_bg_cells * 100) >= (total_cells * 85);
+        if !is_alt_screen && !mostly_explicit {
+            return Ok(None);
+        }
+
+        let best = edge_counts.into_iter().max_by_key(|&(_, count)| count);
+        if let Some((rgb, count)) = best
+            && edge_cells > 0
+            && (count * 100) >= (edge_cells * 35)
+        {
+            return Ok(Some(rgb));
+        }
+
+        Ok(None)
     }
 
     fn populate_row_iterator(&mut self) -> Result<(), VtError> {
@@ -3709,5 +3786,218 @@ mod tests {
             });
         }
         out
+    }
+
+    #[test]
+    fn sample_program_bg_gates_on_alt_screen_and_ignores_normal_prompts() {
+        let term = Terminal::new(40, 10, TerminalConfig::default()).unwrap();
+
+        // 1. Normal shell with a colored prompt on row 0 must NOT trigger program_bg.
+        term.write(b"\x1b[48;2;30;120;200m prompt > \x1b[0mls -la\r\n");
+        let mut rs = RenderState::new().unwrap();
+        let _ = rs.begin_update(&term, Overscan::default()).unwrap();
+        rs.end_update().unwrap();
+        assert!(!term.is_alternate_screen());
+        assert_eq!(
+            rs.sample_program_bg(term.is_alternate_screen()).unwrap(),
+            None
+        );
+
+        // 2. Alternate screen with explicit background (#282828) MUST return Some((40,40,40)).
+        term.write(b"\x1b[?1049h\x1b[48;2;40;40;40m\x1b[2J\x1b[Hnvim");
+        let _ = rs.begin_update(&term, Overscan::default()).unwrap();
+        rs.end_update().unwrap();
+        assert!(term.is_alternate_screen());
+        assert_eq!(
+            rs.sample_program_bg(term.is_alternate_screen()).unwrap(),
+            Some(Rgb {
+                r: 40,
+                g: 40,
+                b: 40
+            })
+        );
+
+        // 3. Leaving alternate screen clears program_bg back to None.
+        term.write(b"\x1b[?1049l");
+        let _ = rs.begin_update(&term, Overscan::default()).unwrap();
+        rs.end_update().unwrap();
+        assert!(!term.is_alternate_screen());
+        assert_eq!(
+            rs.sample_program_bg(term.is_alternate_screen()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_viewport_spans_reports_normal_and_rectangular_bounds() {
+        let term = Terminal::new(20, 5, TerminalConfig::default()).unwrap();
+        term.write(b"alpha beta gamma\r\nsecond line here\r\nthird line");
+
+        let geom = selection::SelectionGeometry {
+            columns: 20,
+            cell_width: 10,
+            padding_left: 0,
+            screen_height: 100,
+        };
+        let mut g = selection::SelectionGesture::new(&term).unwrap();
+        g.press(2, 0, 22.0, 10.0, 1_000_000).unwrap();
+        g.drag(7, 1, 79.0, 30.0, geom, false).unwrap();
+        g.release(Some((7, 1))).unwrap();
+
+        let spans = selection::selection_viewport_spans(&term).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].row, 0);
+        assert_eq!(spans[0].start_col, 2);
+        assert_eq!(spans[1].row, 1);
+        assert_eq!(spans[1].end_col, 8);
+
+        // Rectangular selection across rows 0..=1, cols 3..=6
+        let mut rect_g = selection::SelectionGesture::new(&term).unwrap();
+        rect_g.press(3, 0, 32.0, 10.0, 2_000_000_000).unwrap();
+        rect_g.drag(6, 1, 69.0, 30.0, geom, true).unwrap();
+        rect_g.release(Some((6, 1))).unwrap();
+
+        let rect_spans = selection::selection_viewport_spans(&term).unwrap();
+        assert_eq!(
+            rect_spans,
+            vec![
+                selection::RowCellSpan {
+                    row: 0,
+                    start_col: 3,
+                    end_col: 7,
+                },
+                selection::RowCellSpan {
+                    row: 1,
+                    start_col: 3,
+                    end_col: 7,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn select_range_char_line_block_and_backward_order() {
+        let term = Terminal::new(24, 4, TerminalConfig::default()).unwrap();
+        for i in 0..8 {
+            term.write(format!("line{i} alpha beta\r\n").as_bytes());
+        }
+        let (cols, total) = selection::screen_row_bounds(&term).unwrap();
+        assert_eq!(cols, 24);
+        assert!(total >= 8);
+
+        // Forward char selection in scrollback row 1.
+        selection::select_range(
+            &term,
+            selection::ScreenPoint { col: 6, row: 1 },
+            selection::ScreenPoint { col: 10, row: 1 },
+            selection::SelectionMode::Char,
+        )
+        .unwrap();
+        assert_eq!(
+            selection::selection_text(&term, true, true)
+                .unwrap()
+                .as_deref(),
+            Some("alpha")
+        );
+
+        // Backward char selection across rows 2 -> 1.
+        selection::select_range(
+            &term,
+            selection::ScreenPoint { col: 4, row: 2 },
+            selection::ScreenPoint { col: 6, row: 1 },
+            selection::SelectionMode::Char,
+        )
+        .unwrap();
+        let backward = selection::selection_text(&term, true, true)
+            .unwrap()
+            .unwrap();
+        assert!(backward.contains("alpha beta"));
+        assert!(backward.contains("line2"));
+
+        // Line selection across rows 0..=1.
+        selection::select_range(
+            &term,
+            selection::ScreenPoint { col: 12, row: 1 },
+            selection::ScreenPoint { col: 2, row: 0 },
+            selection::SelectionMode::Line,
+        )
+        .unwrap();
+        let line_sel = selection::selection_text(&term, true, true)
+            .unwrap()
+            .unwrap();
+        assert!(line_sel.contains("line0 alpha beta"));
+        assert!(line_sel.contains("line1 alpha beta"));
+
+        // Block (rectangular) selection across rows 0..=1, cols 6..=10.
+        selection::select_range(
+            &term,
+            selection::ScreenPoint { col: 6, row: 0 },
+            selection::ScreenPoint { col: 10, row: 1 },
+            selection::SelectionMode::Block,
+        )
+        .unwrap();
+        let block_sel = selection::selection_text(&term, true, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block_sel, "alpha\nalpha");
+    }
+
+    #[test]
+    fn word_and_line_motions_and_search_selected_match_screen_range() {
+        let term = Terminal::new(32, 4, TerminalConfig::default()).unwrap();
+        term.write(b"   foo.bar baz\r\n");
+        term.write(b"second_word\r\n");
+        term.write(b"needle one\r\n");
+        term.write(b"fourth\r\n");
+        term.write(b"needle two\r\n");
+
+        assert_eq!(selection::screen_first_non_blank_col(&term, 0).unwrap(), 3);
+        assert_eq!(selection::screen_line_end_col(&term, 0).unwrap(), 13);
+
+        // `w` from col 3 ("foo") -> "." (col 6) -> "bar" (col 7) -> "baz" (col 11) -> "second_word" (row 1, col 0)
+        let p0 = selection::ScreenPoint { col: 3, row: 0 };
+        let p1 =
+            selection::screen_word_motion(&term, p0, selection::WordMotion::NextStart).unwrap();
+        assert_eq!(p1, selection::ScreenPoint { col: 6, row: 0 });
+        let p2 =
+            selection::screen_word_motion(&term, p1, selection::WordMotion::NextStart).unwrap();
+        assert_eq!(p2, selection::ScreenPoint { col: 7, row: 0 });
+        let p3 =
+            selection::screen_word_motion(&term, p2, selection::WordMotion::NextStart).unwrap();
+        assert_eq!(p3, selection::ScreenPoint { col: 11, row: 0 });
+        let p4 =
+            selection::screen_word_motion(&term, p3, selection::WordMotion::NextStart).unwrap();
+        assert_eq!(p4, selection::ScreenPoint { col: 0, row: 1 });
+
+        // `b` back from row 1 col 0 -> "baz" (col 11, row 0)
+        let pb =
+            selection::screen_word_motion(&term, p4, selection::WordMotion::PrevStart).unwrap();
+        assert_eq!(pb, selection::ScreenPoint { col: 11, row: 0 });
+
+        // `e` from col 3 -> end of "foo" (col 5, row 0)
+        let pe = selection::screen_word_motion(&term, p0, selection::WordMotion::NextEnd).unwrap();
+        assert_eq!(pe, selection::ScreenPoint { col: 5, row: 0 });
+
+        // TerminalSearch::selected_match_screen_range
+        let mut search = selection::TerminalSearch::new(&term).unwrap();
+        search
+            .set_scroll_policy(selection::SearchScroll::None)
+            .unwrap();
+        search.set_needle("needle").unwrap();
+        search.run().unwrap();
+        assert_eq!(search.total_matches().unwrap(), 2);
+        assert!(search.select_next().unwrap());
+        let (m1_start, m1_end) = search
+            .selected_match_screen_range(&term)
+            .unwrap()
+            .expect("first match");
+        assert_eq!(m1_start.col, 0);
+        assert_eq!(m1_end.col, 5);
+        assert!(search.select_next().unwrap());
+        let (m2_start, _) = search
+            .selected_match_screen_range(&term)
+            .unwrap()
+            .expect("second match");
+        assert!(m2_start.row < m1_start.row);
     }
 }

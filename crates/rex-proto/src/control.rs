@@ -27,15 +27,19 @@ use crate::types::{
     ServerStatus, SessionAttachResponse, SessionBootstrapRequest, SessionBootstrapResponse,
     SessionCreateRequest, SessionCreateResponse, SessionDisownBlockRequest,
     SessionFloatBlockRequest, SessionFloatBlockResponse, SessionListResponse,
-    SessionNewLayerRequest, SessionNewLayerResponse, SessionNewSplitRequest,
-    SessionNewSplitResponse, SessionNewWindowRequest, SessionOwnBlockRequest,
-    SessionResizeLayerRequest, SessionResizePaneRequest, SessionSetLayerStateRequest, SessionView,
-    SessionZoomBlockRequest, SessionZoomBlockResponse, TerminalClipboardReadArgs,
-    TerminalClipboardReadResponse, TerminalDownloadBeginArgs, TerminalDownloadBeginResponse,
-    TerminalModesResponse, TerminalProcessResponse, TerminalProgramStatusResponse,
-    TerminalPwdResponse, TerminalResizeArgs, TerminalSetThemeArgs, TerminalSizeResponse,
-    TerminalTitleResponse, TerminalUploadBeginArgs, TerminalUploadBeginResponse, TerminalWriteArgs,
-    TerminalWriteResponse, WelcomeMessage,
+    SessionNewBlockRequest, SessionNewBlockResponse, SessionNewLayerRequest,
+    SessionNewLayerResponse, SessionNewSplitRequest, SessionNewSplitResponse,
+    SessionNewWindowRequest, SessionOwnBlockRequest, SessionResizeLayerRequest,
+    SessionResizePaneRequest, SessionSetLayerStateRequest, SessionSwapBlocksRequest,
+    SessionSwapBlocksResponse, SessionTransferWindowRequest, SessionTransferWindowResponse,
+    SessionView, SessionZoomBlockRequest, SessionZoomBlockResponse, TerminalBlobReadArgs,
+    TerminalBlobReadResponse, TerminalClipboardReadArgs, TerminalClipboardReadResponse,
+    TerminalDownloadBeginArgs, TerminalDownloadBeginResponse, TerminalListDirArgs,
+    TerminalListDirResponse, TerminalModesResponse, TerminalPortsResponse, TerminalProcessResponse,
+    TerminalProgramStatusResponse, TerminalPwdResponse, TerminalResizeArgs, TerminalSetThemeArgs,
+    TerminalSizeResponse, TerminalTitleResponse, TerminalUploadBeginArgs,
+    TerminalUploadBeginResponse, TerminalWriteArgs, TerminalWriteResponse, TunnelInfoResponse,
+    WelcomeMessage,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -856,6 +860,85 @@ impl ControlClient {
             Some(args),
         )
         .await
+    }
+
+    pub async fn terminal_list_dir(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        args: TerminalListDirArgs,
+    ) -> Result<(TerminalListDirResponse, u64), ProtoError> {
+        self.call_block(
+            session_id,
+            block_id,
+            "com.superlogical.terminal.list_dir",
+            Some(args),
+        )
+        .await
+    }
+
+    pub async fn terminal_ports(
+        &self,
+        session_id: &str,
+        block_id: &str,
+    ) -> Result<(TerminalPortsResponse, u64), ProtoError> {
+        self.call_block::<serde_json::Value, _>(
+            session_id,
+            block_id,
+            "com.superlogical.terminal.ports",
+            Some(serde_json::json!({})),
+        )
+        .await
+    }
+
+    pub async fn terminal_blob_read(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        args: TerminalBlobReadArgs,
+    ) -> Result<(TerminalBlobReadResponse, u64), ProtoError> {
+        self.call_block(
+            session_id,
+            block_id,
+            "com.superlogical.terminal.blob_read",
+            Some(args),
+        )
+        .await
+    }
+
+    pub async fn tunnel_info(
+        &self,
+        session_id: &str,
+        block_id: &str,
+    ) -> Result<(TunnelInfoResponse, u64), ProtoError> {
+        self.call_block::<serde_json::Value, _>(
+            session_id,
+            block_id,
+            "com.superlogical.tunnel.info",
+            Some(serde_json::json!({})),
+        )
+        .await
+    }
+
+    pub async fn session_new_block(
+        &self,
+        req: &SessionNewBlockRequest,
+    ) -> Result<(SessionNewBlockResponse, u64), ProtoError> {
+        self.call("session.new_block", req).await
+    }
+
+    pub async fn session_swap_blocks(
+        &self,
+        req: &SessionSwapBlocksRequest,
+    ) -> Result<(SessionSwapBlocksResponse, u64), ProtoError> {
+        self.call("session.swap_blocks", req).await
+    }
+
+    pub async fn session_transfer_window(
+        &self,
+        req: &SessionTransferWindowRequest,
+    ) -> Result<(SessionTransferWindowResponse, u64), ProtoError> {
+        self.call("session.transfer_window", req).await
     }
 
     pub async fn terminal_upload_begin(
