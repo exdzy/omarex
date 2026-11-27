@@ -10,7 +10,8 @@ use std::ops::Range;
 
 use crate::atlas::{CellMetrics, GlyphAtlas, ShapedRunCell};
 use crate::draw_list::{
-    ClipRect, Color, CornerRadii, DrawList, GlyphInstance, QuadInstance, Rect, layers,
+    ClipRect, Color, CornerRadii, DrawList, GLYPH_MODE_MONO, GlyphInstance, QuadInstance, Rect,
+    layers,
 };
 
 /// Stable row identity matching `GHOSTTY_RENDER_STATE_ROW_DATA_ID`.
@@ -301,6 +302,18 @@ impl TerminalPaneCache {
             .to_array();
         let dim = viewport.dim_alpha.clamp(0.0, 1.0);
 
+        let resolved_cursor = source.cursor().filter(|c| c.visible);
+        let block_cursor_cell = resolved_cursor
+            .filter(|c| c.shape == CursorShape::Block)
+            .map(|c| {
+                (
+                    c.row,
+                    origin_x_px + f32::from(c.col) * cell_w_px,
+                    cell_w_px,
+                    c.text_color,
+                )
+            });
+
         let row_count = source.row_count();
         let mut stats = TerminalBuildStats {
             total_rows: row_count,
@@ -351,12 +364,16 @@ impl TerminalPaneCache {
             if let Some(row_cache) = self.rows.get_mut(&row_key) {
                 row_cache.last_used_frame = self.frame_counter;
                 let row_y_px = origin_y_px + (visual_row as f32) * cell_h_px + scroll_px;
+                let row_cursor_cell = block_cursor_cell
+                    .filter(|&(cur_row, _, _, _)| cur_row == visual_row)
+                    .map(|(_, x, w, col)| (x, w, col));
                 emit_cached_row(
                     row_cache,
                     origin_x_px,
                     row_y_px,
                     clip_px,
                     dim,
+                    row_cursor_cell,
                     draw_list,
                     &mut stats,
                 );
@@ -364,9 +381,7 @@ impl TerminalPaneCache {
         }
 
         // Emit cursor quad cleanly on top (mutating cursor blink costs 1 quad, zero row rebuilds!).
-        if let Some(cursor) = source.cursor()
-            && cursor.visible
-        {
+        if let Some(cursor) = resolved_cursor {
             emit_cursor(
                 cursor,
                 origin_x_px,
@@ -441,6 +456,40 @@ impl TerminalPaneCache {
             .cursor
             .map(Color::from)
             .unwrap_or(viewport.default_fg);
+
+        let resolved_cursor: Option<TerminalCursor> = if let Some(override_cursor) = cursor_override
+        {
+            override_cursor.visible.then_some(override_cursor)
+        } else if vt_cursor.visible
+            && let Some((col, row)) = vt_cursor.viewport_pos
+        {
+            let shape = match vt_cursor.style {
+                vt_engine::CursorStyle::Bar => CursorShape::Bar,
+                vt_engine::CursorStyle::Block => CursorShape::Block,
+                vt_engine::CursorStyle::Underline => CursorShape::Underline,
+                vt_engine::CursorStyle::BlockHollow => CursorShape::Hollow,
+            };
+            Some(TerminalCursor {
+                col,
+                row: i32::from(row),
+                shape,
+                color: cursor_color,
+                text_color: viewport.default_bg,
+                visible: true,
+            })
+        } else {
+            None
+        };
+        let block_cursor_cell = resolved_cursor
+            .filter(|c| c.shape == CursorShape::Block)
+            .map(|c| {
+                (
+                    c.row,
+                    origin_x_px + f32::from(c.col) * cell_w_px,
+                    cell_w_px,
+                    c.text_color,
+                )
+            });
 
         let mut stats = TerminalBuildStats::default();
         let frame_counter = self.frame_counter;
@@ -528,52 +577,25 @@ impl TerminalPaneCache {
             if let Some(row_cache) = rows_cache.get_mut(&row_key) {
                 row_cache.last_used_frame = frame_counter;
                 let row_y_px = origin_y_px + (dirty_row.viewport_y as f32) * cell_h_px + scroll_px;
+                let row_cursor_cell = block_cursor_cell
+                    .filter(|&(cur_row, _, _, _)| cur_row == dirty_row.viewport_y)
+                    .map(|(_, x, w, col)| (x, w, col));
                 emit_cached_row(
                     row_cache,
                     origin_x_px,
                     row_y_px,
                     clip_px,
                     dim,
+                    row_cursor_cell,
                     draw_list,
                     &mut stats,
                 );
             }
         })?;
 
-        if let Some(override_cursor) = cursor_override {
-            if override_cursor.visible {
-                emit_cursor(
-                    override_cursor,
-                    origin_x_px,
-                    origin_y_px,
-                    scroll_px,
-                    cell_w_px,
-                    cell_h_px,
-                    scale,
-                    clip_px,
-                    dim,
-                    draw_list,
-                    &mut stats,
-                );
-            }
-        } else if vt_cursor.visible
-            && let Some((col, row)) = vt_cursor.viewport_pos
-        {
-            let shape = match vt_cursor.style {
-                vt_engine::CursorStyle::Bar => CursorShape::Bar,
-                vt_engine::CursorStyle::Block => CursorShape::Block,
-                vt_engine::CursorStyle::Underline => CursorShape::Underline,
-                vt_engine::CursorStyle::BlockHollow => CursorShape::Hollow,
-            };
+        if let Some(cursor) = resolved_cursor {
             emit_cursor(
-                TerminalCursor {
-                    col,
-                    row: i32::from(row),
-                    shape,
-                    color: cursor_color,
-                    text_color: viewport.default_bg,
-                    visible: true,
-                },
+                cursor,
                 origin_x_px,
                 origin_y_px,
                 scroll_px,
@@ -1120,12 +1142,14 @@ impl<'v> RowSpanBuilder<'v> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_cached_row(
     row_cache: &CachedRow,
     origin_x_px: f32,
     row_y_px: f32,
     clip_px: [f32; 4],
     dim: f32,
+    block_cursor_cell: Option<(f32, f32, Color)>,
     draw_list: &mut DrawList,
     stats: &mut TerminalBuildStats,
 ) {
@@ -1153,6 +1177,16 @@ fn emit_cached_row(
         translated.bounds[0] += origin_x_px;
         translated.bounds[1] += row_y_px;
         translated.clip_rect = clip_px;
+        if let Some((cur_x, cur_w, text_color)) = block_cursor_cell
+            && translated.mode == GLYPH_MODE_MONO
+        {
+            let glyph_cx = translated.bounds[0] + translated.bounds[2] * 0.5;
+            if glyph_cx >= cur_x && glyph_cx < cur_x + cur_w {
+                translated.color[0] = text_color.r;
+                translated.color[1] = text_color.g;
+                translated.color[2] = text_color.b;
+            }
+        }
         translated.color[3] *= dim;
         draw_list.push_raw_glyph(layers::TERMINAL_FG, translated);
     }
@@ -1180,7 +1214,7 @@ fn emit_cursor(
         CursorShape::Block => QuadInstance::rounded_rect(
             [cx, cy, cell_w_px, cell_h_px],
             clip_px,
-            color.mul_alpha(0.88),
+            color,
             Color::TRANSPARENT,
             CornerRadii::uniform((1.5 * scale).round()).to_array(),
             0.0,
@@ -1585,5 +1619,56 @@ mod tests {
         let stats_fg = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
         assert_eq!(stats_fg.rebuilt_rows, 1);
         assert_eq!(stats_fg.cached_rows, 0);
+    }
+
+    #[test]
+    fn block_cursor_recolors_underlying_glyph_to_text_color() {
+        let shared =
+            crate::GpuShared::new_headless(&crate::GpuConfig::default()).expect("headless GPU");
+        let mut cache = TerminalPaneCache::new();
+        let mut snap = TerminalGridSnapshot::new();
+        snap.push_styled_row(1, 0, true, [("abc", Color::WHITE, None, CellFlags::NONE)]);
+        let cursor_text = Color::from_hex(0x121212);
+        snap.set_cursor(Some(TerminalCursor {
+            col: 1,
+            row: 0,
+            shape: CursorShape::Block,
+            color: Color::WHITE,
+            text_color: cursor_text,
+            visible: true,
+        }));
+
+        let mut atlas = shared.atlas();
+        let metrics = atlas.measure_monospace_cell(14.0, 1.0);
+        let vp = TerminalViewport {
+            rect: Rect::new(0.0, 0.0, 200.0, 60.0),
+            clip_rect: ClipRect::UNBOUNDED,
+            cols: 20,
+            rows: 3,
+            metrics,
+            scroll_offset_y: 0.0,
+            default_bg: cursor_text,
+            default_fg: Color::WHITE,
+            selection_bg: Color::from_hex(0x2a2a2a),
+            selection_fg: Some(Color::WHITE),
+            hyperlink_color: Color::from_hex(0x4ea1ff),
+            dim_alpha: 1.0,
+        };
+
+        let mut dl = DrawList::new(200, 60, 1.0);
+        let _ = cache.build_pane(&snap, &vp, &mut atlas, shared.queue(), &mut dl);
+        let frame = dl.finish();
+        let fg_glyphs = &frame.layers[&layers::TERMINAL_FG].raw_glyphs;
+        assert_eq!(fg_glyphs.len(), 3, "expected 3 glyphs for 'abc'");
+        // Glyph 0 ('a') and Glyph 2 ('c') stay white; Glyph 1 ('b') under Block cursor uses text_color.
+        assert!((fg_glyphs[0].color[0] - 1.0).abs() < 0.01);
+        assert!((fg_glyphs[2].color[0] - 1.0).abs() < 0.01);
+        assert!(
+            (fg_glyphs[1].color[0] - cursor_text.r).abs() < 0.01
+                && (fg_glyphs[1].color[1] - cursor_text.g).abs() < 0.01
+                && (fg_glyphs[1].color[2] - cursor_text.b).abs() < 0.01,
+            "glyph under solid Block cursor should use cursor.text_color, got {:?}",
+            fg_glyphs[1].color
+        );
     }
 }

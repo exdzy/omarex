@@ -120,6 +120,65 @@ impl Rgb {
         }
     }
 
+    /// Ensures `self` has at least `min_contrast` WCAG 2.1 contrast against `bg` whenever its
+    /// initial contrast falls below `trigger_contrast`.
+    ///
+    /// Preserves hue and saturation on dark backgrounds by scaling channels up proportionally
+    /// before blending toward white; on light backgrounds, blends smoothly toward black.
+    pub fn ensure_readable_on(self, bg: Self, trigger_contrast: f64, min_contrast: f64) -> Self {
+        if self.wcag_contrast(bg) >= trigger_contrast {
+            return self;
+        }
+        let target = bg.readable_foreground();
+        if target.wcag_contrast(bg) < min_contrast {
+            return target;
+        }
+
+        // On dark surfaces (`target == white`), scale channels proportionally first so deep
+        // saturated hues (e.g. `#0d003d` indigo-blue) become vibrant legible hues instead of gray.
+        let mut base = self;
+        if target == Self::new(255, 255, 255) {
+            let max_c = self.r.max(self.g).max(self.b);
+            if max_c > 0 && max_c < 255 {
+                let max_scale = 255.0 / f32::from(max_c);
+                let scaled_at = |s: f32| -> Self {
+                    Self {
+                        r: (f32::from(self.r) * s).round().clamp(0.0, 255.0) as u8,
+                        g: (f32::from(self.g) * s).round().clamp(0.0, 255.0) as u8,
+                        b: (f32::from(self.b) * s).round().clamp(0.0, 255.0) as u8,
+                    }
+                };
+                let maxed = scaled_at(max_scale);
+                if maxed.wcag_contrast(bg) >= min_contrast {
+                    let mut lo = 1.0f32;
+                    let mut hi = max_scale;
+                    for _ in 0..16 {
+                        let mid = (lo + hi) * 0.5;
+                        if scaled_at(mid).wcag_contrast(bg) >= min_contrast {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    }
+                    return scaled_at(hi);
+                }
+                base = maxed;
+            }
+        }
+
+        let mut lo = 0.0f32;
+        let mut hi = 1.0f32;
+        for _ in 0..16 {
+            let mid = (lo + hi) * 0.5;
+            if base.blend(target, mid).wcag_contrast(bg) >= min_contrast {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        base.blend(target, hi)
+    }
+
     /// Formats an OSC 11 background color reply (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB ESC \`).
     pub fn to_osc11_reply(self) -> String {
         format!(
@@ -590,6 +649,16 @@ impl ThemePalette {
             }
         }
 
+        // Guard chromatic ANSI slots (`1..=6` normal, `9..=14` bright) against near-invisible
+        // theme colors (e.g. Aether-generated `#0d003d` blue on `#121212`, contrast ~1.03:1)
+        // while leaving already-readable theme colors untouched.
+        for slot in &mut ansi[1..=6] {
+            *slot = slot.ensure_readable_on(raw.background, 2.2, 3.8);
+        }
+        for slot in &mut ansi[9..=14] {
+            *slot = slot.ensure_readable_on(raw.background, 2.2, 4.5);
+        }
+
         // Ensure readable selection colors (WCAG contrast >= 3.0 between selection_bg and selection_fg).
         let selection_bg = raw.selection;
         let selection_fg = match raw.selection_foreground {
@@ -665,10 +734,15 @@ impl ThemePalette {
             )
         };
 
-        let status_blocked = raw.orange.unwrap_or(raw.yellow).opaque();
-        let status_working = raw.bright_blue.opaque();
-        let status_error = raw.red.opaque();
-        let status_done = raw.green.opaque();
+        let sidebar_bg = surface_sidebar.rgb();
+        let status_blocked = raw
+            .orange
+            .unwrap_or(raw.yellow)
+            .ensure_readable_on(sidebar_bg, 2.2, 3.5)
+            .opaque();
+        let status_working = ansi[12].ensure_readable_on(sidebar_bg, 2.2, 3.8).opaque();
+        let status_error = ansi[1].ensure_readable_on(sidebar_bg, 2.2, 3.5).opaque();
+        let status_done = ansi[2].ensure_readable_on(sidebar_bg, 2.2, 3.5).opaque();
         let status_idle = raw.muted.opaque();
 
         let ui = UiTokens {

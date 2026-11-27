@@ -479,6 +479,65 @@ green = "#40a02b"
     }
 
     #[test]
+    fn unreadable_low_contrast_ansi_blue_and_status_working_are_lifted() {
+        let toml = r##"
+mode = "dark"
+accent = "#7675d2"
+selection = "#2a2a2a"
+selection_foreground = "#121212"
+muted = "#9e9e9e"
+background = "#121212"
+dark_background = "#0e0e0e"
+darker_background = "#090909"
+lighter_background = "#2a2a2a"
+foreground = "#ffffff"
+red = "#d2594b"
+yellow = "#efcf76"
+orange = "#d97266"
+green = "#f5d970"
+cyan = "#e4c06b"
+blue = "#0d003d"
+magenta = "#b963be"
+bright_red = "#ff7966"
+bright_yellow = "#f7d988"
+bright_green = "#fce283"
+bright_cyan = "#f0d188"
+bright_blue = "#120046"
+bright_magenta = "#e680f3"
+"##;
+        let pal = ThemePalette::from_toml_str(toml).expect("parse theme");
+        let bg = pal.terminal.background;
+        // Near-invisible #0d003d / #120046 on #121212 must be lifted to readable indigo-blue.
+        assert!(
+            pal.terminal.ansi[4].wcag_contrast(bg) >= 3.8,
+            "ansi[4] blue should be readable on #121212, got {:?} (contrast {:.2})",
+            pal.terminal.ansi[4],
+            pal.terminal.ansi[4].wcag_contrast(bg)
+        );
+        assert!(
+            pal.terminal.ansi[12].wcag_contrast(bg) >= 4.5,
+            "ansi[12] bright_blue should be readable on #121212, got {:?} (contrast {:.2})",
+            pal.terminal.ansi[12],
+            pal.terminal.ansi[12].wcag_contrast(bg)
+        );
+        // Preserve dominant blue hue.
+        assert!(pal.terminal.ansi[4].b > pal.terminal.ansi[4].r);
+        assert!(pal.terminal.ansi[4].b > pal.terminal.ansi[4].g);
+        // Sidebar working dot must also remain legible on dark_background (#0e0e0e).
+        assert!(
+            pal.ui
+                .status_working
+                .rgb()
+                .wcag_contrast(pal.ui.surface_sidebar.rgb())
+                >= 3.8
+        );
+        // Already-readable colors must not be altered.
+        assert_eq!(pal.terminal.ansi[1], Rgb::new(0xd2, 0x59, 0x4b));
+        assert_eq!(pal.terminal.ansi[2], Rgb::new(0xf5, 0xd9, 0x70));
+        assert_eq!(pal.terminal.ansi[0], Rgb::new(0x12, 0x12, 0x12));
+    }
+
+    #[test]
     fn wcag_contrast_and_osc11_formatting() {
         let black = Rgb::new(0, 0, 0);
         let white = Rgb::new(255, 255, 255);

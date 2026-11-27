@@ -1160,28 +1160,140 @@ fn format_explicit_selection(
 
 /// Returns viewport-relative `(row, start_col..end_col)` spans for the active terminal selection.
 ///
-/// Uses a scratch `RenderState` so the pane's incremental dirty-row cache is not disturbed.
+/// Queries the terminal selection and screen coordinates directly without allocating or updating a
+/// `RenderState`, so `GhosttyTerminal`'s incremental dirty-row flags are never consumed or cleared.
 pub fn selection_viewport_spans(terminal: &Terminal) -> Result<Vec<RowCellSpan>, VtError> {
-    let mut rs = crate::RenderState::new()?;
-    let _ = rs.begin_update(terminal, crate::Overscan::default())?;
-    rs.end_update()?;
+    let guard = terminal.inner.lock();
 
+    let mut sel = ffi::GhosttySelection::default();
+    // SAFETY: `guard.raw` is locked; `sel.size` is initialized by `Default`.
+    let rc_sel = unsafe {
+        ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_SELECTION,
+            (&raw mut sel).cast(),
+        )
+    };
+    if rc_sel == ffi::GHOSTTY_NO_VALUE {
+        return Ok(Vec::new());
+    }
+    if rc_sel != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(rc_sel));
+    }
+
+    let mut cols: u16 = 0;
+    let mut rows: u16 = 0;
+    let mut sb = ffi::GhosttyTerminalScrollbar::default();
+    // SAFETY: `guard.raw` is locked; output pointers match documented C ABI types.
+    unsafe {
+        let rc_c = ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_COLS,
+            (&raw mut cols).cast(),
+        );
+        if rc_c != ffi::GHOSTTY_SUCCESS {
+            return Err(VtError::Ffi(rc_c));
+        }
+        let rc_r = ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_ROWS,
+            (&raw mut rows).cast(),
+        );
+        if rc_r != ffi::GHOSTTY_SUCCESS {
+            return Err(VtError::Ffi(rc_r));
+        }
+        let rc_sb = ffi::ghostty_terminal_get(
+            guard.raw,
+            ffi::GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+            (&raw mut sb).cast(),
+        );
+        if rc_sb != ffi::GHOSTTY_SUCCESS {
+            return Err(VtError::Ffi(rc_sb));
+        }
+    }
+    if cols == 0 || rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut start_pt = ffi::GhosttyPointCoordinate::default();
+    let mut end_pt = ffi::GhosttyPointCoordinate::default();
+    // SAFETY: `sel.start` and `sel.end` are valid untracked grid refs while `guard` is held.
+    let rc_s = unsafe {
+        ffi::ghostty_terminal_point_from_grid_ref(
+            guard.raw,
+            &raw const sel.start,
+            ffi::GHOSTTY_POINT_TAG_SCREEN,
+            &raw mut start_pt,
+        )
+    };
+    let rc_e = unsafe {
+        ffi::ghostty_terminal_point_from_grid_ref(
+            guard.raw,
+            &raw const sel.end,
+            ffi::GHOSTTY_POINT_TAG_SCREEN,
+            &raw mut end_pt,
+        )
+    };
+    if rc_s == ffi::GHOSTTY_NO_VALUE || rc_e == ffi::GHOSTTY_NO_VALUE {
+        return Ok(Vec::new());
+    }
+    if rc_s != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(rc_s));
+    }
+    if rc_e != ffi::GHOSTTY_SUCCESS {
+        return Err(VtError::Ffi(rc_e));
+    }
+
+    let vp_top = sb.offset;
+    let vp_bot_excl = vp_top.saturating_add(u64::from(rows));
+    let max_col = cols.saturating_sub(1);
     let mut spans = Vec::new();
-    rs.for_each_row(|row| {
-        if row.viewport_y >= 0
-            && let Some(sel) = row.selection
-        {
-            let start_col = sel.start_x;
-            let end_col = sel.end_x.saturating_add(1);
-            if end_col > start_col {
+
+    if sel.rectangle {
+        let y_min = u64::from(start_pt.y.min(end_pt.y));
+        let y_max = u64::from(start_pt.y.max(end_pt.y));
+        let x_min = start_pt.x.min(end_pt.x).min(max_col);
+        let x_max = start_pt.x.max(end_pt.x).min(max_col);
+        let vis_start = y_min.max(vp_top);
+        let vis_end = y_max.min(vp_bot_excl.saturating_sub(1));
+        if vis_start <= vis_end && y_min < vp_bot_excl && y_max >= vp_top {
+            for y in vis_start..=vis_end {
                 spans.push(RowCellSpan {
-                    row: row.viewport_y as u32,
-                    start_col,
-                    end_col,
+                    row: (y - vp_top) as u32,
+                    start_col: x_min,
+                    end_col: x_max.saturating_add(1),
                 });
             }
         }
-    })?;
+    } else {
+        let ((s_x, s_y), (e_x, e_y)) = if (start_pt.y, start_pt.x) <= (end_pt.y, end_pt.x) {
+            (
+                (start_pt.x.min(max_col), u64::from(start_pt.y)),
+                (end_pt.x.min(max_col), u64::from(end_pt.y)),
+            )
+        } else {
+            (
+                (end_pt.x.min(max_col), u64::from(end_pt.y)),
+                (start_pt.x.min(max_col), u64::from(start_pt.y)),
+            )
+        };
+        let vis_start = s_y.max(vp_top);
+        let vis_end = e_y.min(vp_bot_excl.saturating_sub(1));
+        if vis_start <= vis_end && s_y < vp_bot_excl && e_y >= vp_top {
+            for y in vis_start..=vis_end {
+                let start_col = if y == s_y { s_x } else { 0 };
+                let end_col_incl = if y == e_y { e_x } else { max_col };
+                if end_col_incl >= start_col {
+                    spans.push(RowCellSpan {
+                        row: (y - vp_top) as u32,
+                        start_col,
+                        end_col: end_col_incl.saturating_add(1),
+                    });
+                }
+            }
+        }
+    }
+
     Ok(spans)
 }
 

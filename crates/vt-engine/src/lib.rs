@@ -3876,6 +3876,49 @@ mod tests {
     }
 
     #[test]
+    fn selection_viewport_spans_preserves_terminal_dirty_rows() {
+        let term = Terminal::new(20, 4, TerminalConfig::default()).unwrap();
+        let mut rs = RenderState::new().unwrap();
+
+        // Establish clean baseline.
+        let _ = rs.begin_update(&term, Overscan::default()).unwrap();
+        rs.end_update().unwrap();
+        rs.clean().unwrap();
+
+        // Write text and create a selection, then query `selection_viewport_spans`.
+        term.write(b"dirty text check");
+        selection::select_range(
+            &term,
+            selection::ScreenPoint { col: 0, row: 0 },
+            selection::ScreenPoint { col: 4, row: 0 },
+            selection::SelectionMode::Char,
+        )
+        .unwrap();
+
+        let spans = selection::selection_viewport_spans(&term).unwrap();
+        assert_eq!(
+            spans,
+            vec![selection::RowCellSpan {
+                row: 0,
+                start_col: 0,
+                end_col: 5,
+            }]
+        );
+
+        // `selection_viewport_spans` must NOT consume `term`'s dirty state!
+        let _ = rs.begin_update(&term, Overscan::default()).unwrap();
+        rs.end_update().unwrap();
+        assert_ne!(
+            rs.dirty_state(),
+            DirtyState::Clean,
+            "selection_viewport_spans must not clear terminal dirty flags"
+        );
+        let mut dirty_rows = 0usize;
+        rs.for_each_dirty_row(|_| dirty_rows += 1).unwrap();
+        assert!(dirty_rows >= 1, "expected row 0 to remain dirty");
+    }
+
+    #[test]
     fn select_range_char_line_block_and_backward_order() {
         let term = Terminal::new(24, 4, TerminalConfig::default()).unwrap();
         for i in 0..8 {
