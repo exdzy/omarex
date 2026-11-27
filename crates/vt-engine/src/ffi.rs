@@ -1,9 +1,8 @@
-//! Audited raw C ABI bindings to `libghostty-vt` (`/usr/include/ghostty/vt/*.h`).
+//! Audited raw C ABI bindings to `libghostty-vt` 1.0 (`GHOSTTY_VT_1.0`, `/usr/include/ghostty/vt/*.h`).
 //!
 //! Every `unsafe extern "C"` declaration is isolated in this module and paired with
-//! compile-time/unit-test ABI verification against `ghostty_type_json()` so any
-//! upstream ABI drift fails tests immediately rather than causing silent memory
-//! corruption.
+//! unit-test ABI verification against `ghostty_type_json()` so any upstream ABI or
+//! discriminant drift fails tests immediately rather than causing silent memory corruption.
 
 #![allow(non_camel_case_types, dead_code)]
 
@@ -23,6 +22,7 @@ pub const GHOSTTY_NO_VALUE: GhosttyResult = -4;
 pub const GHOSTTY_IO_ERROR: GhosttyResult = -5;
 pub const GHOSTTY_LIMIT_EXCEEDED: GhosttyResult = -6;
 pub const GHOSTTY_REJECTED: GhosttyResult = -7;
+pub const GHOSTTY_UNSUPPORTED: GhosttyResult = -8;
 
 // ---------------------------------------------------------------------------
 // Opaque handles (types.h, selection.h, key/*.h, mouse/*.h)
@@ -95,6 +95,12 @@ pub struct GhosttySearchImpl {
 pub type GhosttySearch = *mut GhosttySearchImpl;
 
 #[repr(C)]
+pub struct GhosttyFormatterImpl {
+    _opaque: [u8; 0],
+}
+pub type GhosttyFormatter = *mut GhosttyFormatterImpl;
+
+#[repr(C)]
 pub struct GhosttySelectionGestureImpl {
     _opaque: [u8; 0],
 }
@@ -145,6 +151,34 @@ pub const GHOSTTY_FORMATTER_FORMAT_PLAIN: GhosttyFormatterFormat = 0;
 pub const GHOSTTY_FORMATTER_FORMAT_VT: GhosttyFormatterFormat = 1;
 pub const GHOSTTY_FORMATTER_FORMAT_HTML: GhosttyFormatterFormat = 2;
 
+pub type GhosttyFormatterExtras = u32;
+pub const GHOSTTY_FORMATTER_EXTRA_PALETTE: GhosttyFormatterExtras = 1 << 0;
+pub const GHOSTTY_FORMATTER_EXTRA_MODES: GhosttyFormatterExtras = 1 << 1;
+pub const GHOSTTY_FORMATTER_EXTRA_SCROLLING_REGION: GhosttyFormatterExtras = 1 << 2;
+pub const GHOSTTY_FORMATTER_EXTRA_TABSTOPS: GhosttyFormatterExtras = 1 << 3;
+pub const GHOSTTY_FORMATTER_EXTRA_PWD: GhosttyFormatterExtras = 1 << 4;
+pub const GHOSTTY_FORMATTER_EXTRA_KEYBOARD: GhosttyFormatterExtras = 1 << 5;
+pub const GHOSTTY_FORMATTER_EXTRA_CURSOR: GhosttyFormatterExtras = 1 << 6;
+pub const GHOSTTY_FORMATTER_EXTRA_STYLE: GhosttyFormatterExtras = 1 << 7;
+pub const GHOSTTY_FORMATTER_EXTRA_HYPERLINK: GhosttyFormatterExtras = 1 << 8;
+pub const GHOSTTY_FORMATTER_EXTRA_PROTECTION: GhosttyFormatterExtras = 1 << 9;
+pub const GHOSTTY_FORMATTER_EXTRA_KITTY_KEYBOARD: GhosttyFormatterExtras = 1 << 10;
+pub const GHOSTTY_FORMATTER_EXTRA_CHARSETS: GhosttyFormatterExtras = 1 << 11;
+pub const GHOSTTY_FORMATTER_EXTRAS_NONE: GhosttyFormatterExtras = 0;
+pub const GHOSTTY_FORMATTER_EXTRAS_ALL: GhosttyFormatterExtras = 0xFFF;
+pub const GHOSTTY_FORMATTER_EXTRAS_DEFAULT: GhosttyFormatterExtras =
+    GHOSTTY_FORMATTER_EXTRA_PALETTE
+        | GHOSTTY_FORMATTER_EXTRA_STYLE
+        | GHOSTTY_FORMATTER_EXTRA_HYPERLINK;
+
+pub type GhosttyFormatterOption = c_int;
+pub const GHOSTTY_FORMATTER_OPT_INVALID: GhosttyFormatterOption = 0;
+pub const GHOSTTY_FORMATTER_OPT_EMIT: GhosttyFormatterOption = 1;
+pub const GHOSTTY_FORMATTER_OPT_UNWRAP: GhosttyFormatterOption = 2;
+pub const GHOSTTY_FORMATTER_OPT_TRIM: GhosttyFormatterOption = 3;
+pub const GHOSTTY_FORMATTER_OPT_SELECTION: GhosttyFormatterOption = 4;
+pub const GHOSTTY_FORMATTER_OPT_EXTRAS: GhosttyFormatterOption = 5;
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct GhosttyString {
@@ -183,6 +217,7 @@ pub struct GhosttyAllocatorVtable {
         unsafe extern "C" fn(*mut c_void, *mut c_void, usize, u8, usize, usize) -> *mut c_void,
     >,
     pub free: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, u8, usize)>,
+    pub reserved: [*mut c_void; 4],
 }
 
 #[repr(C)]
@@ -235,10 +270,11 @@ pub const GHOSTTY_SYS_LOG_LEVEL_INFO: GhosttySysLogLevel = 2;
 pub const GHOSTTY_SYS_LOG_LEVEL_DEBUG: GhosttySysLogLevel = 3;
 
 pub type GhosttySysOption = c_int;
-pub const GHOSTTY_SYS_OPT_USERDATA: GhosttySysOption = 0;
-pub const GHOSTTY_SYS_OPT_DECODE_PNG: GhosttySysOption = 1;
-pub const GHOSTTY_SYS_OPT_LOG: GhosttySysOption = 2;
-pub const GHOSTTY_SYS_OPT_RANDOM_SECURE: GhosttySysOption = 3;
+pub const GHOSTTY_SYS_OPT_INVALID: GhosttySysOption = 0;
+pub const GHOSTTY_SYS_OPT_USERDATA: GhosttySysOption = 1;
+pub const GHOSTTY_SYS_OPT_DECODE_PNG: GhosttySysOption = 2;
+pub const GHOSTTY_SYS_OPT_LOG: GhosttySysOption = 3;
+pub const GHOSTTY_SYS_OPT_RANDOM_SECURE: GhosttySysOption = 4;
 
 pub type GhosttySysDecodePngFn = unsafe extern "C" fn(
     userdata: *mut c_void,
@@ -308,15 +344,37 @@ pub const GHOSTTY_STYLE_COLOR_RGB: GhosttyStyleColorTag = 2;
 pub union GhosttyStyleColorValue {
     pub palette: GhosttyColorPaletteIndex,
     pub rgb: GhosttyColorRgb,
-    pub _padding: u64,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct GhosttyStyleColor {
-    pub tag: GhosttyStyleColorTag,
+    pub tag: u8,
     pub value: GhosttyStyleColorValue,
 }
+
+impl Default for GhosttyStyleColor {
+    fn default() -> Self {
+        Self {
+            tag: GHOSTTY_STYLE_COLOR_NONE as u8,
+            value: GhosttyStyleColorValue {
+                rgb: GhosttyColorRgb::default(),
+            },
+        }
+    }
+}
+
+pub type GhosttyStyleFlags = u16;
+pub const GHOSTTY_STYLE_FLAG_BOLD: GhosttyStyleFlags = 1 << 0;
+pub const GHOSTTY_STYLE_FLAG_ITALIC: GhosttyStyleFlags = 1 << 1;
+pub const GHOSTTY_STYLE_FLAG_FAINT: GhosttyStyleFlags = 1 << 2;
+pub const GHOSTTY_STYLE_FLAG_BLINK: GhosttyStyleFlags = 1 << 3;
+pub const GHOSTTY_STYLE_FLAG_INVERSE: GhosttyStyleFlags = 1 << 4;
+pub const GHOSTTY_STYLE_FLAG_INVISIBLE: GhosttyStyleFlags = 1 << 5;
+pub const GHOSTTY_STYLE_FLAG_STRIKETHROUGH: GhosttyStyleFlags = 1 << 6;
+pub const GHOSTTY_STYLE_FLAG_OVERLINE: GhosttyStyleFlags = 1 << 7;
+pub const GHOSTTY_STYLE_UNDERLINE_SHIFT: u32 = 8;
+pub const GHOSTTY_STYLE_UNDERLINE_MASK: GhosttyStyleFlags = 0x7 << GHOSTTY_STYLE_UNDERLINE_SHIFT;
 
 pub type GhosttySgrUnderline = c_int;
 pub const GHOSTTY_SGR_UNDERLINE_NONE: GhosttySgrUnderline = 0;
@@ -326,51 +384,15 @@ pub const GHOSTTY_SGR_UNDERLINE_CURLY: GhosttySgrUnderline = 3;
 pub const GHOSTTY_SGR_UNDERLINE_DOTTED: GhosttySgrUnderline = 4;
 pub const GHOSTTY_SGR_UNDERLINE_DASHED: GhosttySgrUnderline = 5;
 
+/// Frozen 16-byte terminal cell style (`style.h`).
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 pub struct GhosttyStyle {
-    pub size: usize,
     pub fg_color: GhosttyStyleColor,
     pub bg_color: GhosttyStyleColor,
     pub underline_color: GhosttyStyleColor,
-    pub bold: bool,
-    pub italic: bool,
-    pub faint: bool,
-    pub blink: bool,
-    pub inverse: bool,
-    pub invisible: bool,
-    pub strikethrough: bool,
-    pub overline: bool,
-    pub underline: c_int,
-}
-
-impl Default for GhosttyStyle {
-    fn default() -> Self {
-        Self {
-            size: std::mem::size_of::<Self>(),
-            fg_color: GhosttyStyleColor {
-                tag: GHOSTTY_STYLE_COLOR_NONE,
-                value: GhosttyStyleColorValue { _padding: 0 },
-            },
-            bg_color: GhosttyStyleColor {
-                tag: GHOSTTY_STYLE_COLOR_NONE,
-                value: GhosttyStyleColorValue { _padding: 0 },
-            },
-            underline_color: GhosttyStyleColor {
-                tag: GHOSTTY_STYLE_COLOR_NONE,
-                value: GhosttyStyleColorValue { _padding: 0 },
-            },
-            bold: false,
-            italic: false,
-            faint: false,
-            blink: false,
-            inverse: false,
-            invisible: false,
-            strikethrough: false,
-            overline: false,
-            underline: GHOSTTY_SGR_UNDERLINE_NONE,
-        }
-    }
+    pub flags: GhosttyStyleFlags,
+    pub reserved: u16,
 }
 
 #[repr(C)]
@@ -420,10 +442,10 @@ impl GhosttyPoint {
     }
 }
 
+/// Frozen untracked grid reference (`grid_ref.h`, 16 bytes on 64-bit).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct GhosttyGridRef {
-    pub size: usize,
     pub node: *mut c_void,
     pub x: u16,
     pub y: u16,
@@ -432,7 +454,6 @@ pub struct GhosttyGridRef {
 impl Default for GhosttyGridRef {
     fn default() -> Self {
         Self {
-            size: std::mem::size_of::<Self>(),
             node: std::ptr::null_mut(),
             x: 0,
             y: 0,
@@ -574,6 +595,10 @@ pub struct GhosttyClipboardContent {
 pub type GhosttyClipboardWriteResult = c_int;
 pub const GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS: GhosttyClipboardWriteResult = 0;
 pub const GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED: GhosttyClipboardWriteResult = 1;
+pub const GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED: GhosttyClipboardWriteResult = 2;
+pub const GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY: GhosttyClipboardWriteResult = 3;
+pub const GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA: GhosttyClipboardWriteResult = 4;
+pub const GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR: GhosttyClipboardWriteResult = 5;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -588,9 +613,9 @@ pub type GhosttyClipboardWriteReplyFn = unsafe extern "C" fn(
     reply: *const GhosttyClipboardWriteReply,
 );
 
+/// Frozen clipboard write request (`terminal.h`, 64 bytes on 64-bit).
 #[repr(C)]
 pub struct GhosttyClipboardWrite {
-    pub size: usize,
     pub location: GhosttyClipboardLocation,
     pub contents: *const GhosttyClipboardContent,
     pub contents_len: usize,
@@ -601,10 +626,10 @@ pub struct GhosttyClipboardWrite {
     pub reply: Option<GhosttyClipboardWriteReplyFn>,
 }
 
+/// Frozen desktop notification request (`terminal.h`, 32 bytes on 64-bit).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct GhosttyTerminalDesktopNotification {
-    pub size: usize,
     pub title: GhosttyString,
     pub body: GhosttyString,
 }
@@ -616,10 +641,10 @@ pub const GHOSTTY_TERMINAL_PROGRESS_STATE_ERROR: GhosttyTerminalProgressState = 
 pub const GHOSTTY_TERMINAL_PROGRESS_STATE_INDETERMINATE: GhosttyTerminalProgressState = 3;
 pub const GHOSTTY_TERMINAL_PROGRESS_STATE_PAUSE: GhosttyTerminalProgressState = 4;
 
+/// Frozen progress report (`terminal.h`, 8 bytes).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct GhosttyTerminalProgressReport {
-    pub size: usize,
     pub state: GhosttyTerminalProgressState,
     pub progress: i8,
 }
@@ -638,10 +663,10 @@ pub const GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION: GhosttyProgramStatusKind = 1;
 pub const GHOSTTY_PROGRAM_STATUS_KIND_QUESTION: GhosttyProgramStatusKind = 2;
 pub const GHOSTTY_PROGRAM_STATUS_KIND_AUTH: GhosttyProgramStatusKind = 3;
 
+/// Frozen program status report (`terminal.h`, 80 bytes on 64-bit).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct GhosttyTerminalProgramStatus {
-    pub size: usize,
     pub state: GhosttyProgramStatusState,
     pub kind: GhosttyProgramStatusKind,
     pub progress: i8,
@@ -669,33 +694,36 @@ pub type GhosttyTerminalProgressReportFn =
 pub type GhosttyTerminalProgramStatusFn =
     unsafe extern "C" fn(GhosttyTerminal, *mut c_void, *const GhosttyTerminalProgramStatus);
 
-// Terminal options
+// Terminal options (terminal.h)
 pub type GhosttyTerminalOption = c_int;
-pub const GHOSTTY_TERMINAL_OPT_USERDATA: GhosttyTerminalOption = 0;
-pub const GHOSTTY_TERMINAL_OPT_WRITE_PTY: GhosttyTerminalOption = 1;
-pub const GHOSTTY_TERMINAL_OPT_BELL: GhosttyTerminalOption = 2;
-pub const GHOSTTY_TERMINAL_OPT_TITLE_CHANGED: GhosttyTerminalOption = 5;
-pub const GHOSTTY_TERMINAL_OPT_COLOR_SCHEME: GhosttyTerminalOption = 7;
-pub const GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND: GhosttyTerminalOption = 11;
-pub const GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND: GhosttyTerminalOption = 12;
-pub const GHOSTTY_TERMINAL_OPT_COLOR_CURSOR: GhosttyTerminalOption = 13;
-pub const GHOSTTY_TERMINAL_OPT_COLOR_PALETTE: GhosttyTerminalOption = 14;
-pub const GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT: GhosttyTerminalOption = 15;
-pub const GHOSTTY_TERMINAL_OPT_SELECTION: GhosttyTerminalOption = 21;
-pub const GHOSTTY_TERMINAL_OPT_PWD_CHANGED: GhosttyTerminalOption = 25;
-pub const GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE: GhosttyTerminalOption = 26;
-pub const GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES: GhosttyTerminalOption = 27;
-pub const GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES: GhosttyTerminalOption = 28;
-pub const GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION: GhosttyTerminalOption = 29;
-pub const GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT: GhosttyTerminalOption = 30;
-pub const GHOSTTY_TERMINAL_OPT_MODE: GhosttyTerminalOption = 34;
-pub const GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE: GhosttyTerminalOption = 35;
-pub const GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES: GhosttyTerminalOption = 36;
-pub const GHOSTTY_TERMINAL_OPT_RENDER_HOLD: GhosttyTerminalOption = 41;
-pub const GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS: GhosttyTerminalOption = 46;
+pub const GHOSTTY_TERMINAL_OPT_INVALID: GhosttyTerminalOption = 0;
+pub const GHOSTTY_TERMINAL_OPT_USERDATA: GhosttyTerminalOption = 1;
+pub const GHOSTTY_TERMINAL_OPT_WRITE_PTY: GhosttyTerminalOption = 2;
+pub const GHOSTTY_TERMINAL_OPT_BELL: GhosttyTerminalOption = 3;
+pub const GHOSTTY_TERMINAL_OPT_TITLE_CHANGED: GhosttyTerminalOption = 6;
+pub const GHOSTTY_TERMINAL_OPT_COLOR_SCHEME: GhosttyTerminalOption = 8;
+pub const GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND: GhosttyTerminalOption = 12;
+pub const GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND: GhosttyTerminalOption = 13;
+pub const GHOSTTY_TERMINAL_OPT_COLOR_CURSOR: GhosttyTerminalOption = 14;
+pub const GHOSTTY_TERMINAL_OPT_COLOR_PALETTE: GhosttyTerminalOption = 15;
+pub const GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT: GhosttyTerminalOption = 16;
+pub const GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE: GhosttyTerminalOption = 17;
+pub const GHOSTTY_TERMINAL_OPT_SELECTION: GhosttyTerminalOption = 22;
+pub const GHOSTTY_TERMINAL_OPT_PWD_CHANGED: GhosttyTerminalOption = 26;
+pub const GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE: GhosttyTerminalOption = 27;
+pub const GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES: GhosttyTerminalOption = 28;
+pub const GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES: GhosttyTerminalOption = 29;
+pub const GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION: GhosttyTerminalOption = 30;
+pub const GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT: GhosttyTerminalOption = 31;
+pub const GHOSTTY_TERMINAL_OPT_MODE: GhosttyTerminalOption = 35;
+pub const GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE: GhosttyTerminalOption = 36;
+pub const GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES: GhosttyTerminalOption = 37;
+pub const GHOSTTY_TERMINAL_OPT_RENDER_HOLD: GhosttyTerminalOption = 42;
+pub const GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS: GhosttyTerminalOption = 47;
 
-// Terminal data keys
+// Terminal data keys (terminal.h)
 pub type GhosttyTerminalData = c_int;
+pub const GHOSTTY_TERMINAL_DATA_INVALID: GhosttyTerminalData = 0;
 pub const GHOSTTY_TERMINAL_DATA_COLS: GhosttyTerminalData = 1;
 pub const GHOSTTY_TERMINAL_DATA_ROWS: GhosttyTerminalData = 2;
 pub const GHOSTTY_TERMINAL_DATA_CURSOR_X: GhosttyTerminalData = 3;
@@ -711,6 +739,7 @@ pub const GHOSTTY_TERMINAL_DATA_TOTAL_ROWS: GhosttyTerminalData = 14;
 pub const GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS: GhosttyTerminalData = 15;
 pub const GHOSTTY_TERMINAL_DATA_WIDTH_PX: GhosttyTerminalData = 16;
 pub const GHOSTTY_TERMINAL_DATA_HEIGHT_PX: GhosttyTerminalData = 17;
+pub const GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE: GhosttyTerminalData = 27;
 pub const GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS: GhosttyTerminalData = 30;
 pub const GHOSTTY_TERMINAL_DATA_SELECTION: GhosttyTerminalData = 31;
 pub const GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE: GhosttyTerminalData = 32;
@@ -718,7 +747,7 @@ pub const GHOSTTY_TERMINAL_DATA_MODE: GhosttyTerminalData = 37;
 pub const GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE: GhosttyTerminalData = 41;
 
 // ---------------------------------------------------------------------------
-// Render State (render.h)
+// Render State (render.h, types.h)
 // ---------------------------------------------------------------------------
 
 pub type GhosttyRenderStateDirty = c_int;
@@ -726,13 +755,11 @@ pub const GHOSTTY_RENDER_STATE_DIRTY_FALSE: GhosttyRenderStateDirty = 0;
 pub const GHOSTTY_RENDER_STATE_DIRTY_PARTIAL: GhosttyRenderStateDirty = 1;
 pub const GHOSTTY_RENDER_STATE_DIRTY_FULL: GhosttyRenderStateDirty = 2;
 
-pub type GhosttyRenderStateCursorVisualStyle = c_int;
-pub const GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR: GhosttyRenderStateCursorVisualStyle = 0;
-pub const GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK: GhosttyRenderStateCursorVisualStyle = 1;
-pub const GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE: GhosttyRenderStateCursorVisualStyle =
-    2;
-pub const GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
-    GhosttyRenderStateCursorVisualStyle = 3;
+pub type GhosttyCursorStyle = c_int;
+pub const GHOSTTY_CURSOR_STYLE_BAR: GhosttyCursorStyle = 0;
+pub const GHOSTTY_CURSOR_STYLE_BLOCK: GhosttyCursorStyle = 1;
+pub const GHOSTTY_CURSOR_STYLE_UNDERLINE: GhosttyCursorStyle = 2;
+pub const GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW: GhosttyCursorStyle = 3;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
@@ -748,6 +775,7 @@ pub struct GhosttyRenderStateRowId {
 }
 
 pub type GhosttyRenderStateData = c_int;
+pub const GHOSTTY_RENDER_STATE_DATA_INVALID: GhosttyRenderStateData = 0;
 pub const GHOSTTY_RENDER_STATE_DATA_COLS: GhosttyRenderStateData = 1;
 pub const GHOSTTY_RENDER_STATE_DATA_ROWS: GhosttyRenderStateData = 2;
 pub const GHOSTTY_RENDER_STATE_DATA_DIRTY: GhosttyRenderStateData = 3;
@@ -759,16 +787,17 @@ pub const GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR: GhosttyRenderStateData = 22;
 pub const GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION: GhosttyRenderStateData = 23;
 
 pub type GhosttyRenderStateOption = c_int;
-pub const GHOSTTY_RENDER_STATE_OPTION_DIRTY: GhosttyRenderStateOption = 0;
-pub const GHOSTTY_RENDER_STATE_OPTION_OVERSCAN: GhosttyRenderStateOption = 1;
+pub const GHOSTTY_RENDER_STATE_OPT_INVALID: GhosttyRenderStateOption = 0;
+pub const GHOSTTY_RENDER_STATE_OPT_DIRTY: GhosttyRenderStateOption = 1;
+pub const GHOSTTY_RENDER_STATE_OPT_OVERSCAN: GhosttyRenderStateOption = 2;
 
 pub type GhosttyImageProtocol = c_int;
 pub const GHOSTTY_IMAGE_PROTOCOL_KITTY: GhosttyImageProtocol = 0;
 
-pub type GhosttyRenderStateImageLayer = c_int;
-pub const GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_BACKGROUND: GhosttyRenderStateImageLayer = 0;
-pub const GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_TEXT: GhosttyRenderStateImageLayer = 1;
-pub const GHOSTTY_RENDER_STATE_IMAGE_LAYER_ABOVE_TEXT: GhosttyRenderStateImageLayer = 2;
+pub type GhosttyImageLayer = c_int;
+pub const GHOSTTY_IMAGE_LAYER_BELOW_BACKGROUND: GhosttyImageLayer = 0;
+pub const GHOSTTY_IMAGE_LAYER_BELOW_TEXT: GhosttyImageLayer = 1;
+pub const GHOSTTY_IMAGE_LAYER_ABOVE_TEXT: GhosttyImageLayer = 2;
 
 pub type GhosttyRenderStateKittyPlacementKind = c_int;
 pub const GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL: GhosttyRenderStateKittyPlacementKind =
@@ -778,6 +807,7 @@ pub const GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_RELATIVE: GhosttyRenderState
 pub const GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED: GhosttyRenderStateKittyPlacementKind = 2;
 
 pub type GhosttyRenderStateImageData = c_int;
+pub const GHOSTTY_RENDER_STATE_IMAGE_DATA_INVALID: GhosttyRenderStateImageData = 0;
 pub const GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL: GhosttyRenderStateImageData = 1;
 pub const GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID: GhosttyRenderStateImageData = 2;
 pub const GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION: GhosttyRenderStateImageData = 3;
@@ -799,6 +829,7 @@ pub const GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID: GhosttyRenderState
 pub const GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND: GhosttyRenderStateImageData = 19;
 
 pub type GhosttyRenderStateRowData = c_int;
+pub const GHOSTTY_RENDER_STATE_ROW_DATA_INVALID: GhosttyRenderStateRowData = 0;
 pub const GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY: GhosttyRenderStateRowData = 1;
 pub const GHOSTTY_RENDER_STATE_ROW_DATA_RAW: GhosttyRenderStateRowData = 2;
 pub const GHOSTTY_RENDER_STATE_ROW_DATA_CELLS: GhosttyRenderStateRowData = 3;
@@ -808,6 +839,7 @@ pub const GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y: GhosttyRenderStateRowData = 
 pub const GHOSTTY_RENDER_STATE_ROW_DATA_ID: GhosttyRenderStateRowData = 7;
 
 pub type GhosttyRenderStateRowCellsData = c_int;
+pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_INVALID: GhosttyRenderStateRowCellsData = 0;
 pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW: GhosttyRenderStateRowCellsData = 1;
 pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE: GhosttyRenderStateRowCellsData = 2;
 pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN: GhosttyRenderStateRowCellsData = 3;
@@ -846,7 +878,7 @@ pub struct GhosttyRenderStateCursor {
     pub visible: bool,
     pub blinking: bool,
     pub password_input: bool,
-    pub visual_style: GhosttyRenderStateCursorVisualStyle,
+    pub visual_style: GhosttyCursorStyle,
 }
 
 impl Default for GhosttyRenderStateCursor {
@@ -860,7 +892,7 @@ impl Default for GhosttyRenderStateCursor {
             visible: false,
             blinking: false,
             password_input: false,
-            visual_style: GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK,
+            visual_style: GHOSTTY_CURSOR_STYLE_BLOCK,
         }
     }
 }
@@ -894,16 +926,18 @@ impl Default for GhosttyRenderStateColors {
 // ---------------------------------------------------------------------------
 
 pub type GhosttySnapshotDecoderOption = c_int;
-pub const GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES: GhosttySnapshotDecoderOption = 0;
-pub const GHOSTTY_SNAPSHOT_DECODER_OPT_RETAIN_CONTINUATION: GhosttySnapshotDecoderOption = 1;
-pub const GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY: GhosttySnapshotDecoderOption = 2;
-pub const GHOSTTY_SNAPSHOT_DECODER_OPT_KITTY_IMAGE_STORAGE_LIMIT: GhosttySnapshotDecoderOption = 3;
+pub const GHOSTTY_SNAPSHOT_DECODER_OPT_INVALID: GhosttySnapshotDecoderOption = 0;
+pub const GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES: GhosttySnapshotDecoderOption = 1;
+pub const GHOSTTY_SNAPSHOT_DECODER_OPT_RETAIN_CONTINUATION: GhosttySnapshotDecoderOption = 2;
+pub const GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY: GhosttySnapshotDecoderOption = 3;
+pub const GHOSTTY_SNAPSHOT_DECODER_OPT_KITTY_IMAGE_STORAGE_LIMIT: GhosttySnapshotDecoderOption = 4;
 
 pub type GhosttySnapshotDecoderProgressKind = c_int;
 pub const GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_PAGE: GhosttySnapshotDecoderProgressKind = 0;
 pub const GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_IMAGE: GhosttySnapshotDecoderProgressKind = 1;
 
 pub type GhosttySnapshotDecoderData = c_int;
+pub const GHOSTTY_SNAPSHOT_DECODER_DATA_INVALID: GhosttySnapshotDecoderData = 0;
 pub const GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET: GhosttySnapshotDecoderData = 2;
 pub const GHOSTTY_SNAPSHOT_DECODER_DATA_HISTORY_ROWS_PRIMARY: GhosttySnapshotDecoderData = 3;
 pub const GHOSTTY_SNAPSHOT_DECODER_DATA_HISTORY_ROWS_ALTERNATE: GhosttySnapshotDecoderData = 4;
@@ -923,6 +957,7 @@ pub const GHOSTTY_SNAPSHOT_DECODER_DATA_KITTY_PENDING_BYTES_PRIMARY: GhosttySnap
 // ---------------------------------------------------------------------------
 
 pub type GhosttyKittyGraphicsData = c_int;
+pub const GHOSTTY_KITTY_GRAPHICS_DATA_INVALID: GhosttyKittyGraphicsData = 0;
 pub const GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR: GhosttyKittyGraphicsData = 1;
 pub const GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION: GhosttyKittyGraphicsData = 2;
 
@@ -934,14 +969,16 @@ pub const GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA: GhosttyKittyImageFormat = 3;
 pub const GHOSTTY_KITTY_IMAGE_FORMAT_GRAY: GhosttyKittyImageFormat = 4;
 
 pub type GhosttyKittyGraphicsImageData = c_int;
-pub const GHOSTTY_KITTY_IMAGE_DATA_ID: GhosttyKittyGraphicsImageData = 1;
-pub const GHOSTTY_KITTY_IMAGE_DATA_NUMBER: GhosttyKittyGraphicsImageData = 2;
-pub const GHOSTTY_KITTY_IMAGE_DATA_WIDTH: GhosttyKittyGraphicsImageData = 3;
-pub const GHOSTTY_KITTY_IMAGE_DATA_HEIGHT: GhosttyKittyGraphicsImageData = 4;
-pub const GHOSTTY_KITTY_IMAGE_DATA_FORMAT: GhosttyKittyGraphicsImageData = 5;
-pub const GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR: GhosttyKittyGraphicsImageData = 7;
-pub const GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN: GhosttyKittyGraphicsImageData = 8;
-pub const GHOSTTY_KITTY_IMAGE_DATA_GENERATION: GhosttyKittyGraphicsImageData = 9;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_INVALID: GhosttyKittyGraphicsImageData = 0;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_ID: GhosttyKittyGraphicsImageData = 1;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_NUMBER: GhosttyKittyGraphicsImageData = 2;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH: GhosttyKittyGraphicsImageData = 3;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT: GhosttyKittyGraphicsImageData = 4;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT: GhosttyKittyGraphicsImageData = 5;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_COMPRESSION: GhosttyKittyGraphicsImageData = 6;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS: GhosttyKittyGraphicsImageData = 7;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_EXPECTED_LEN: GhosttyKittyGraphicsImageData = 8;
+pub const GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION: GhosttyKittyGraphicsImageData = 9;
 
 // ---------------------------------------------------------------------------
 // Key & Mouse & Focus & Paste (key/*.h, mouse/*.h, focus.h, paste.h)
@@ -981,14 +1018,15 @@ pub const GHOSTTY_OPTION_AS_ALT_LEFT: GhosttyOptionAsAlt = 2;
 pub const GHOSTTY_OPTION_AS_ALT_RIGHT: GhosttyOptionAsAlt = 3;
 
 pub type GhosttyKeyEncoderOption = c_int;
-pub const GHOSTTY_KEY_ENCODER_OPT_CURSOR_KEY_APPLICATION: GhosttyKeyEncoderOption = 0;
-pub const GHOSTTY_KEY_ENCODER_OPT_KEYPAD_KEY_APPLICATION: GhosttyKeyEncoderOption = 1;
-pub const GHOSTTY_KEY_ENCODER_OPT_IGNORE_KEYPAD_WITH_NUMLOCK: GhosttyKeyEncoderOption = 2;
-pub const GHOSTTY_KEY_ENCODER_OPT_ALT_ESC_PREFIX: GhosttyKeyEncoderOption = 3;
-pub const GHOSTTY_KEY_ENCODER_OPT_MODIFY_OTHER_KEYS_STATE_2: GhosttyKeyEncoderOption = 4;
-pub const GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS: GhosttyKeyEncoderOption = 5;
-pub const GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT: GhosttyKeyEncoderOption = 6;
-pub const GHOSTTY_KEY_ENCODER_OPT_BACKARROW_KEY_MODE: GhosttyKeyEncoderOption = 7;
+pub const GHOSTTY_KEY_ENCODER_OPT_INVALID: GhosttyKeyEncoderOption = 0;
+pub const GHOSTTY_KEY_ENCODER_OPT_CURSOR_KEY_APPLICATION: GhosttyKeyEncoderOption = 1;
+pub const GHOSTTY_KEY_ENCODER_OPT_KEYPAD_KEY_APPLICATION: GhosttyKeyEncoderOption = 2;
+pub const GHOSTTY_KEY_ENCODER_OPT_IGNORE_KEYPAD_WITH_NUMLOCK: GhosttyKeyEncoderOption = 3;
+pub const GHOSTTY_KEY_ENCODER_OPT_ALT_ESC_PREFIX: GhosttyKeyEncoderOption = 4;
+pub const GHOSTTY_KEY_ENCODER_OPT_MODIFY_OTHER_KEYS_STATE_2: GhosttyKeyEncoderOption = 5;
+pub const GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS: GhosttyKeyEncoderOption = 6;
+pub const GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT: GhosttyKeyEncoderOption = 7;
+pub const GHOSTTY_KEY_ENCODER_OPT_BACKARROW_KEY_MODE: GhosttyKeyEncoderOption = 8;
 
 pub type GhosttyMouseAction = c_int;
 pub const GHOSTTY_MOUSE_ACTION_PRESS: GhosttyMouseAction = 0;
@@ -1061,11 +1099,12 @@ impl Default for GhosttyMouseEncoderSize {
 }
 
 pub type GhosttyMouseEncoderOption = c_int;
-pub const GHOSTTY_MOUSE_ENCODER_OPT_EVENT: GhosttyMouseEncoderOption = 0;
-pub const GHOSTTY_MOUSE_ENCODER_OPT_FORMAT: GhosttyMouseEncoderOption = 1;
-pub const GHOSTTY_MOUSE_ENCODER_OPT_SIZE: GhosttyMouseEncoderOption = 2;
-pub const GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED: GhosttyMouseEncoderOption = 3;
-pub const GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL: GhosttyMouseEncoderOption = 4;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_INVALID: GhosttyMouseEncoderOption = 0;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_EVENT: GhosttyMouseEncoderOption = 1;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_FORMAT: GhosttyMouseEncoderOption = 2;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_SIZE: GhosttyMouseEncoderOption = 3;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED: GhosttyMouseEncoderOption = 4;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL: GhosttyMouseEncoderOption = 5;
 
 pub type GhosttyMouseShape = c_int;
 
@@ -1077,24 +1116,13 @@ pub const GHOSTTY_FOCUS_LOST: GhosttyFocusEvent = 1;
 // Selection & Search (selection.h, search.h)
 // ---------------------------------------------------------------------------
 
+/// Frozen selection range (`selection.h`, 40 bytes on 64-bit).
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub struct GhosttySelection {
-    pub size: usize,
     pub start: GhosttyGridRef,
     pub end: GhosttyGridRef,
     pub rectangle: bool,
-}
-
-impl Default for GhosttySelection {
-    fn default() -> Self {
-        Self {
-            size: std::mem::size_of::<Self>(),
-            start: GhosttyGridRef::default(),
-            end: GhosttyGridRef::default(),
-            rectangle: false,
-        }
-    }
 }
 
 #[repr(C)]
@@ -1122,96 +1150,6 @@ pub struct GhosttyTerminalSelectLineOptions {
     pub whitespace: *const u32,
     pub whitespace_len: usize,
     pub semantic_prompt_boundary: bool,
-}
-
-pub type GhosttyFormatter = *mut c_void;
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct GhosttyFormatterScreenExtra {
-    pub size: usize,
-    pub cursor: bool,
-    pub style: bool,
-    pub hyperlink: bool,
-    pub protection: bool,
-    pub kitty_keyboard: bool,
-    pub charsets: bool,
-}
-
-impl Default for GhosttyFormatterScreenExtra {
-    fn default() -> Self {
-        Self {
-            size: std::mem::size_of::<Self>(),
-            cursor: false,
-            style: false,
-            hyperlink: false,
-            protection: false,
-            kitty_keyboard: false,
-            charsets: false,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct GhosttyFormatterTerminalExtra {
-    pub size: usize,
-    pub palette: bool,
-    pub modes: bool,
-    pub scrolling_region: bool,
-    pub tabstops: bool,
-    pub pwd: bool,
-    pub keyboard: bool,
-    pub screen: GhosttyFormatterScreenExtra,
-}
-
-impl Default for GhosttyFormatterTerminalExtra {
-    fn default() -> Self {
-        Self {
-            size: std::mem::size_of::<Self>(),
-            palette: false,
-            modes: false,
-            scrolling_region: false,
-            tabstops: false,
-            pwd: false,
-            keyboard: false,
-            screen: GhosttyFormatterScreenExtra::default(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct GhosttyFormatterTerminalOptions {
-    pub size: usize,
-    pub emit: GhosttyFormatterFormat,
-    pub unwrap: bool,
-    pub trim: bool,
-    pub extra: GhosttyFormatterTerminalExtra,
-    pub selection: *const GhosttySelection,
-}
-
-impl Default for GhosttyFormatterTerminalOptions {
-    fn default() -> Self {
-        Self {
-            size: std::mem::size_of::<Self>(),
-            emit: GHOSTTY_FORMATTER_FORMAT_PLAIN,
-            unwrap: false,
-            trim: false,
-            extra: GhosttyFormatterTerminalExtra::default(),
-            selection: std::ptr::null(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct GhosttyTerminalSelectionFormatOptions {
-    pub size: usize,
-    pub emit: GhosttyFormatterFormat,
-    pub unwrap: bool,
-    pub trim: bool,
-    pub selection: *const GhosttySelection,
 }
 
 pub type GhosttySelectionGestureBehavior = c_int;
@@ -1243,11 +1181,12 @@ pub const GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_UP: GhosttySelectionGestureAutosc
 pub const GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_DOWN: GhosttySelectionGestureAutoscroll = 2;
 
 pub type GhosttySelectionGestureData = c_int;
-pub const GHOSTTY_SELECTION_GESTURE_DATA_CLICK_COUNT: GhosttySelectionGestureData = 0;
-pub const GHOSTTY_SELECTION_GESTURE_DATA_DRAGGED: GhosttySelectionGestureData = 1;
-pub const GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL: GhosttySelectionGestureData = 2;
-pub const GHOSTTY_SELECTION_GESTURE_DATA_BEHAVIOR: GhosttySelectionGestureData = 3;
-pub const GHOSTTY_SELECTION_GESTURE_DATA_ANCHOR: GhosttySelectionGestureData = 4;
+pub const GHOSTTY_SELECTION_GESTURE_DATA_INVALID: GhosttySelectionGestureData = 0;
+pub const GHOSTTY_SELECTION_GESTURE_DATA_CLICK_COUNT: GhosttySelectionGestureData = 1;
+pub const GHOSTTY_SELECTION_GESTURE_DATA_DRAGGED: GhosttySelectionGestureData = 2;
+pub const GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL: GhosttySelectionGestureData = 3;
+pub const GHOSTTY_SELECTION_GESTURE_DATA_BEHAVIOR: GhosttySelectionGestureData = 4;
+pub const GHOSTTY_SELECTION_GESTURE_DATA_ANCHOR: GhosttySelectionGestureData = 5;
 
 pub type GhosttySelectionGestureEventType = c_int;
 pub const GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS: GhosttySelectionGestureEventType = 0;
@@ -1258,19 +1197,20 @@ pub const GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_AUTOSCROLL_TICK: GhosttySelection
 pub const GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DEEP_PRESS: GhosttySelectionGestureEventType = 4;
 
 pub type GhosttySelectionGestureEventOption = c_int;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF: GhosttySelectionGestureEventOption = 0;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION: GhosttySelectionGestureEventOption = 1;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_INVALID: GhosttySelectionGestureEventOption = 0;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF: GhosttySelectionGestureEventOption = 1;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION: GhosttySelectionGestureEventOption = 2;
 pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE: GhosttySelectionGestureEventOption =
-    2;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS: GhosttySelectionGestureEventOption = 3;
+    3;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS: GhosttySelectionGestureEventOption = 4;
 pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS:
-    GhosttySelectionGestureEventOption = 4;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_WORD_BOUNDARY_CODEPOINTS:
     GhosttySelectionGestureEventOption = 5;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS: GhosttySelectionGestureEventOption = 6;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE: GhosttySelectionGestureEventOption = 7;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY: GhosttySelectionGestureEventOption = 8;
-pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT: GhosttySelectionGestureEventOption = 9;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_WORD_BOUNDARY_CODEPOINTS:
+    GhosttySelectionGestureEventOption = 6;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS: GhosttySelectionGestureEventOption = 7;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE: GhosttySelectionGestureEventOption = 8;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY: GhosttySelectionGestureEventOption = 9;
+pub const GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT: GhosttySelectionGestureEventOption = 10;
 
 pub type GhosttySearchStatus = c_int;
 pub const GHOSTTY_SEARCH_STATUS_RUNNING: GhosttySearchStatus = 0;
@@ -1282,20 +1222,20 @@ pub const GHOSTTY_SEARCH_SCROLL_IF_NEEDED: GhosttySearchScroll = 0;
 pub const GHOSTTY_SEARCH_SCROLL_NONE: GhosttySearchScroll = 1;
 
 pub type GhosttySearchData = c_int;
-pub const GHOSTTY_SEARCH_DATA_STATUS: GhosttySearchData = 0;
-pub const GHOSTTY_SEARCH_DATA_NEEDLE: GhosttySearchData = 1;
-pub const GHOSTTY_SEARCH_DATA_TOTAL_MATCHES: GhosttySearchData = 2;
-pub const GHOSTTY_SEARCH_DATA_SELECTED_INDEX: GhosttySearchData = 3;
-pub const GHOSTTY_SEARCH_DATA_SELECTED_MATCH: GhosttySearchData = 4;
-pub const GHOSTTY_SEARCH_DATA_MATCHES: GhosttySearchData = 5;
-pub const GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES: GhosttySearchData = 6;
-pub const GHOSTTY_SEARCH_DATA_SELECT_SCROLL: GhosttySearchData = 7;
+pub const GHOSTTY_SEARCH_DATA_INVALID: GhosttySearchData = 0;
+pub const GHOSTTY_SEARCH_DATA_STATUS: GhosttySearchData = 1;
+pub const GHOSTTY_SEARCH_DATA_NEEDLE: GhosttySearchData = 2;
+pub const GHOSTTY_SEARCH_DATA_TOTAL_MATCHES: GhosttySearchData = 3;
+pub const GHOSTTY_SEARCH_DATA_SELECTED_INDEX: GhosttySearchData = 4;
+pub const GHOSTTY_SEARCH_DATA_SELECTED_MATCH: GhosttySearchData = 5;
+pub const GHOSTTY_SEARCH_DATA_MATCHES: GhosttySearchData = 6;
+pub const GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES: GhosttySearchData = 7;
+pub const GHOSTTY_SEARCH_DATA_SELECT_SCROLL: GhosttySearchData = 8;
 
 pub type GhosttySearchOption = c_int;
-pub const GHOSTTY_SEARCH_OPT_NEEDLE: GhosttySearchOption = 0;
-pub const GHOSTTY_SEARCH_OPT_SELECT_NEXT: GhosttySearchOption = 1;
-pub const GHOSTTY_SEARCH_OPT_SELECT_PREV: GhosttySearchOption = 2;
-pub const GHOSTTY_SEARCH_OPT_SELECT_SCROLL: GhosttySearchOption = 3;
+pub const GHOSTTY_SEARCH_OPT_INVALID: GhosttySearchOption = 0;
+pub const GHOSTTY_SEARCH_OPT_NEEDLE: GhosttySearchOption = 1;
+pub const GHOSTTY_SEARCH_OPT_SELECT_SCROLL: GhosttySearchOption = 4;
 
 // ---------------------------------------------------------------------------
 // Packed GhosttyCell decoding (verified against ghostty_type_json() ABI manifest)
@@ -1361,12 +1301,13 @@ pub const fn cell_semantic_content(raw: GhosttyCell) -> GhosttyCellSemanticConte
 }
 
 // ---------------------------------------------------------------------------
-// Extern C functions
+// Extern C functions (`GHOSTTY_VT_1.0`)
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
     // Build info & ABI manifest
     pub fn ghostty_build_info(data: c_int, out: *mut c_void) -> GhosttyResult;
+    pub fn ghostty_version() -> *const c_char;
     pub fn ghostty_type_json() -> *const c_char;
 
     // Allocator & system callbacks
@@ -1389,7 +1330,7 @@ unsafe extern "C" {
     ) -> GhosttyResult;
     pub fn ghostty_color_scheme_report_encode(
         scheme: GhosttyColorScheme,
-        buf: *mut c_char,
+        buf: *mut u8,
         buf_len: usize,
         out_written: *mut usize,
     ) -> GhosttyResult;
@@ -1424,7 +1365,7 @@ unsafe extern "C" {
     pub fn ghostty_terminal_scroll_viewport(
         terminal: GhosttyTerminal,
         behavior: GhosttyTerminalScrollViewport,
-    );
+    ) -> GhosttyResult;
     pub fn ghostty_terminal_compress(
         terminal: GhosttyTerminal,
         mode: GhosttyTerminalCompressionMode,
@@ -1455,7 +1396,16 @@ unsafe extern "C" {
         allocator: *const GhosttyAllocator,
         formatter: *mut GhosttyFormatter,
         terminal: GhosttyTerminal,
-        options: GhosttyFormatterTerminalOptions,
+    ) -> GhosttyResult;
+    pub fn ghostty_formatter_set(
+        formatter: GhosttyFormatter,
+        option: GhosttyFormatterOption,
+        value: *const c_void,
+    ) -> GhosttyResult;
+    pub fn ghostty_formatter_get(
+        formatter: GhosttyFormatter,
+        option: GhosttyFormatterOption,
+        out: *mut c_void,
     ) -> GhosttyResult;
     pub fn ghostty_formatter_format_buf(
         formatter: GhosttyFormatter,
@@ -1603,34 +1553,49 @@ unsafe extern "C" {
         event: *mut GhosttyKeyEvent,
     ) -> GhosttyResult;
     pub fn ghostty_key_event_free(event: GhosttyKeyEvent);
-    pub fn ghostty_key_event_set_action(event: GhosttyKeyEvent, action: GhosttyKeyAction);
-    pub fn ghostty_key_event_set_key(event: GhosttyKeyEvent, key: GhosttyKey);
-    pub fn ghostty_key_event_set_mods(event: GhosttyKeyEvent, mods: GhosttyMods);
-    pub fn ghostty_key_event_set_consumed_mods(event: GhosttyKeyEvent, consumed_mods: GhosttyMods);
-    pub fn ghostty_key_event_set_composing(event: GhosttyKeyEvent, composing: bool);
-    pub fn ghostty_key_event_set_utf8(event: GhosttyKeyEvent, utf8: *const c_char, len: usize);
-    pub fn ghostty_key_event_set_unshifted_codepoint(event: GhosttyKeyEvent, codepoint: u32);
+    pub fn ghostty_key_event_set_action(
+        event: GhosttyKeyEvent,
+        action: GhosttyKeyAction,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_event_set_key(event: GhosttyKeyEvent, key: GhosttyKey) -> GhosttyResult;
+    pub fn ghostty_key_event_set_mods(event: GhosttyKeyEvent, mods: GhosttyMods) -> GhosttyResult;
+    pub fn ghostty_key_event_set_consumed_mods(
+        event: GhosttyKeyEvent,
+        consumed_mods: GhosttyMods,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_event_set_composing(
+        event: GhosttyKeyEvent,
+        composing: bool,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_event_set_utf8(
+        event: GhosttyKeyEvent,
+        utf8: GhosttyString,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_event_set_unshifted_codepoint(
+        event: GhosttyKeyEvent,
+        codepoint: u32,
+    ) -> GhosttyResult;
 
     pub fn ghostty_key_encoder_new(
         allocator: *const GhosttyAllocator,
         encoder: *mut GhosttyKeyEncoder,
     ) -> GhosttyResult;
     pub fn ghostty_key_encoder_free(encoder: GhosttyKeyEncoder);
-    pub fn ghostty_key_encoder_setopt(
+    pub fn ghostty_key_encoder_set(
         encoder: GhosttyKeyEncoder,
         option: GhosttyKeyEncoderOption,
         value: *const c_void,
-    );
-    pub fn ghostty_key_encoder_setopt_from_terminal(
+    ) -> GhosttyResult;
+    pub fn ghostty_key_encoder_set_from_terminal(
         encoder: GhosttyKeyEncoder,
         terminal: GhosttyTerminal,
-    );
+    ) -> GhosttyResult;
     pub fn ghostty_key_encoder_encode(
         encoder: GhosttyKeyEncoder,
         event: GhosttyKeyEvent,
-        out_buf: *mut c_char,
-        out_buf_size: usize,
-        out_len: *mut usize,
+        buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 
     // Mouse event & encoder
@@ -1639,36 +1604,45 @@ unsafe extern "C" {
         event: *mut GhosttyMouseEvent,
     ) -> GhosttyResult;
     pub fn ghostty_mouse_event_free(event: GhosttyMouseEvent);
-    pub fn ghostty_mouse_event_set_action(event: GhosttyMouseEvent, action: GhosttyMouseAction);
-    pub fn ghostty_mouse_event_set_button(event: GhosttyMouseEvent, button: GhosttyMouseButton);
-    pub fn ghostty_mouse_event_clear_button(event: GhosttyMouseEvent);
-    pub fn ghostty_mouse_event_set_mods(event: GhosttyMouseEvent, mods: GhosttyMods);
+    pub fn ghostty_mouse_event_set_action(
+        event: GhosttyMouseEvent,
+        action: GhosttyMouseAction,
+    ) -> GhosttyResult;
+    pub fn ghostty_mouse_event_set_button(
+        event: GhosttyMouseEvent,
+        button: GhosttyMouseButton,
+    ) -> GhosttyResult;
+    pub fn ghostty_mouse_event_clear_button(event: GhosttyMouseEvent) -> GhosttyResult;
+    pub fn ghostty_mouse_event_set_mods(
+        event: GhosttyMouseEvent,
+        mods: GhosttyMods,
+    ) -> GhosttyResult;
     pub fn ghostty_mouse_event_set_position(
         event: GhosttyMouseEvent,
         position: GhosttyMousePosition,
-    );
+    ) -> GhosttyResult;
 
     pub fn ghostty_mouse_encoder_new(
         allocator: *const GhosttyAllocator,
         encoder: *mut GhosttyMouseEncoder,
     ) -> GhosttyResult;
     pub fn ghostty_mouse_encoder_free(encoder: GhosttyMouseEncoder);
-    pub fn ghostty_mouse_encoder_setopt(
+    pub fn ghostty_mouse_encoder_set(
         encoder: GhosttyMouseEncoder,
         option: GhosttyMouseEncoderOption,
         value: *const c_void,
-    );
-    pub fn ghostty_mouse_encoder_setopt_from_terminal(
+    ) -> GhosttyResult;
+    pub fn ghostty_mouse_encoder_set_from_terminal(
         encoder: GhosttyMouseEncoder,
         terminal: GhosttyTerminal,
-    );
-    pub fn ghostty_mouse_encoder_reset(encoder: GhosttyMouseEncoder);
+    ) -> GhosttyResult;
+    pub fn ghostty_mouse_encoder_reset(encoder: GhosttyMouseEncoder) -> GhosttyResult;
     pub fn ghostty_mouse_encoder_encode(
         encoder: GhosttyMouseEncoder,
         event: GhosttyMouseEvent,
-        out_buf: *mut c_char,
-        out_buf_size: usize,
-        out_len: *mut usize,
+        buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 
     // Paste & Focus
@@ -1677,13 +1651,13 @@ unsafe extern "C" {
         data: *mut c_char,
         data_len: usize,
         bracketed: bool,
-        buf: *mut c_char,
+        buf: *mut u8,
         buf_len: usize,
         out_written: *mut usize,
     ) -> GhosttyResult;
     pub fn ghostty_focus_encode(
         event: GhosttyFocusEvent,
-        buf: *mut c_char,
+        buf: *mut u8,
         buf_len: usize,
         out_written: *mut usize,
     ) -> GhosttyResult;
@@ -1738,13 +1712,6 @@ unsafe extern "C" {
         terminal: GhosttyTerminal,
         out_selection: *mut GhosttySelection,
     ) -> GhosttyResult;
-    pub fn ghostty_terminal_selection_format_buf(
-        terminal: GhosttyTerminal,
-        options: GhosttyTerminalSelectionFormatOptions,
-        buf: *mut u8,
-        buf_len: usize,
-        out_written: *mut usize,
-    ) -> GhosttyResult;
 
     // Search
     pub fn ghostty_search_new(
@@ -1759,6 +1726,8 @@ unsafe extern "C" {
     ) -> GhosttyResult;
     pub fn ghostty_search_feed(search: GhosttySearch) -> GhosttyResult;
     pub fn ghostty_search_run(search: GhosttySearch) -> GhosttyResult;
+    pub fn ghostty_search_select_next(search: GhosttySearch) -> GhosttyResult;
+    pub fn ghostty_search_select_prev(search: GhosttySearch) -> GhosttyResult;
     pub fn ghostty_search_set(
         search: GhosttySearch,
         option: GhosttySearchOption,

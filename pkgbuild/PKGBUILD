@@ -1,12 +1,12 @@
 pkgname=omarex
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Fast native Wayland GUI client for Rex and T3 Code on Omarchy'
 arch=('x86_64' 'aarch64')
 url='https://github.com/omarex/omarex'
 license=('MIT')
-options=('!lto')
-depends=('ghostty' 'vulkan-icd-loader' 'wayland' 'libxkbcommon' 'fontconfig')
+options=('!lto' '!debug')
+depends=('libghostty-vt>=1.0.2' 'libghostty-vt<2.0' 'vulkan-icd-loader' 'wayland' 'libxkbcommon' 'fontconfig')
 optdepends=(
   'rex: local Rex server daemon'
   'tr3x: T3 Code thread bridge for Rex'

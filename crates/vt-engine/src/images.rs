@@ -21,10 +21,10 @@ pub enum KittyImageLayer {
 }
 
 impl KittyImageLayer {
-    pub(crate) fn from_ffi(raw: ffi::GhosttyRenderStateImageLayer) -> Self {
+    pub(crate) fn from_ffi(raw: ffi::GhosttyImageLayer) -> Self {
         match raw {
-            ffi::GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_BACKGROUND => Self::BelowBackground,
-            ffi::GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_TEXT => Self::BelowText,
+            ffi::GHOSTTY_IMAGE_LAYER_BELOW_BACKGROUND => Self::BelowBackground,
+            ffi::GHOSTTY_IMAGE_LAYER_BELOW_TEXT => Self::BelowText,
             _ => Self::AboveText,
         }
     }
@@ -154,7 +154,7 @@ pub(crate) unsafe fn collect_render_state_placements(
     while unsafe { ffi::ghostty_render_state_image_iterator_next(iter) } {
         let mut image_id: u32 = 0;
         let mut generation: u64 = 0;
-        let mut layer: ffi::GhosttyRenderStateImageLayer = 0;
+        let mut layer: ffi::GhosttyImageLayer = 0;
         let mut z_index: i32 = 0;
         let mut viewport_col: i32 = 0;
         let mut viewport_row: i32 = 0;
@@ -284,15 +284,17 @@ pub fn read_kitty_image(
     let mut height: u32 = 0;
     let mut format: ffi::GhosttyKittyImageFormat = ffi::GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
     let mut generation: u64 = 0;
-    let mut data_ptr: *const u8 = ptr::null();
-    let mut data_len: usize = 0;
+    let mut pixels = ffi::GhosttyString {
+        ptr: ptr::null(),
+        len: 0,
+    };
 
     // SAFETY: Output pointers match `kitty_graphics.h` types while `guard` holds the lock.
     unsafe {
         let rc = ffi::ghostty_kitty_graphics_image_get(
             image,
-            ffi::GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR,
-            (&raw mut data_ptr).cast(),
+            ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS,
+            (&raw mut pixels).cast(),
         );
         if rc == ffi::GHOSTTY_NO_VALUE {
             // Image metadata is present (e.g. snapshot READY) but pixels are still pending.
@@ -304,24 +306,20 @@ pub fn read_kitty_image(
 
         for (key, out) in [
             (
-                ffi::GHOSTTY_KITTY_IMAGE_DATA_WIDTH,
+                ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH,
                 (&raw mut width).cast::<c_void>(),
             ),
             (
-                ffi::GHOSTTY_KITTY_IMAGE_DATA_HEIGHT,
+                ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT,
                 (&raw mut height).cast::<c_void>(),
             ),
             (
-                ffi::GHOSTTY_KITTY_IMAGE_DATA_FORMAT,
+                ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT,
                 (&raw mut format).cast::<c_void>(),
             ),
             (
-                ffi::GHOSTTY_KITTY_IMAGE_DATA_GENERATION,
+                ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION,
                 (&raw mut generation).cast::<c_void>(),
-            ),
-            (
-                ffi::GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN,
-                (&raw mut data_len).cast::<c_void>(),
             ),
         ] {
             let r = ffi::ghostty_kitty_graphics_image_get(image, key, out);
@@ -331,12 +329,12 @@ pub fn read_kitty_image(
         }
     }
 
-    if data_ptr.is_null() || data_len == 0 || width == 0 || height == 0 {
+    if pixels.ptr.is_null() || pixels.len == 0 || width == 0 || height == 0 {
         return Ok(None);
     }
 
-    // SAFETY: `data_ptr` is valid for `data_len` bytes while `guard` holds the terminal lock.
-    let raw = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    // SAFETY: `pixels.ptr` is valid for `pixels.len` bytes while `guard` holds the terminal lock.
+    let raw = unsafe { std::slice::from_raw_parts(pixels.ptr, pixels.len) };
 
     let (source_format, rgba8) = match format {
         ffi::GHOSTTY_KITTY_IMAGE_FORMAT_RGBA => (KittyPixelFormat::Rgba, raw.to_vec()),

@@ -1,4 +1,4 @@
-//! Safe, zero-overhead Rust wrapper around Ghostty's `libghostty-vt` C ABI (`ghostty 1.4.0-1`).
+//! Safe, zero-overhead Rust wrapper around Ghostty's `libghostty-vt` 1.0 C ABI (`GHOSTTY_VT_1.0`).
 //!
 //! Designed for `omarex`'s two-phase lock-minimal GPU rendering architecture:
 //! - [`Terminal`] wraps `GhosttyTerminal` behind a short `parking_lot::Mutex` with process-global
@@ -51,11 +51,6 @@ pub const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_UNKNOWN_MAX_BYTES: usize = 64 * 1024;
 /// Safety timeout for DEC 2026 synchronized output (`RENDER_HOLD`), matching Ghostty/Rex.
 pub const RENDER_HOLD_SAFETY_TIMEOUT: Duration = Duration::from_millis(1000);
-
-/// `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE` from `/usr/include/ghostty/vt/terminal.h`.
-const GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE: ffi::GhosttyTerminalOption = 16;
-/// `GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE` from `/usr/include/ghostty/vt/terminal.h`.
-const GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE: ffi::GhosttyTerminalData = 27;
 
 #[derive(Debug, Error)]
 pub enum VtError {
@@ -722,29 +717,51 @@ fn query_initial_scroll_region(raw: ffi::GhosttyTerminal) -> Option<(u16, u16)> 
         ffi::ghostty_terminal_grid_ref(raw, ffi::GhosttyPoint::active(0, 0), &raw mut cell_ref)
     } == ffi::GHOSTTY_SUCCESS;
     let one_cell_sel = ffi::GhosttySelection {
-        size: std::mem::size_of::<ffi::GhosttySelection>(),
         start: cell_ref,
         end: cell_ref,
         rectangle: false,
     };
 
-    let mut opts = ffi::GhosttyFormatterTerminalOptions {
-        emit: ffi::GHOSTTY_FORMATTER_FORMAT_VT,
-        trim: true,
-        selection: if have_ref {
-            &raw const one_cell_sel
-        } else {
-            ptr::null()
-        },
-        ..Default::default()
-    };
-    opts.extra.scrolling_region = true;
-
     let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
-    // SAFETY: `raw` is live and locked; `opts` has initialized `.size` fields.
-    let rc =
-        unsafe { ffi::ghostty_formatter_terminal_new(ptr::null(), &raw mut formatter, raw, opts) };
+    // SAFETY: `raw` is live and locked.
+    let rc = unsafe { ffi::ghostty_formatter_terminal_new(ptr::null(), &raw mut formatter, raw) };
     if rc != ffi::GHOSTTY_SUCCESS || formatter.is_null() {
+        return None;
+    }
+
+    let emit = ffi::GHOSTTY_FORMATTER_FORMAT_VT;
+    let trim = true;
+    let extras = ffi::GHOSTTY_FORMATTER_EXTRA_SCROLLING_REGION;
+    // SAFETY: Option pointers match documented types in `formatter.h`.
+    let opts_ok = unsafe {
+        let ok_emit = ffi::ghostty_formatter_set(
+            formatter,
+            ffi::GHOSTTY_FORMATTER_OPT_EMIT,
+            (&raw const emit).cast(),
+        ) == ffi::GHOSTTY_SUCCESS;
+        let ok_trim = ffi::ghostty_formatter_set(
+            formatter,
+            ffi::GHOSTTY_FORMATTER_OPT_TRIM,
+            (&raw const trim).cast(),
+        ) == ffi::GHOSTTY_SUCCESS;
+        let ok_extras = ffi::ghostty_formatter_set(
+            formatter,
+            ffi::GHOSTTY_FORMATTER_OPT_EXTRAS,
+            (&raw const extras).cast(),
+        ) == ffi::GHOSTTY_SUCCESS;
+        let ok_sel = if have_ref {
+            ffi::ghostty_formatter_set(
+                formatter,
+                ffi::GHOSTTY_FORMATTER_OPT_SELECTION,
+                (&raw const one_cell_sel).cast(),
+            ) == ffi::GHOSTTY_SUCCESS
+        } else {
+            true
+        };
+        ok_emit && ok_trim && ok_extras && ok_sel
+    };
+    if !opts_ok {
+        unsafe { ffi::ghostty_formatter_free(formatter) };
         return None;
     }
 
@@ -1188,7 +1205,7 @@ impl Terminal {
             let medium_file = config.kitty_image_medium_file;
             let _ = ffi::ghostty_terminal_set(
                 raw,
-                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
+                ffi::GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
                 (&raw const medium_file).cast(),
             );
 
@@ -1288,7 +1305,7 @@ impl Terminal {
         let rc = unsafe {
             ffi::ghostty_terminal_set(
                 guard.raw,
-                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
+                ffi::GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
                 (&raw const enabled).cast(),
             )
         };
@@ -1306,7 +1323,7 @@ impl Terminal {
         let rc = unsafe {
             ffi::ghostty_terminal_get(
                 guard.raw,
-                GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE,
+                ffi::GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE,
                 (&raw mut enabled).cast(),
             )
         };
@@ -1497,7 +1514,7 @@ impl Terminal {
             },
         };
         // SAFETY: `guard.raw` is locked.
-        unsafe { ffi::ghostty_terminal_scroll_viewport(guard.raw, behavior) };
+        let _ = unsafe { ffi::ghostty_terminal_scroll_viewport(guard.raw, behavior) };
     }
 
     pub fn scrollbar(&self) -> Result<Scrollbar, VtError> {
@@ -2158,11 +2175,11 @@ impl RenderState {
                 above: overscan.above,
                 below: overscan.below,
             };
-            // SAFETY: `raw_os` matches `GHOSTTY_RENDER_STATE_OPTION_OVERSCAN`.
+            // SAFETY: `raw_os` matches `GHOSTTY_RENDER_STATE_OPT_OVERSCAN`.
             let rc = unsafe {
                 ffi::ghostty_render_state_set(
                     self.raw,
-                    ffi::GHOSTTY_RENDER_STATE_OPTION_OVERSCAN,
+                    ffi::GHOSTTY_RENDER_STATE_OPT_OVERSCAN,
                     (&raw const raw_os).cast(),
                 )
             };
@@ -2315,11 +2332,9 @@ impl RenderState {
             blinking: raw_cursor.blinking,
             password_input: raw_cursor.password_input,
             style: match raw_cursor.visual_style {
-                ffi::GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR => CursorStyle::Bar,
-                ffi::GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE => CursorStyle::Underline,
-                ffi::GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW => {
-                    CursorStyle::BlockHollow
-                }
+                ffi::GHOSTTY_CURSOR_STYLE_BAR => CursorStyle::Bar,
+                ffi::GHOSTTY_CURSOR_STYLE_UNDERLINE => CursorStyle::Underline,
+                ffi::GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW => CursorStyle::BlockHollow,
                 _ => CursorStyle::Block,
             },
             viewport_pos: raw_cursor
@@ -2767,7 +2782,7 @@ impl RenderState {
 }
 
 fn resolve_style_color(sc: &ffi::GhosttyStyleColor, palette: &[Rgb; 256]) -> Option<Rgb> {
-    match sc.tag {
+    match i32::from(sc.tag) {
         ffi::GHOSTTY_STYLE_COLOR_PALETTE => {
             // SAFETY: `tag == PALETTE` selects `palette` arm.
             let idx = unsafe { sc.value.palette };
@@ -2784,32 +2799,35 @@ fn resolve_style_color(sc: &ffi::GhosttyStyleColor, palette: &[Rgb; 256]) -> Opt
 
 fn resolve_style(s: &ffi::GhosttyStyle, palette: &[Rgb; 256]) -> ResolvedStyle {
     let mut bits: u16 = 0;
-    if s.bold {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_BOLD) != 0 {
         bits |= CellFlags::BOLD.0;
     }
-    if s.italic {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_ITALIC) != 0 {
         bits |= CellFlags::ITALIC.0;
     }
-    if s.faint {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_FAINT) != 0 {
         bits |= CellFlags::FAINT.0;
     }
-    if s.blink {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_BLINK) != 0 {
         bits |= CellFlags::BLINK.0;
     }
-    if s.inverse {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_INVERSE) != 0 {
         bits |= CellFlags::INVERSE.0;
     }
-    if s.invisible {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_INVISIBLE) != 0 {
         bits |= CellFlags::INVISIBLE.0;
     }
-    if s.strikethrough {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_STRIKETHROUGH) != 0 {
         bits |= CellFlags::STRIKETHROUGH.0;
     }
-    if s.overline {
+    if (s.flags & ffi::GHOSTTY_STYLE_FLAG_OVERLINE) != 0 {
         bits |= CellFlags::OVERLINE.0;
     }
 
-    let underline = match s.underline {
+    let underline_raw =
+        ((s.flags & ffi::GHOSTTY_STYLE_UNDERLINE_MASK) >> ffi::GHOSTTY_STYLE_UNDERLINE_SHIFT)
+            as ffi::GhosttySgrUnderline;
+    let underline = match underline_raw {
         ffi::GHOSTTY_SGR_UNDERLINE_SINGLE => UnderlineStyle::Single,
         ffi::GHOSTTY_SGR_UNDERLINE_DOUBLE => UnderlineStyle::Double,
         ffi::GHOSTTY_SGR_UNDERLINE_CURLY => UnderlineStyle::Curly,
@@ -2862,63 +2880,163 @@ mod tests {
             serde_json::from_str(manifest_str).expect("manifest JSON must parse");
         let types = manifest["types"].as_object().expect("types map");
 
-        // Verify key C struct sizes against the live linked library's manifest.
-        let check_size = |name: &str, rust_size: usize| {
-            let expected = types[name]["size"]
+        // Verify every bound C struct size and alignment against the live linked library's manifest.
+        let check_layout = |name: &str, rust_size: usize, rust_align: usize| {
+            let expected_size = types[name]["size"]
                 .as_u64()
                 .unwrap_or_else(|| panic!("missing size for {name}"))
                 as usize;
-            assert_eq!(rust_size, expected, "ABI size mismatch for {name}");
+            let expected_align = types[name]["align"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("missing align for {name}"))
+                as usize;
+            assert_eq!(rust_size, expected_size, "ABI size mismatch for {name}");
+            assert_eq!(rust_align, expected_align, "ABI align mismatch for {name}");
+        };
+        let check_enum = |enum_name: &str, member: &str, rust_val: i32| {
+            let expected = types[enum_name]["values"][member]
+                .as_i64()
+                .unwrap_or_else(|| panic!("missing enum {enum_name}.{member}"));
+            assert_eq!(
+                i64::from(rust_val),
+                expected,
+                "ABI enum discriminant mismatch for {enum_name}.{member}"
+            );
         };
 
-        check_size("GhosttyCell", std::mem::size_of::<ffi::GhosttyCell>());
-        check_size("GhosttyStyle", std::mem::size_of::<ffi::GhosttyStyle>());
-        check_size(
+        check_layout(
+            "GhosttyAllocatorVtable",
+            std::mem::size_of::<ffi::GhosttyAllocatorVtable>(),
+            std::mem::align_of::<ffi::GhosttyAllocatorVtable>(),
+        );
+        check_layout(
+            "GhosttyCell",
+            std::mem::size_of::<ffi::GhosttyCell>(),
+            std::mem::align_of::<ffi::GhosttyCell>(),
+        );
+        check_layout(
+            "GhosttyStyle",
+            std::mem::size_of::<ffi::GhosttyStyle>(),
+            std::mem::align_of::<ffi::GhosttyStyle>(),
+        );
+        check_layout(
             "GhosttyStyleColor",
             std::mem::size_of::<ffi::GhosttyStyleColor>(),
+            std::mem::align_of::<ffi::GhosttyStyleColor>(),
         );
-        check_size("GhosttyPoint", std::mem::size_of::<ffi::GhosttyPoint>());
-        check_size("GhosttyGridRef", std::mem::size_of::<ffi::GhosttyGridRef>());
-        check_size(
+        check_layout(
+            "GhosttyPoint",
+            std::mem::size_of::<ffi::GhosttyPoint>(),
+            std::mem::align_of::<ffi::GhosttyPoint>(),
+        );
+        check_layout(
+            "GhosttyGridRef",
+            std::mem::size_of::<ffi::GhosttyGridRef>(),
+            std::mem::align_of::<ffi::GhosttyGridRef>(),
+        );
+        check_layout(
             "GhosttySelection",
             std::mem::size_of::<ffi::GhosttySelection>(),
+            std::mem::align_of::<ffi::GhosttySelection>(),
         );
-        check_size(
+        check_layout(
+            "GhosttySelectionBuffer",
+            std::mem::size_of::<ffi::GhosttySelectionBuffer>(),
+            std::mem::align_of::<ffi::GhosttySelectionBuffer>(),
+        );
+        check_layout(
+            "GhosttyTerminalSelectWordOptions",
+            std::mem::size_of::<ffi::GhosttyTerminalSelectWordOptions>(),
+            std::mem::align_of::<ffi::GhosttyTerminalSelectWordOptions>(),
+        );
+        check_layout(
+            "GhosttyTerminalSelectLineOptions",
+            std::mem::size_of::<ffi::GhosttyTerminalSelectLineOptions>(),
+            std::mem::align_of::<ffi::GhosttyTerminalSelectLineOptions>(),
+        );
+        check_layout(
             "GhosttyRenderStateColors",
             std::mem::size_of::<ffi::GhosttyRenderStateColors>(),
+            std::mem::align_of::<ffi::GhosttyRenderStateColors>(),
         );
-        check_size(
+        check_layout(
             "GhosttyRenderStateCursor",
             std::mem::size_of::<ffi::GhosttyRenderStateCursor>(),
+            std::mem::align_of::<ffi::GhosttyRenderStateCursor>(),
         );
-        check_size(
+        check_layout(
             "GhosttyRenderStateRowId",
             std::mem::size_of::<ffi::GhosttyRenderStateRowId>(),
+            std::mem::align_of::<ffi::GhosttyRenderStateRowId>(),
         );
-        check_size(
+        check_layout(
             "GhosttyRenderStateRowSelection",
             std::mem::size_of::<ffi::GhosttyRenderStateRowSelection>(),
+            std::mem::align_of::<ffi::GhosttyRenderStateRowSelection>(),
         );
-        check_size(
+        check_layout(
             "GhosttyTerminalScrollbar",
             std::mem::size_of::<ffi::GhosttyTerminalScrollbar>(),
+            std::mem::align_of::<ffi::GhosttyTerminalScrollbar>(),
         );
-        check_size(
+        check_layout(
             "GhosttyTerminalScrollViewport",
             std::mem::size_of::<ffi::GhosttyTerminalScrollViewport>(),
+            std::mem::align_of::<ffi::GhosttyTerminalScrollViewport>(),
         );
-        check_size(
+        check_layout(
             "GhosttyTerminalUnknownSequence",
             std::mem::size_of::<ffi::GhosttyTerminalUnknownSequence>(),
+            std::mem::align_of::<ffi::GhosttyTerminalUnknownSequence>(),
         );
-        check_size(
+        check_layout(
+            "GhosttyClipboardWrite",
+            std::mem::size_of::<ffi::GhosttyClipboardWrite>(),
+            std::mem::align_of::<ffi::GhosttyClipboardWrite>(),
+        );
+        check_layout(
+            "GhosttyClipboardWriteReply",
+            std::mem::size_of::<ffi::GhosttyClipboardWriteReply>(),
+            std::mem::align_of::<ffi::GhosttyClipboardWriteReply>(),
+        );
+        check_layout(
+            "GhosttyTerminalDesktopNotification",
+            std::mem::size_of::<ffi::GhosttyTerminalDesktopNotification>(),
+            std::mem::align_of::<ffi::GhosttyTerminalDesktopNotification>(),
+        );
+        check_layout(
+            "GhosttyTerminalProgressReport",
+            std::mem::size_of::<ffi::GhosttyTerminalProgressReport>(),
+            std::mem::align_of::<ffi::GhosttyTerminalProgressReport>(),
+        );
+        check_layout(
+            "GhosttyTerminalProgramStatus",
+            std::mem::size_of::<ffi::GhosttyTerminalProgramStatus>(),
+            std::mem::align_of::<ffi::GhosttyTerminalProgramStatus>(),
+        );
+        check_layout(
             "GhosttySysImage",
             std::mem::size_of::<ffi::GhosttySysImage>(),
+            std::mem::align_of::<ffi::GhosttySysImage>(),
         );
-        check_size(
+        check_layout(
             "GhosttyMouseEncoderSize",
             std::mem::size_of::<ffi::GhosttyMouseEncoderSize>(),
+            std::mem::align_of::<ffi::GhosttyMouseEncoderSize>(),
         );
+
+        // Verify GhosttyStyleFlags packed bit positions.
+        let style_bits = &types["GhosttyStyleFlags"]["bits"];
+        assert_eq!(style_bits["bold"]["lsb"].as_u64(), Some(0));
+        assert_eq!(style_bits["italic"]["lsb"].as_u64(), Some(1));
+        assert_eq!(style_bits["faint"]["lsb"].as_u64(), Some(2));
+        assert_eq!(style_bits["blink"]["lsb"].as_u64(), Some(3));
+        assert_eq!(style_bits["inverse"]["lsb"].as_u64(), Some(4));
+        assert_eq!(style_bits["invisible"]["lsb"].as_u64(), Some(5));
+        assert_eq!(style_bits["strikethrough"]["lsb"].as_u64(), Some(6));
+        assert_eq!(style_bits["overline"]["lsb"].as_u64(), Some(7));
+        assert_eq!(style_bits["underline"]["lsb"].as_u64(), Some(8));
+        assert_eq!(style_bits["underline"]["width"].as_u64(), Some(3));
 
         // Verify GhosttyCell packed bit positions match our fast-path bitfield decoder.
         let cell_bits = &types["GhosttyCell"]["bits"];
@@ -2933,6 +3051,63 @@ mod tests {
         assert_eq!(cell_bits["protected"]["lsb"].as_u64(), Some(44));
         assert_eq!(cell_bits["hyperlink"]["lsb"].as_u64(), Some(45));
         assert_eq!(cell_bits["semantic_content"]["lsb"].as_u64(), Some(46));
+
+        // Verify all key option & data enum discriminants against the linked library's manifest.
+        check_enum("GhosttySysOption", "USERDATA", ffi::GHOSTTY_SYS_OPT_USERDATA);
+        check_enum("GhosttySysOption", "DECODE_PNG", ffi::GHOSTTY_SYS_OPT_DECODE_PNG);
+        check_enum("GhosttySysOption", "LOG", ffi::GHOSTTY_SYS_OPT_LOG);
+        check_enum("GhosttyFormatterOption", "EMIT", ffi::GHOSTTY_FORMATTER_OPT_EMIT);
+        check_enum("GhosttyFormatterOption", "UNWRAP", ffi::GHOSTTY_FORMATTER_OPT_UNWRAP);
+        check_enum("GhosttyFormatterOption", "TRIM", ffi::GHOSTTY_FORMATTER_OPT_TRIM);
+        check_enum("GhosttyFormatterOption", "SELECTION", ffi::GHOSTTY_FORMATTER_OPT_SELECTION);
+        check_enum("GhosttyFormatterOption", "EXTRAS", ffi::GHOSTTY_FORMATTER_OPT_EXTRAS);
+        check_enum("GhosttyTerminalOption", "USERDATA", ffi::GHOSTTY_TERMINAL_OPT_USERDATA);
+        check_enum("GhosttyTerminalOption", "WRITE_PTY", ffi::GHOSTTY_TERMINAL_OPT_WRITE_PTY);
+        check_enum("GhosttyTerminalOption", "BELL", ffi::GHOSTTY_TERMINAL_OPT_BELL);
+        check_enum("GhosttyTerminalOption", "TITLE_CHANGED", ffi::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED);
+        check_enum("GhosttyTerminalOption", "COLOR_SCHEME", ffi::GHOSTTY_TERMINAL_OPT_COLOR_SCHEME);
+        check_enum("GhosttyTerminalOption", "COLOR_FOREGROUND", ffi::GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND);
+        check_enum("GhosttyTerminalOption", "COLOR_BACKGROUND", ffi::GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND);
+        check_enum("GhosttyTerminalOption", "COLOR_CURSOR", ffi::GHOSTTY_TERMINAL_OPT_COLOR_CURSOR);
+        check_enum("GhosttyTerminalOption", "COLOR_PALETTE", ffi::GHOSTTY_TERMINAL_OPT_COLOR_PALETTE);
+        check_enum("GhosttyTerminalOption", "KITTY_IMAGE_STORAGE_LIMIT", ffi::GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT);
+        check_enum("GhosttyTerminalOption", "KITTY_IMAGE_MEDIUM_FILE", ffi::GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE);
+        check_enum("GhosttyTerminalOption", "SELECTION", ffi::GHOSTTY_TERMINAL_OPT_SELECTION);
+        check_enum("GhosttyTerminalOption", "PWD_CHANGED", ffi::GHOSTTY_TERMINAL_OPT_PWD_CHANGED);
+        check_enum("GhosttyTerminalOption", "CLIPBOARD_WRITE", ffi::GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE);
+        check_enum("GhosttyTerminalOption", "SCROLLBACK_MAX_BYTES", ffi::GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES);
+        check_enum("GhosttyTerminalOption", "DESKTOP_NOTIFICATION", ffi::GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION);
+        check_enum("GhosttyTerminalOption", "PROGRESS_REPORT", ffi::GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT);
+        check_enum("GhosttyTerminalOption", "MODE", ffi::GHOSTTY_TERMINAL_OPT_MODE);
+        check_enum("GhosttyTerminalOption", "UNKNOWN_SEQUENCE", ffi::GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE);
+        check_enum("GhosttyTerminalOption", "UNKNOWN_MAX_BYTES", ffi::GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES);
+        check_enum("GhosttyTerminalOption", "RENDER_HOLD", ffi::GHOSTTY_TERMINAL_OPT_RENDER_HOLD);
+        check_enum("GhosttyTerminalOption", "PROGRAM_STATUS", ffi::GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS);
+        check_enum("GhosttyTerminalData", "KITTY_IMAGE_MEDIUM_FILE", ffi::GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE);
+        check_enum("GhosttyTerminalData", "KITTY_GRAPHICS", ffi::GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS);
+        check_enum("GhosttyTerminalData", "SELECTION", ffi::GHOSTTY_TERMINAL_DATA_SELECTION);
+        check_enum("GhosttyTerminalData", "MODE", ffi::GHOSTTY_TERMINAL_DATA_MODE);
+        check_enum("GhosttyTerminalData", "MOUSE_SHAPE", ffi::GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE);
+        check_enum("GhosttyRenderStateOption", "DIRTY", ffi::GHOSTTY_RENDER_STATE_OPT_DIRTY);
+        check_enum("GhosttyRenderStateOption", "OVERSCAN", ffi::GHOSTTY_RENDER_STATE_OPT_OVERSCAN);
+        check_enum("GhosttySnapshotDecoderOption", "COMPRESS_HISTORY", ffi::GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY);
+        check_enum("GhosttySnapshotDecoderOption", "KITTY_IMAGE_STORAGE_LIMIT", ffi::GHOSTTY_SNAPSHOT_DECODER_OPT_KITTY_IMAGE_STORAGE_LIMIT);
+        check_enum("GhosttyKittyGraphicsImageData", "PIXELS", ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS);
+        check_enum("GhosttyKittyGraphicsImageData", "GENERATION", ffi::GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION);
+        check_enum("GhosttyKeyEncoderOption", "CURSOR_KEY_APPLICATION", ffi::GHOSTTY_KEY_ENCODER_OPT_CURSOR_KEY_APPLICATION);
+        check_enum("GhosttyKeyEncoderOption", "KITTY_FLAGS", ffi::GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS);
+        check_enum("GhosttyKeyEncoderOption", "BACKARROW_KEY_MODE", ffi::GHOSTTY_KEY_ENCODER_OPT_BACKARROW_KEY_MODE);
+        check_enum("GhosttyMouseEncoderOption", "EVENT", ffi::GHOSTTY_MOUSE_ENCODER_OPT_EVENT);
+        check_enum("GhosttyMouseEncoderOption", "FORMAT", ffi::GHOSTTY_MOUSE_ENCODER_OPT_FORMAT);
+        check_enum("GhosttyMouseEncoderOption", "SIZE", ffi::GHOSTTY_MOUSE_ENCODER_OPT_SIZE);
+        check_enum("GhosttyMouseEncoderOption", "TRACK_LAST_CELL", ffi::GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL);
+        check_enum("GhosttySelectionGestureData", "AUTOSCROLL", ffi::GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL);
+        check_enum("GhosttySelectionGestureEventOption", "REF", ffi::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF);
+        check_enum("GhosttySelectionGestureEventOption", "VIEWPORT", ffi::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT);
+        check_enum("GhosttySearchData", "STATUS", ffi::GHOSTTY_SEARCH_DATA_STATUS);
+        check_enum("GhosttySearchData", "VIEWPORT_MATCHES", ffi::GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES);
+        check_enum("GhosttySearchOption", "NEEDLE", ffi::GHOSTTY_SEARCH_OPT_NEEDLE);
+        check_enum("GhosttySearchOption", "SELECT_SCROLL", ffi::GHOSTTY_SEARCH_OPT_SELECT_SCROLL);
 
         // Verify GhosttyKey enum discriminants for PhysicalKey.
         let key_vals = types["GhosttyKey"]["values"]

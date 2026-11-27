@@ -526,52 +526,23 @@ pub fn selection_text(
     trim: bool,
 ) -> Result<Option<String>, VtError> {
     let guard = terminal.inner.lock();
-    let opts = ffi::GhosttyTerminalSelectionFormatOptions {
-        size: std::mem::size_of::<ffi::GhosttyTerminalSelectionFormatOptions>(),
-        emit: ffi::GHOSTTY_FORMATTER_FORMAT_PLAIN,
-        unwrap,
-        trim,
-        selection: ptr::null(),
-    };
-
-    let mut required: usize = 0;
-    // SAFETY: Passing NULL `buf` queries exact byte length or returns `GHOSTTY_NO_VALUE`.
+    let mut sel = ffi::GhosttySelection::default();
+    // SAFETY: `guard.raw` is locked; `sel` receives an untracked snapshot of the active selection.
     let rc = unsafe {
-        ffi::ghostty_terminal_selection_format_buf(
+        ffi::ghostty_terminal_get(
             guard.raw,
-            opts,
-            ptr::null_mut(),
-            0,
-            &raw mut required,
+            ffi::GHOSTTY_TERMINAL_DATA_SELECTION,
+            (&raw mut sel).cast(),
         )
     };
     if rc == ffi::GHOSTTY_NO_VALUE {
         return Ok(None);
     }
-    if rc != ffi::GHOSTTY_SUCCESS && rc != ffi::GHOSTTY_OUT_OF_SPACE {
+    if rc != ffi::GHOSTTY_SUCCESS {
         return Err(VtError::Ffi(rc));
     }
-    if required == 0 {
-        return Ok(Some(String::new()));
-    }
-
-    let mut buf = vec![0u8; required];
-    let mut written: usize = 0;
-    // SAFETY: `buf` has exact capacity `required` while `guard` holds the terminal lock.
-    let rc2 = unsafe {
-        ffi::ghostty_terminal_selection_format_buf(
-            guard.raw,
-            opts,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut written,
-        )
-    };
-    if rc2 != ffi::GHOSTTY_SUCCESS {
-        return Err(VtError::Ffi(rc2));
-    }
-    buf.truncate(written);
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    let text = format_explicit_selection(guard.raw, &sel, unwrap, trim)?;
+    Ok(Some(text))
 }
 
 /// Selects the word under viewport cell `(col, row)` and installs it as active selection.
@@ -809,7 +780,6 @@ pub fn select_range(
     }
 
     let sel = ffi::GhosttySelection {
-        size: std::mem::size_of::<ffi::GhosttySelection>(),
         start: ref0,
         end: ref1,
         rectangle,
@@ -852,7 +822,6 @@ fn read_screen_row_cells(
         return Ok(Vec::new());
     }
     let sel = ffi::GhosttySelection {
-        size: std::mem::size_of::<ffi::GhosttySelection>(),
         start: ref0,
         end: ref1,
         rectangle: true,
@@ -1112,6 +1081,15 @@ pub fn hyperlink_at(terminal: &Terminal, col: u16, row: u32) -> Result<Option<St
     }
 }
 
+struct FormatterGuard(ffi::GhosttyFormatter);
+
+impl Drop for FormatterGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was created by `ghostty_formatter_terminal_new` and is freed once.
+        unsafe { ffi::ghostty_formatter_free(self.0) };
+    }
+}
+
 /// Formats an explicit `GhosttySelection` without mutating the terminal's active selection.
 fn format_explicit_selection(
     raw: ffi::GhosttyTerminal,
@@ -1119,43 +1097,78 @@ fn format_explicit_selection(
     unwrap: bool,
     trim: bool,
 ) -> Result<String, VtError> {
-    let opts = ffi::GhosttyTerminalSelectionFormatOptions {
-        size: std::mem::size_of::<ffi::GhosttyTerminalSelectionFormatOptions>(),
-        emit: ffi::GHOSTTY_FORMATTER_FORMAT_PLAIN,
-        unwrap,
-        trim,
-        selection: sel as *const ffi::GhosttySelection,
-    };
-
-    let mut required: usize = 0;
-    // SAFETY: Caller holds `terminal.inner` lock; `sel` lives across both calls.
-    let rc = unsafe {
-        ffi::ghostty_terminal_selection_format_buf(raw, opts, ptr::null_mut(), 0, &raw mut required)
-    };
-    if rc == ffi::GHOSTTY_NO_VALUE || required == 0 {
-        return Ok(String::new());
-    }
-    if rc != ffi::GHOSTTY_SUCCESS && rc != ffi::GHOSTTY_OUT_OF_SPACE {
+    let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
+    // SAFETY: Caller holds `terminal.inner` lock; `raw` outlives `formatter`.
+    let rc = unsafe { ffi::ghostty_formatter_terminal_new(ptr::null(), &raw mut formatter, raw) };
+    if rc != ffi::GHOSTTY_SUCCESS || formatter.is_null() {
         return Err(VtError::Ffi(rc));
     }
+    let _guard = FormatterGuard(formatter);
 
-    let mut buf = vec![0u8; required];
+    let emit = ffi::GHOSTTY_FORMATTER_FORMAT_PLAIN;
+    // SAFETY: Each value pointer matches its documented `GhosttyFormatterOption` type (`formatter.h`).
+    unsafe {
+        for (opt, val) in [
+            (
+                ffi::GHOSTTY_FORMATTER_OPT_EMIT,
+                (&raw const emit).cast::<std::ffi::c_void>(),
+            ),
+            (
+                ffi::GHOSTTY_FORMATTER_OPT_UNWRAP,
+                (&raw const unwrap).cast::<std::ffi::c_void>(),
+            ),
+            (
+                ffi::GHOSTTY_FORMATTER_OPT_TRIM,
+                (&raw const trim).cast::<std::ffi::c_void>(),
+            ),
+            (
+                ffi::GHOSTTY_FORMATTER_OPT_SELECTION,
+                (sel as *const ffi::GhosttySelection).cast::<std::ffi::c_void>(),
+            ),
+        ] {
+            let rc_opt = ffi::ghostty_formatter_set(formatter, opt, val);
+            if rc_opt != ffi::GHOSTTY_SUCCESS {
+                return Err(VtError::Ffi(rc_opt));
+            }
+        }
+    }
+
+    let mut stack_buf = [0u8; 512];
     let mut written: usize = 0;
-    // SAFETY: `buf` has exact required length.
-    let rc2 = unsafe {
-        ffi::ghostty_terminal_selection_format_buf(
-            raw,
-            opts,
-            buf.as_mut_ptr(),
-            buf.len(),
+    // SAFETY: `formatter` is valid and `raw` remains locked across formatting.
+    let rc_fmt = unsafe {
+        ffi::ghostty_formatter_format_buf(
+            formatter,
+            stack_buf.as_mut_ptr(),
+            stack_buf.len(),
             &raw mut written,
         )
     };
-    if rc2 != ffi::GHOSTTY_SUCCESS {
-        return Err(VtError::Ffi(rc2));
+    match rc_fmt {
+        ffi::GHOSTTY_SUCCESS => Ok(String::from_utf8_lossy(&stack_buf[..written]).into_owned()),
+        ffi::GHOSTTY_OUT_OF_SPACE => {
+            if written == 0 {
+                return Ok(String::new());
+            }
+            let mut buf = vec![0u8; written];
+            let mut actual: usize = 0;
+            // SAFETY: `buf` has exact required length `written` while terminal lock is held.
+            let rc2 = unsafe {
+                ffi::ghostty_formatter_format_buf(
+                    formatter,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &raw mut actual,
+                )
+            };
+            if rc2 != ffi::GHOSTTY_SUCCESS {
+                return Err(VtError::Ffi(rc2));
+            }
+            buf.truncate(actual);
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        }
+        other => Err(VtError::Ffi(other)),
     }
-    buf.truncate(written);
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Returns viewport-relative `(row, start_col..end_col)` spans for the active terminal selection.
@@ -1347,7 +1360,6 @@ pub fn logical_line_at(
     }
 
     let prefix_sel = ffi::GhosttySelection {
-        size: std::mem::size_of::<ffi::GhosttySelection>(),
         start: line_sel.start,
         end: hover_ref,
         rectangle: false,
@@ -1539,7 +1551,6 @@ fn read_viewport_row(
     }
 
     let row_sel = ffi::GhosttySelection {
-        size: std::mem::size_of::<ffi::GhosttySelection>(),
         start: ref0,
         end: ref1,
         rectangle: true,
@@ -1997,7 +2008,6 @@ pub fn viewport_row_span_is_blank(
     }
 
     let span_sel = ffi::GhosttySelection {
-        size: std::mem::size_of::<ffi::GhosttySelection>(),
         start: ref0,
         end: ref1,
         rectangle: true,
@@ -2168,10 +2178,8 @@ impl TerminalSearch {
             return Err(VtError::TerminalDropped);
         };
         let _guard = arc.lock();
-        // SAFETY: `OPT_SELECT_NEXT` requires NULL value and serialized terminal access.
-        let rc = unsafe {
-            ffi::ghostty_search_set(self.raw, ffi::GHOSTTY_SEARCH_OPT_SELECT_NEXT, ptr::null())
-        };
+        // SAFETY: Terminal lock is held across `ghostty_search_select_next`.
+        let rc = unsafe { ffi::ghostty_search_select_next(self.raw) };
         match rc {
             ffi::GHOSTTY_SUCCESS => Ok(true),
             ffi::GHOSTTY_NO_VALUE => Ok(false),
@@ -2185,10 +2193,8 @@ impl TerminalSearch {
             return Err(VtError::TerminalDropped);
         };
         let _guard = arc.lock();
-        // SAFETY: `OPT_SELECT_PREV` requires NULL value and serialized terminal access.
-        let rc = unsafe {
-            ffi::ghostty_search_set(self.raw, ffi::GHOSTTY_SEARCH_OPT_SELECT_PREV, ptr::null())
-        };
+        // SAFETY: Terminal lock is held across `ghostty_search_select_prev`.
+        let rc = unsafe { ffi::ghostty_search_select_prev(self.raw) };
         match rc {
             ffi::GHOSTTY_SUCCESS => Ok(true),
             ffi::GHOSTTY_NO_VALUE => Ok(false),

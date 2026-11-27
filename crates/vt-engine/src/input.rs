@@ -372,7 +372,7 @@ impl KeyEncoder {
         let guard = terminal.inner.lock();
         // SAFETY: Both handles are valid and `terminal` is locked for the duration of this call.
         unsafe {
-            ffi::ghostty_key_encoder_setopt_from_terminal(self.encoder, guard.raw);
+            let _ = ffi::ghostty_key_encoder_set_from_terminal(self.encoder, guard.raw);
         }
     }
 
@@ -380,7 +380,7 @@ impl KeyEncoder {
         let raw = flags.0;
         // SAFETY: `raw` is a `GhosttyKittyKeyFlags` (`u8`) matching `OPT_KITTY_FLAGS`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS,
                 (&raw const raw).cast::<c_void>(),
@@ -391,7 +391,7 @@ impl KeyEncoder {
     pub fn set_cursor_key_application(&mut self, enabled: bool) {
         // SAFETY: `enabled` is a `bool` matching `OPT_CURSOR_KEY_APPLICATION`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_CURSOR_KEY_APPLICATION,
                 (&raw const enabled).cast::<c_void>(),
@@ -402,7 +402,7 @@ impl KeyEncoder {
     pub fn set_keypad_key_application(&mut self, enabled: bool) {
         // SAFETY: `enabled` is a `bool` matching `OPT_KEYPAD_KEY_APPLICATION`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_KEYPAD_KEY_APPLICATION,
                 (&raw const enabled).cast::<c_void>(),
@@ -413,7 +413,7 @@ impl KeyEncoder {
     pub fn set_alt_esc_prefix(&mut self, enabled: bool) {
         // SAFETY: `enabled` is a `bool` matching `OPT_ALT_ESC_PREFIX`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_ALT_ESC_PREFIX,
                 (&raw const enabled).cast::<c_void>(),
@@ -424,7 +424,7 @@ impl KeyEncoder {
     pub fn set_modify_other_keys(&mut self, enabled: bool) {
         // SAFETY: `enabled` is a `bool` matching `OPT_MODIFY_OTHER_KEYS_STATE_2`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_MODIFY_OTHER_KEYS_STATE_2,
                 (&raw const enabled).cast::<c_void>(),
@@ -435,7 +435,7 @@ impl KeyEncoder {
     pub fn set_backarrow_key_mode(&mut self, enabled: bool) {
         // SAFETY: `enabled` is a `bool` matching `OPT_BACKARROW_KEY_MODE`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_BACKARROW_KEY_MODE,
                 (&raw const enabled).cast::<c_void>(),
@@ -447,7 +447,7 @@ impl KeyEncoder {
         let raw = mode as ffi::GhosttyOptionAsAlt;
         // SAFETY: `raw` is a `GhosttyOptionAsAlt` matching `OPT_MACOS_OPTION_AS_ALT`.
         unsafe {
-            ffi::ghostty_key_encoder_setopt(
+            let _ = ffi::ghostty_key_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT,
                 (&raw const raw).cast::<c_void>(),
@@ -460,33 +460,37 @@ impl KeyEncoder {
         let filtered_utf8 = input
             .utf8
             .filter(|s| !s.is_empty() && !s.bytes().all(|b| b < 0x20 || b == 0x7F));
+        let utf8_str = match filtered_utf8 {
+            Some(s) => ffi::GhosttyString {
+                ptr: s.as_ptr(),
+                len: s.len(),
+            },
+            None => ffi::GhosttyString {
+                ptr: ptr::null(),
+                len: 0,
+            },
+        };
 
         // SAFETY: `self.event` and `self.encoder` are valid handles; `utf8` slice lives across `encode`.
         unsafe {
-            ffi::ghostty_key_event_set_action(self.event, input.action as ffi::GhosttyKeyAction);
-            ffi::ghostty_key_event_set_key(self.event, input.key as ffi::GhosttyKey);
-            ffi::ghostty_key_event_set_mods(self.event, input.mods.0);
-            ffi::ghostty_key_event_set_consumed_mods(self.event, input.consumed_mods.0);
-            ffi::ghostty_key_event_set_composing(self.event, input.composing);
-            ffi::ghostty_key_event_set_unshifted_codepoint(
+            let _ =
+                ffi::ghostty_key_event_set_action(self.event, input.action as ffi::GhosttyKeyAction);
+            let _ = ffi::ghostty_key_event_set_key(self.event, input.key as ffi::GhosttyKey);
+            let _ = ffi::ghostty_key_event_set_mods(self.event, input.mods.0);
+            let _ = ffi::ghostty_key_event_set_consumed_mods(self.event, input.consumed_mods.0);
+            let _ = ffi::ghostty_key_event_set_composing(self.event, input.composing);
+            let _ = ffi::ghostty_key_event_set_unshifted_codepoint(
                 self.event,
                 input.unshifted_codepoint.map_or(0, |c| c as u32),
             );
-            match filtered_utf8 {
-                Some(s) => ffi::ghostty_key_event_set_utf8(
-                    self.event,
-                    s.as_ptr().cast::<c_char>(),
-                    s.len(),
-                ),
-                None => ffi::ghostty_key_event_set_utf8(self.event, ptr::null(), 0),
-            }
+            let _ = ffi::ghostty_key_event_set_utf8(self.event, utf8_str);
 
             let mut stack_buf = [0u8; 128];
             let mut written: usize = 0;
             let rc = ffi::ghostty_key_encoder_encode(
                 self.encoder,
                 self.event,
-                stack_buf.as_mut_ptr().cast::<c_char>(),
+                stack_buf.as_mut_ptr(),
                 stack_buf.len(),
                 &raw mut written,
             );
@@ -503,7 +507,7 @@ impl KeyEncoder {
                     let rc2 = ffi::ghostty_key_encoder_encode(
                         self.encoder,
                         self.event,
-                        out[start..].as_mut_ptr().cast::<c_char>(),
+                        out[start..].as_mut_ptr(),
                         written,
                         &raw mut actual,
                     );
@@ -517,7 +521,13 @@ impl KeyEncoder {
                 }
                 other => Err(VtError::Ffi(other)),
             };
-            ffi::ghostty_key_event_set_utf8(self.event, ptr::null(), 0);
+            let _ = ffi::ghostty_key_event_set_utf8(
+                self.event,
+                ffi::GhosttyString {
+                    ptr: ptr::null(),
+                    len: 0,
+                },
+            );
             res
         }
     }
@@ -654,7 +664,7 @@ impl MouseEncoder {
         let guard = terminal.inner.lock();
         // SAFETY: Both handles are valid while `terminal` is locked.
         unsafe {
-            ffi::ghostty_mouse_encoder_setopt_from_terminal(self.encoder, guard.raw);
+            let _ = ffi::ghostty_mouse_encoder_set_from_terminal(self.encoder, guard.raw);
         }
     }
 
@@ -662,7 +672,7 @@ impl MouseEncoder {
         let raw = mode as ffi::GhosttyMouseTrackingMode;
         // SAFETY: `raw` matches `GHOSTTY_MOUSE_ENCODER_OPT_EVENT`.
         unsafe {
-            ffi::ghostty_mouse_encoder_setopt(
+            let _ = ffi::ghostty_mouse_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_MOUSE_ENCODER_OPT_EVENT,
                 (&raw const raw).cast::<c_void>(),
@@ -674,7 +684,7 @@ impl MouseEncoder {
         let raw = format as ffi::GhosttyMouseFormat;
         // SAFETY: `raw` matches `GHOSTTY_MOUSE_ENCODER_OPT_FORMAT`.
         unsafe {
-            ffi::ghostty_mouse_encoder_setopt(
+            let _ = ffi::ghostty_mouse_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_MOUSE_ENCODER_OPT_FORMAT,
                 (&raw const raw).cast::<c_void>(),
@@ -696,7 +706,7 @@ impl MouseEncoder {
         };
         // SAFETY: `raw` is a properly sized `GhosttyMouseEncoderSize`.
         unsafe {
-            ffi::ghostty_mouse_encoder_setopt(
+            let _ = ffi::ghostty_mouse_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_MOUSE_ENCODER_OPT_SIZE,
                 (&raw const raw).cast::<c_void>(),
@@ -707,7 +717,7 @@ impl MouseEncoder {
     pub fn set_any_button_pressed(&mut self, pressed: bool) {
         // SAFETY: `pressed` is a `bool` matching `OPT_ANY_BUTTON_PRESSED`.
         unsafe {
-            ffi::ghostty_mouse_encoder_setopt(
+            let _ = ffi::ghostty_mouse_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED,
                 (&raw const pressed).cast::<c_void>(),
@@ -718,7 +728,7 @@ impl MouseEncoder {
     pub fn set_track_last_cell(&mut self, enabled: bool) {
         // SAFETY: `enabled` is a `bool` matching `OPT_TRACK_LAST_CELL`.
         unsafe {
-            ffi::ghostty_mouse_encoder_setopt(
+            let _ = ffi::ghostty_mouse_encoder_set(
                 self.encoder,
                 ffi::GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL,
                 (&raw const enabled).cast::<c_void>(),
@@ -728,25 +738,32 @@ impl MouseEncoder {
 
     pub fn reset(&mut self) {
         // SAFETY: `self.encoder` is valid.
-        unsafe { ffi::ghostty_mouse_encoder_reset(self.encoder) };
+        unsafe {
+            let _ = ffi::ghostty_mouse_encoder_reset(self.encoder);
+        }
     }
 
     /// Encodes `input` into terminal mouse escape bytes, appending them to `out`.
     pub fn encode(&mut self, input: &MouseEventInput, out: &mut Vec<u8>) -> Result<(), VtError> {
         // SAFETY: `self.event` and `self.encoder` are valid exclusive handles.
         unsafe {
-            ffi::ghostty_mouse_event_set_action(
+            let _ = ffi::ghostty_mouse_event_set_action(
                 self.event,
                 input.action as ffi::GhosttyMouseAction,
             );
             match input.button {
                 Some(btn) => {
-                    ffi::ghostty_mouse_event_set_button(self.event, btn as ffi::GhosttyMouseButton)
+                    let _ = ffi::ghostty_mouse_event_set_button(
+                        self.event,
+                        btn as ffi::GhosttyMouseButton,
+                    );
                 }
-                None => ffi::ghostty_mouse_event_clear_button(self.event),
+                None => {
+                    let _ = ffi::ghostty_mouse_event_clear_button(self.event);
+                }
             }
-            ffi::ghostty_mouse_event_set_mods(self.event, input.mods.0);
-            ffi::ghostty_mouse_event_set_position(
+            let _ = ffi::ghostty_mouse_event_set_mods(self.event, input.mods.0);
+            let _ = ffi::ghostty_mouse_event_set_position(
                 self.event,
                 ffi::GhosttyMousePosition {
                     x: input.x,
@@ -759,7 +776,7 @@ impl MouseEncoder {
             let rc = ffi::ghostty_mouse_encoder_encode(
                 self.encoder,
                 self.event,
-                stack_buf.as_mut_ptr().cast::<c_char>(),
+                stack_buf.as_mut_ptr(),
                 stack_buf.len(),
                 &raw mut written,
             );
@@ -775,7 +792,7 @@ impl MouseEncoder {
                     let rc2 = ffi::ghostty_mouse_encoder_encode(
                         self.encoder,
                         self.event,
-                        out[start..].as_mut_ptr().cast::<c_char>(),
+                        out[start..].as_mut_ptr(),
                         written,
                         &raw mut actual,
                     );
@@ -866,7 +883,7 @@ pub fn encode_paste(data: &[u8], bracketed: bool) -> Result<Vec<u8>, VtError> {
             data_ptr,
             mutable.len(),
             bracketed,
-            out.as_mut_ptr().cast::<c_char>(),
+            out.as_mut_ptr(),
             out.len(),
             &raw mut written,
         )
@@ -888,14 +905,7 @@ pub fn encode_focus(gained: bool) -> Result<Vec<u8>, VtError> {
     let mut buf = [0u8; 8];
     let mut written: usize = 0;
     // SAFETY: 8-byte buffer always fits `CSI I` / `CSI O` (3 bytes).
-    let rc = unsafe {
-        ffi::ghostty_focus_encode(
-            ev,
-            buf.as_mut_ptr().cast::<c_char>(),
-            buf.len(),
-            &raw mut written,
-        )
-    };
+    let rc = unsafe { ffi::ghostty_focus_encode(ev, buf.as_mut_ptr(), buf.len(), &raw mut written) };
     if rc != ffi::GHOSTTY_SUCCESS {
         return Err(VtError::Ffi(rc));
     }
@@ -910,7 +920,7 @@ pub fn encode_color_scheme_report(scheme: ColorScheme) -> Result<Vec<u8>, VtErro
     let rc = unsafe {
         ffi::ghostty_color_scheme_report_encode(
             scheme.to_ffi(),
-            buf.as_mut_ptr().cast::<c_char>(),
+            buf.as_mut_ptr(),
             buf.len(),
             &raw mut written,
         )

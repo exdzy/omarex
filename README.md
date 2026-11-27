@@ -66,7 +66,7 @@
 
 ### Arch Linux / Omarchy
 
-Requires `ghostty` (`libghostty-vt`), `vulkan-icd-loader`, `wayland`, `libxkbcommon`, `fontconfig`, and a stable Rust toolchain. Optional runtime packages: `rex` and `tr3x`.
+Requires `libghostty-vt` (`>= 1.0.2`), `vulkan-icd-loader`, `wayland`, `libxkbcommon`, `fontconfig`, and a stable Rust toolchain. Optional runtime packages: `rex` and `tr3x`.
 
 ```bash
 git clone https://github.com/exdzy/omarex.git

@@ -2,12 +2,12 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Locates `libghostty-vt` headers and shared library cleanly on Arch/Omarchy.
+/// Locates `libghostty-vt` (`>= 1.0.2`, `GHOSTTY_VT_1.0` ABI) headers and shared library cleanly
+/// on Arch/Omarchy.
 ///
-/// Arch's `ghostty 1.4.0-1` package currently ships `/usr/share/pkgconfig/libghostty-vt.pc`
-/// with a broken build-time staging prefix (`/src/ghostty/src/ghostty-1.4.0/build/usr`),
-/// so we probe explicit environment overrides and standard system paths directly before
-/// falling back to `pkg-config` (and only accept `pkg-config` if its paths actually exist).
+/// Explicit environment overrides (`GHOSTTY_VT_INCLUDE_DIR`, `GHOSTTY_VT_LIB_DIR`) take priority,
+/// followed by standard system paths (`/usr/include`, `/usr/lib`) and `pkg-config libghostty-vt`
+/// (accepting `pkg-config` paths only if they actually exist on disk).
 fn main() {
     println!("cargo:rerun-if-env-changed=GHOSTTY_VT_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=GHOSTTY_VT_LIB_DIR");
@@ -20,6 +20,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         include_dir.join("ghostty/vt.h").display()
     );
+    let version_header = include_dir.join("ghostty/vt/version.h");
+    if version_header.is_file() {
+        println!("cargo:rerun-if-changed={}", version_header.display());
+    }
     println!(
         "cargo:rustc-env=GHOSTTY_VT_INCLUDE_DIR={}",
         include_dir.display()
@@ -61,7 +65,7 @@ fn resolve_include_dir() -> PathBuf {
     }
 
     panic!(
-        "Could not locate ghostty/vt.h. Install the `ghostty` package (libghostty-vt) \
+        "Could not locate ghostty/vt.h. Install the `libghostty-vt` (>= 1.0.2) package \
          or set GHOSTTY_VT_INCLUDE_DIR."
     );
 }
@@ -91,7 +95,7 @@ fn resolve_lib_dir() -> PathBuf {
     }
 
     panic!(
-        "Could not locate libghostty-vt.so. Install the `ghostty` package \
+        "Could not locate libghostty-vt.so. Install the `libghostty-vt` (>= 1.0.2) package \
          or set GHOSTTY_VT_LIB_DIR."
     );
 }
